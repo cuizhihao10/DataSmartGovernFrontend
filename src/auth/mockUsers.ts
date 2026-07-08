@@ -1,0 +1,48 @@
+import type { MockUserOption } from "@/types/auth";
+
+export const mockUsers: MockUserOption[] = [
+  {
+    id: "mock-project-owner",
+    username: "project-owner",
+    displayName: "项目负责人",
+    email: "project-owner@example.local",
+    tenantId: "10",
+    actorId: "1001",
+    actorRole: "PROJECT_OWNER",
+    actorType: "USER",
+    passwordHint: "DataSmart@123",
+  },
+  {
+    id: "mock-operator",
+    username: "operator",
+    displayName: "治理运营",
+    email: "operator@example.local",
+    tenantId: "10",
+    actorId: "1002",
+    actorRole: "OPERATOR",
+    actorType: "USER",
+    passwordHint: "DataSmart@123",
+  },
+  {
+    id: "mock-auditor",
+    username: "auditor",
+    displayName: "审计员",
+    email: "auditor@example.local",
+    tenantId: "10",
+    actorId: "1003",
+    actorRole: "AUDITOR",
+    actorType: "USER",
+    passwordHint: "DataSmart@123",
+  },
+  {
+    id: "mock-platform-admin",
+    username: "platform-admin",
+    displayName: "平台管理员",
+    email: "platform-admin@example.local",
+    tenantId: "1",
+    actorId: "9001",
+    actorRole: "PLATFORM_ADMINISTRATOR",
+    actorType: "USER",
+    passwordHint: "DataSmart@123",
+  },
+];

@@ -1,0 +1,358 @@
+import dayjs from "dayjs";
+import type {
+  AgentSnapshot,
+  AgentTool,
+  DashboardKpi,
+  DataSourceRecord,
+  GovernanceTask,
+  PlatformPageResponse,
+  QualityReport,
+  QualityRule,
+  QueueSnapshot,
+  RoutePolicy,
+  RuntimeEvent,
+  ServiceHealth,
+  PermissionRole,
+} from "@/types/domain";
+
+const now = dayjs("2026-07-05T10:20:00+08:00");
+
+export const dashboardKpis: DashboardKpi[] = [
+  { key: "activeTasks", title: "运行任务", value: 28, trend: "up", delta: "+12%", tone: "blue" },
+  { key: "healthySources", title: "健康数据源", value: "94.2", suffix: "%", trend: "flat", delta: "持平", tone: "green" },
+  { key: "qualityScore", title: "质量均分", value: 91.6, trend: "up", delta: "+2.4", tone: "violet" },
+  { key: "openAlerts", title: "待处理告警", value: 7, trend: "down", delta: "-3", tone: "amber" },
+];
+
+export const serviceHealth: ServiceHealth[] = [
+  {
+    key: "gateway",
+    serviceName: "统一网关",
+    domain: "统一入口",
+    status: "UP",
+    port: 8080,
+    p95LatencyMs: 86,
+    errorRate: 0.12,
+    updatedAt: now.subtract(1, "minute").toISOString(),
+  },
+  {
+    key: "agent-runtime",
+    serviceName: "智能体运行时",
+    domain: "智能体控制面",
+    status: "UP",
+    port: 8091,
+    p95LatencyMs: 142,
+    errorRate: 0.31,
+    updatedAt: now.subtract(2, "minute").toISOString(),
+  },
+  {
+    key: "python-ai-runtime",
+    serviceName: "Python 智能运行时",
+    domain: "Python 模型与知识检索",
+    status: "DEGRADED",
+    port: 8090,
+    p95LatencyMs: 336,
+    errorRate: 1.84,
+    updatedAt: now.subtract(4, "minute").toISOString(),
+  },
+  {
+    key: "task-management",
+    serviceName: "任务管理服务",
+    domain: "任务控制",
+    status: "UP",
+    port: 8081,
+    p95LatencyMs: 118,
+    errorRate: 0.2,
+    updatedAt: now.subtract(1, "minute").toISOString(),
+  },
+  {
+    key: "datasource-management",
+    serviceName: "数据源管理服务",
+    domain: "数据源",
+    status: "UP",
+    port: 8082,
+    p95LatencyMs: 154,
+    errorRate: 0.45,
+    updatedAt: now.subtract(3, "minute").toISOString(),
+  },
+  {
+    key: "data-quality",
+    serviceName: "数据质量服务",
+    domain: "数据质量",
+    status: "UP",
+    port: 8083,
+    p95LatencyMs: 132,
+    errorRate: 0.22,
+    updatedAt: now.subtract(3, "minute").toISOString(),
+  },
+];
+
+export const queueSnapshots: QueueSnapshot[] = [
+  { key: "sync", name: "数据同步队列", pending: 42, running: 8, failed: 3, maxLagSeconds: 312 },
+  { key: "agent", name: "智能体工具命令", pending: 18, running: 6, failed: 1, maxLagSeconds: 128 },
+  { key: "quality", name: "质量扫描队列", pending: 25, running: 5, failed: 2, maxLagSeconds: 246 },
+  { key: "rag", name: "知识检索执行队列", pending: 9, running: 3, failed: 0, maxLagSeconds: 72 },
+];
+
+export const agentSnapshots: AgentSnapshot[] = [
+  {
+    key: "master-agent",
+    name: "总控调度智能体",
+    role: "任务拆解与协同",
+    status: "UP",
+    activeRuns: 11,
+    risk: "MEDIUM",
+    tools: ["task.create.draft", "knowledge.rag.query"],
+  },
+  {
+    key: "datasource-agent",
+    name: "数据源接入智能体",
+    role: "元数据采集",
+    status: "UP",
+    activeRuns: 7,
+    risk: "LOW",
+    tools: ["datasource.metadata.read"],
+  },
+  {
+    key: "quality-agent",
+    name: "数据质量智能体",
+    role: "规则建议与异常诊断",
+    status: "DEGRADED",
+    activeRuns: 4,
+    risk: "HIGH",
+    tools: ["quality.rule.suggest", "quality.remediation.submit"],
+  },
+  {
+    key: "ops-agent",
+    name: "运维告警智能体",
+    role: "告警收敛",
+    status: "UP",
+    activeRuns: 3,
+    risk: "MEDIUM",
+    tools: ["observability.alert.triage"],
+  },
+];
+
+export const dataSources: DataSourceRecord[] = [
+  {
+    id: 1001,
+    name: "retail-order-postgres",
+    type: "PostgreSQL",
+    environment: "PROD",
+    owner: "平台数据组",
+    status: "ENABLED",
+    sensitivity: "HIGH",
+    tableCount: 128,
+    lastSyncAt: now.subtract(13, "minute").toISOString(),
+    connectionHealth: "UP",
+  },
+  {
+    id: 1002,
+    name: "crm-member-mysql",
+    type: "MySQL",
+    environment: "PROD",
+    owner: "会员运营组",
+    status: "ENABLED",
+    sensitivity: "CRITICAL",
+    tableCount: 76,
+    lastSyncAt: now.subtract(42, "minute").toISOString(),
+    connectionHealth: "UP",
+  },
+  {
+    id: 1003,
+    name: "iot-device-kafka",
+    type: "Kafka",
+    environment: "TEST",
+    owner: "智能设备组",
+    status: "TESTING",
+    sensitivity: "MEDIUM",
+    tableCount: 18,
+    lastSyncAt: now.subtract(2, "hour").toISOString(),
+    connectionHealth: "DEGRADED",
+  },
+  {
+    id: 1004,
+    name: "finance-recon-api",
+    type: "API",
+    environment: "PROD",
+    owner: "财务共享组",
+    status: "ERROR",
+    sensitivity: "HIGH",
+    tableCount: 22,
+    lastSyncAt: now.subtract(9, "hour").toISOString(),
+    connectionHealth: "DOWN",
+  },
+  {
+    id: 1005,
+    name: "archive-object-minio",
+    type: "MinIO",
+    environment: "DEV",
+    owner: "数据平台组",
+    status: "DISABLED",
+    sensitivity: "LOW",
+    tableCount: 41,
+    lastSyncAt: now.subtract(3, "day").toISOString(),
+    connectionHealth: "UNKNOWN",
+  },
+];
+
+export const governanceTasks: GovernanceTask[] = [
+  {
+    id: 9001,
+    taskCode: "TASK-DS-20260705-001",
+    name: "订单域 PostgreSQL 增量同步",
+    type: "DATA_SYNC",
+    status: "RUNNING",
+    priority: "HIGH",
+    owner: "平台数据组",
+    progress: 67,
+    retryCount: 1,
+    nextFireAt: now.add(13, "minute").toISOString(),
+    updatedAt: now.subtract(2, "minute").toISOString(),
+  },
+  {
+    id: 9002,
+    taskCode: "TASK-QA-20260705-011",
+    name: "会员手机号脱敏前质量扫描",
+    type: "QUALITY_SCAN",
+    status: "FAILED",
+    priority: "URGENT",
+    owner: "治理运营组",
+    progress: 48,
+    retryCount: 3,
+    updatedAt: now.subtract(17, "minute").toISOString(),
+  },
+  {
+    id: 9003,
+    taskCode: "TASK-AG-20260705-027",
+    name: "知识检索结果写入受控产物",
+    type: "AGENT_TOOL",
+    status: "SUCCEEDED",
+    priority: "MEDIUM",
+    owner: "AI 平台组",
+    progress: 100,
+    retryCount: 0,
+    updatedAt: now.subtract(1, "hour").toISOString(),
+  },
+  {
+    id: 9004,
+    taskCode: "TASK-MD-20260705-014",
+    name: "CRM 数据源元数据重新采集",
+    type: "METADATA_DISCOVERY",
+    status: "PAUSED",
+    priority: "MEDIUM",
+    owner: "会员运营组",
+    progress: 39,
+    retryCount: 0,
+    nextFireAt: now.add(1, "hour").toISOString(),
+    updatedAt: now.subtract(28, "minute").toISOString(),
+  },
+  {
+    id: 9005,
+    taskCode: "TASK-TOOL-20260705-005",
+    name: "quality.remediation.submit 人工确认",
+    type: "AGENT_TOOL",
+    status: "PENDING_REVIEW",
+    priority: "HIGH",
+    owner: "治理运营组",
+    progress: 0,
+    retryCount: 0,
+    updatedAt: now.subtract(7, "minute").toISOString(),
+  },
+];
+
+export const qualityRules: QualityRule[] = [
+  {
+    id: 3001,
+    name: "订单金额非负校验",
+    datasourceName: "retail-order-postgres",
+    targetTable: "ods_order",
+    ruleType: "RANGE_CHECK",
+    status: "ENABLED",
+    severity: "HIGH",
+    passRate: 99.32,
+    anomalyCount: 38,
+    lastRunAt: now.subtract(26, "minute").toISOString(),
+  },
+  {
+    id: 3002,
+    name: "会员手机号唯一性",
+    datasourceName: "crm-member-mysql",
+    targetTable: "dim_member",
+    ruleType: "UNIQUE_CHECK",
+    status: "ENABLED",
+    severity: "CRITICAL",
+    passRate: 96.74,
+    anomalyCount: 412,
+    lastRunAt: now.subtract(2, "hour").toISOString(),
+  },
+  {
+    id: 3003,
+    name: "商品主数据引用完整性",
+    datasourceName: "retail-order-postgres",
+    targetTable: "ods_order_item",
+    ruleType: "REFERENTIAL_CHECK",
+    status: "ENABLED",
+    severity: "MEDIUM",
+    passRate: 98.8,
+    anomalyCount: 96,
+    lastRunAt: now.subtract(1, "hour").toISOString(),
+  },
+  {
+    id: 3004,
+    name: "设备事件时间戳空值",
+    datasourceName: "iot-device-kafka",
+    targetTable: "device_event_stream",
+    ruleType: "NULL_CHECK",
+    status: "DISABLED",
+    severity: "LOW",
+    passRate: 100,
+    anomalyCount: 0,
+    lastRunAt: now.subtract(1, "day").toISOString(),
+  },
+];
+
+export const qualityReports: QualityReport[] = [
+  { id: "RPT-001", ruleName: "会员手机号唯一性", score: 78, status: "WARNING", anomalies: 412, generatedAt: now.subtract(2, "hour").toISOString() },
+  { id: "RPT-002", ruleName: "订单金额非负校验", score: 94, status: "PASSED", anomalies: 38, generatedAt: now.subtract(26, "minute").toISOString() },
+  { id: "RPT-003", ruleName: "商品主数据引用完整性", score: 88, status: "WARNING", anomalies: 96, generatedAt: now.subtract(1, "hour").toISOString() },
+];
+
+export const roles: PermissionRole[] = [
+  { id: "role-platform-admin", name: "平台管理员", code: "PLATFORM_ADMIN", scope: "PLATFORM", members: 3, enabled: true, policyCount: 42 },
+  { id: "role-tenant-admin", name: "租户管理员", code: "TENANT_ADMIN", scope: "TENANT", members: 8, enabled: true, policyCount: 31 },
+  { id: "role-operator", name: "治理运营", code: "OPERATOR", scope: "PROJECT", members: 19, enabled: true, policyCount: 24 },
+  { id: "role-auditor", name: "审计员", code: "AUDITOR", scope: "PROJECT", members: 6, enabled: true, policyCount: 16 },
+];
+
+export const routePolicies: RoutePolicy[] = [
+  { id: "rp-agent-events", pathPattern: "/api/agent/runtime-events/**", resourceType: "AI_RUNTIME", defaultAction: "VIEW_EVENTS", enabled: true },
+  { id: "rp-tool-approve", pathPattern: "/api/agent/sessions/{sessionId}/runs/{runId}/tool-executions/{auditId}/approve", resourceType: "AI_RUNTIME", defaultAction: "APPROVE", enabled: true },
+  { id: "rp-datasource", pathPattern: "/api/datasource/**", resourceType: "DATASOURCE", defaultAction: "VIEW", enabled: true },
+  { id: "rp-permission", pathPattern: "/api/permission/**", resourceType: "SYSTEM_SETTING", defaultAction: "EXECUTE", enabled: true },
+];
+
+export const agentTools: AgentTool[] = [
+  { toolCode: "datasource.metadata.read", displayName: "数据源元数据读取", targetService: "datasource-management", riskLevel: "LOW", executionMode: "SYNC", enabled: true },
+  { toolCode: "quality.rule.suggest", displayName: "质量规则建议", targetService: "data-quality", riskLevel: "MEDIUM", executionMode: "HUMAN_APPROVAL", enabled: true },
+  { toolCode: "task.create.draft", displayName: "任务草稿创建", targetService: "task-management", riskLevel: "HIGH", executionMode: "HUMAN_APPROVAL", enabled: true },
+  { toolCode: "knowledge.rag.query", displayName: "治理知识检索查询", targetService: "python-ai-runtime-rag", riskLevel: "LOW", executionMode: "ASYNC", enabled: true },
+  { toolCode: "quality.remediation.submit", displayName: "质量修复方案提交", targetService: "agent-runtime", riskLevel: "CRITICAL", executionMode: "HUMAN_APPROVAL", enabled: false },
+];
+
+export const runtimeEvents: RuntimeEvent[] = [
+  { id: "evt-1", time: now.subtract(3, "minute").toISOString(), level: "INFO", title: "知识检索产物写入完成", detail: "产物引用已写入执行回执", domain: "python-runtime" },
+  { id: "evt-2", time: now.subtract(8, "minute").toISOString(), level: "WARN", title: "质量规则建议等待审批", detail: "高风险工具需要人工确认", domain: "agent-runtime" },
+  { id: "evt-3", time: now.subtract(12, "minute").toISOString(), level: "INFO", title: "网关路由策略命中", detail: "/api/agent/plans -> Python 智能运行时", domain: "gateway" },
+  { id: "evt-4", time: now.subtract(19, "minute").toISOString(), level: "ERROR", title: "同步任务达到重试上限", detail: "TASK-QA-20260705-011 已进入失败治理", domain: "task-management" },
+];
+
+export function pageOf<T>(records: T[]): PlatformPageResponse<T> {
+  return {
+    current: 1,
+    size: records.length,
+    total: records.length,
+    pages: 1,
+    records,
+  };
+}
