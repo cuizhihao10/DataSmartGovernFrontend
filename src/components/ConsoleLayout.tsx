@@ -45,6 +45,7 @@ export function ConsoleLayout() {
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const setSelectedProjectId = useUiStore((state) => state.setSelectedProjectId);
   const discoveredProjectOptions = useUiStore((state) => state.projectOptions);
+  const setDiscoveredProjectOptions = useUiStore((state) => state.setProjectOptions);
   const authUser = useAuthStore((state) => state.user);
   const logout = useAuthStore((state) => state.logout);
   const sessionQuery = useQuery({
@@ -70,8 +71,11 @@ export function ConsoleLayout() {
     return Array.from(new Set(ids.map((id) => String(id)))).map((id) => ({ value: id, label: session?.projectName ?? `项目 ${id}` }));
   }, [session?.authorizedProjectIds, session?.authorizedProjects, session?.projectName]);
   const projectOptions = useMemo(() => {
+    if (sessionProjectOptions.length) {
+      return sessionProjectOptions;
+    }
     const optionMap = new Map<string, { value: string; label: string }>();
-    [...sessionProjectOptions, ...discoveredProjectOptions].forEach((option) => {
+    discoveredProjectOptions.forEach((option) => {
       if (option.value && !optionMap.has(option.value)) {
         optionMap.set(option.value, option);
       }
@@ -79,6 +83,15 @@ export function ConsoleLayout() {
     return Array.from(optionMap.values());
   }, [discoveredProjectOptions, sessionProjectOptions]);
   const activeKey = navItems.find((item) => location.pathname.startsWith(item.path))?.key ?? "dashboard";
+
+  useEffect(() => {
+    /*
+     * 项目切换器是整个控制台的数据范围入口，不能把上一个登录用户在业务列表里“发现到”的项目继续留给新用户。
+     * 有 Keycloak/gateway session 时，授权项目集合才是可信来源；页面列表反推出来的项目只作为开发/异常场景兜底。
+     */
+    setSelectedProjectId(undefined);
+    setDiscoveredProjectOptions([]);
+  }, [authUser?.id, session?.actorId, setDiscoveredProjectOptions, setSelectedProjectId]);
 
   useEffect(() => {
     if (!projectOptions.length) {

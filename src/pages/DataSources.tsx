@@ -126,13 +126,14 @@ export function DataSources() {
   const [editConnectionTestResult, setEditConnectionTestResult] = useState<DataSourceConnectionTestResult | null>(null);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const setProjectOptions = useUiStore((state) => state.setProjectOptions);
+  const selectedProjectScopeId = isNumericScopeValue(selectedProjectId) ? Number(selectedProjectId) : undefined;
   const sessionQuery = useQuery({
     queryKey: ["datasource-gateway-session"],
     queryFn: api.getSession,
   });
   const dataSourceQuery = useQuery({
-    queryKey: ["datasources"],
-    queryFn: () => api.listDataSources({ size: 100 }),
+    queryKey: ["datasources", selectedProjectScopeId],
+    queryFn: () => api.listDataSources({ projectId: selectedProjectScopeId, size: 100 }),
   });
   const notifyConnectionTestResult = (data: DataSourceConnectionTestResult) => {
     if (String(data.testStatus).toUpperCase() !== "SUCCESS") {
@@ -215,7 +216,7 @@ export function DataSources() {
   const currentProjectId = selectedProjectId ?? session?.authorizedProjectIds?.[0];
   const currentProject = session?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
   const currentProjectLabel = currentProject?.projectName ?? currentProject?.name ?? session?.projectName ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
-  const scopedProjectId = isNumericScopeValue(selectedProjectId) ? String(selectedProjectId) : undefined;
+  const scopedProjectId = selectedProjectScopeId == null ? undefined : String(selectedProjectScopeId);
   const authorizationQuery = useQuery({
     queryKey: ["datasource-authorizations", authorizationTarget?.id],
     queryFn: () => api.listDataSourceAuthorizations(authorizationTarget!.id, { size: 50 }),
@@ -451,6 +452,12 @@ export function DataSources() {
 
   const authorizationColumns: ColumnsType<DataSourceAuthorizationRecord> = [
     {
+      title: "ID",
+      dataIndex: "id",
+      width: 82,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
       title: "授权主体",
       dataIndex: "subjectName",
       render: (value, record) => (
@@ -490,6 +497,12 @@ export function DataSources() {
   ];
 
   const columns: ColumnsType<DataSourceRecord> = [
+    {
+      title: "ID",
+      dataIndex: "id",
+      width: 82,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
     {
       title: "数据源",
       dataIndex: "name",

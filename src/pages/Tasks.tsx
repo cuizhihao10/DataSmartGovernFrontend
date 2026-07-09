@@ -132,6 +132,12 @@ export function Tasks() {
 
   const columns: ColumnsType<GovernanceTask> = [
     {
+      title: "ID",
+      dataIndex: "id",
+      width: 82,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
       title: "任务",
       dataIndex: "name",
       render: (value, record) => (

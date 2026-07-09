@@ -506,7 +506,13 @@ function generateResourceCode(prefix: string) {
 }
 
 function syncGroupDisplayName(node: SyncTaskGroupTreeNode) {
-  return node.displayName?.trim() || node.groupName?.trim() || UNNAMED_SYNC_GROUP;
+  /*
+   * 分组树和筛选框面向普通用户时只展示“分组名称”本身。
+   * 后端返回的 displayName/displayPath 适合诊断同名分组或审计定位，但如果直接展示给业务用户，
+   * 就会出现“项目级：租户 0 / 项目 101 / 默认分组”这类过度技术化文案。
+   * 稳定身份仍然交给 treeKey/uiKey 处理，展示文案则保持短名称。
+   */
+  return node.groupName?.trim() || node.displayName?.trim() || UNNAMED_SYNC_GROUP;
 }
 
 function syncGroupScopeKey(node: SyncTaskGroupTreeNode) {
@@ -526,17 +532,12 @@ function syncGroupScopeKey(node: SyncTaskGroupTreeNode) {
 }
 
 function syncGroupMergeKey(node: SyncTaskGroupTreeNode) {
-  if (node.treeKey?.trim()) {
-    return `tree:${node.treeKey.trim()}`;
-  }
-  const code = node.groupCode?.trim();
-  if (code === DEFAULT_SYNC_GROUP_CODE) {
-    return `code:${DEFAULT_SYNC_GROUP_CODE}`;
-  }
-  if (code) {
-    return `code:${code}`;
-  }
-  return `name:${syncGroupDisplayName(node)}`;
+  /*
+   * groupCode 只在“同一租户 + 同一项目”内唯一，不能继续用裸 groupCode 作为合并键。
+   * 否则平台管理员或刚切换用户/项目时，多个项目下的 DEFAULT 会被前端误合并成同一个节点，
+   * 进一步导致计数、选中态和筛选条件都串到别的项目。
+   */
+  return `scope:${syncGroupScopeKey(node)}`;
 }
 
 function addSyncGroupNumber(left?: number, right?: number) {
@@ -1067,8 +1068,8 @@ export function DataSync() {
     queryFn: api.getSession,
   });
   const dataSourceQuery = useQuery({
-    queryKey: ["sync-datasources"],
-    queryFn: () => api.listDataSources({ size: 100 }),
+    queryKey: ["sync-datasources", selectedProjectScopeId],
+    queryFn: () => api.listDataSources(compactPayload({ projectId: selectedProjectScopeId, size: 100 })),
   });
   const capabilityQuery = useQuery({
     queryKey: ["sync-connector-capabilities"],
@@ -1290,6 +1291,19 @@ export function DataSync() {
   const checkpoints = checkpointQuery.data?.data.records ?? [];
   const auditRecords = auditQuery.data?.data.records ?? [];
   useEffect(() => {
+    /*
+     * 项目是数据同步模块的可见范围边界。分组筛选、树节点选中态、批量选择和详情抽屉都必须随项目切换失效，
+     * 否则用户在项目 101 选择的 DEFAULT 会继续参与项目 900 的查询，页面看起来就像“换用户后分组乱了”。
+     */
+    setTaskGroupFilter(undefined);
+    setTaskGroupTreeKeyFilter(undefined);
+    setTaskTreeView("tasks");
+    setSelectedTaskRowKeys([]);
+    setSelectedRecycleTaskRowKeys([]);
+    setSelectedTask(null);
+    setSelectedExecutionId(undefined);
+  }, [selectedProjectScopeId]);
+  useEffect(() => {
     setTaskPage((page) => (page === 1 ? page : 1));
   }, [selectedProjectScopeId, taskGroupFilter, taskStateFilter, taskApprovalFilter, normalizedTaskKeyword]);
   useEffect(() => {
@@ -1312,25 +1326,25 @@ export function DataSync() {
       nodes.flatMap((node) => {
         const path = [...parentPath, node.groupName || UNNAMED_SYNC_GROUP].filter(Boolean);
         return [
-          { ...node, groupName: path.join(" / ") || UNNAMED_SYNC_GROUP },
+          { ...node, displayPath: node.displayPath || path.join(" / ") || UNNAMED_SYNC_GROUP },
           ...walk(node.children ?? [], path),
         ];
       });
     return walk(taskGroupTree);
   }, [taskGroupTree]);
   const groupOptions = useMemo(() => {
-    const seenGroupCodes = new Set<string>();
+    const seenGroupKeys = new Set<string>();
     return flatGroupNodes
       .filter((group) => {
-        if (seenGroupCodes.has(group.groupCode)) {
+        if (seenGroupKeys.has(group.uiKey)) {
           return false;
         }
-        seenGroupCodes.add(group.groupCode);
+        seenGroupKeys.add(group.uiKey);
         return true;
       })
       .map((group) => ({
-        value: group.groupCode,
-        label: group.displayPath || group.displayName || group.groupName || UNNAMED_SYNC_GROUP,
+        value: group.uiKey,
+        label: group.groupName || UNNAMED_SYNC_GROUP,
       }));
   }, [flatGroupNodes]);
 
@@ -3822,6 +3836,12 @@ export function DataSync() {
 
   const makeTaskColumns = (recycleView = false): ColumnsType<SyncTask> => [
     {
+      title: "ID",
+      dataIndex: "id",
+      width: 86,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
       title: "任务",
       dataIndex: "name",
       width: 300,
@@ -4165,6 +4185,12 @@ export function DataSync() {
 
   const executionPolicyColumns: ColumnsType<SyncExecutionPolicy> = [
     {
+      title: "ID",
+      dataIndex: "id",
+      width: 82,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
       title: "策略",
       width: 250,
       render: (_, record) => (
@@ -4308,6 +4334,7 @@ export function DataSync() {
   ];
 
   const incidentColumns: ColumnsType<SyncIncident> = [
+    { title: "ID", dataIndex: "id", width: 82, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
     { title: "事故", dataIndex: "title" },
     { title: "严重级别", dataIndex: "severity", render: (value) => <Tag color={severityColor[value] ?? "default"}>{value}</Tag> },
     { title: "状态", dataIndex: "incidentStatus", render: (value) => <Tag>{labelOf(value, incidentStatusLabels)}</Tag> },
@@ -4316,6 +4343,7 @@ export function DataSync() {
   ];
 
   const objectExecutionColumns: ColumnsType<SyncObjectExecution> = [
+    { title: "ID", dataIndex: "id", width: 82, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
     { title: "对象", render: (_, record) => <Typography.Text>{compactObjectName(record.sourceSchemaName, record.sourceObjectName)}</Typography.Text> },
     { title: "目标", render: (_, record) => <Typography.Text>{compactObjectName(record.targetSchemaName, record.targetObjectName)}</Typography.Text> },
     { title: "状态", dataIndex: "objectState", render: (value) => statusTag(value, stateColor, syncExecutionStateLabels) },
@@ -4344,6 +4372,7 @@ export function DataSync() {
   ];
 
   const auditColumns: ColumnsType<SyncAuditRecord> = [
+    { title: "ID", dataIndex: "id", width: 82, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
     { title: "动作", dataIndex: "actionType", render: (value) => <Tag>{labelOf(value || "UNKNOWN", auditActionLabels)}</Tag> },
     { title: "操作者", render: (_, record) => [labelOf(record.actorRole, actorRoleLabels), record.actorId].filter(Boolean).join(" / ") || "-" },
     { title: "结果", dataIndex: "result", render: (value) => value || "-" },
@@ -4521,10 +4550,10 @@ export function DataSync() {
                     <Select
                       allowClear
                       placeholder="按分组筛选"
-                      value={taskGroupFilter}
+                      value={taskGroupTreeKeyFilter}
                       onChange={(value) => {
-                        setTaskGroupFilter(value);
-                        const selectedGroup = findGroupNode(value);
+                        const selectedGroup = value ? groupNodeByTreeKey.get(value) : undefined;
+                        setTaskGroupFilter(selectedGroup?.groupCode);
                         setTaskGroupTreeKeyFilter(selectedGroup?.uiKey);
                         setTaskTreeView("tasks");
                       }}

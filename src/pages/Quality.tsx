@@ -140,6 +140,12 @@ export function Quality() {
 
   const ruleColumns: ColumnsType<QualityRule> = [
     {
+      title: "ID",
+      dataIndex: "id",
+      width: 82,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
       title: "规则",
       dataIndex: "name",
       render: (value, record) => (
@@ -179,7 +185,7 @@ export function Quality() {
   ];
 
   const reportColumns: ColumnsType<QualityReport> = [
-    { title: "报告", dataIndex: "id", render: (value) => <span className="mono">{value}</span> },
+    { title: "ID", dataIndex: "id", render: (value) => <span className="mono">{value}</span> },
     { title: "规则", dataIndex: "ruleName" },
     { title: "分数", dataIndex: "score", render: (value) => <Progress percent={value} size="small" /> },
     {

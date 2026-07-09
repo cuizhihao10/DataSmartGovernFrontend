@@ -63,6 +63,12 @@ export function Permissions() {
 
   const roleColumns: ColumnsType<PermissionRole> = [
     {
+      title: "ID",
+      dataIndex: "id",
+      width: 120,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
       title: "角色",
       dataIndex: "name",
       render: (value, record) => (
@@ -85,6 +91,12 @@ export function Permissions() {
   ];
 
   const policyColumns: ColumnsType<RoutePolicy> = [
+    {
+      title: "ID",
+      dataIndex: "id",
+      width: 120,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
     { title: "路径", dataIndex: "pathPattern", render: (value) => <span className="mono">{value}</span> },
     { title: "资源", dataIndex: "resourceType", render: (value) => <Tag>{labelOf(value, resourceTypeLabels)}</Tag> },
     { title: "动作", dataIndex: "defaultAction", render: (value) => <Tag color="blue">{labelOf(value, actionLabels)}</Tag> },
