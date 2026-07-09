@@ -107,6 +107,18 @@ export interface DataSourceListParams {
   type?: string;
   usagePurpose?: "SOURCE" | "TARGET";
   status?: string;
+  keyword?: string;
+}
+
+export interface GovernanceTaskListParams {
+  current?: number;
+  size?: number;
+  status?: string;
+  type?: string;
+  tenantId?: number;
+  ownerId?: number;
+  projectId?: number;
+  keyword?: string;
 }
 
 export interface GrantDataSourceAuthorizationPayload {
@@ -229,8 +241,6 @@ export interface CreateSyncTaskPayload {
   scheduleConfig?: string;
   runMode?: string;
   ownerId?: number;
-  approvalConfirmed?: boolean;
-  approvalFactId?: string;
 }
 
 export interface SyncTaskCreateWizardDraftPayload extends Omit<CreateSyncTemplatePayload, "name"> {
@@ -269,7 +279,6 @@ export interface SyncTaskQueryParams {
   ownerId?: number;
   groupCode?: string;
   currentState?: string;
-  approvalState?: string;
   triggerType?: string;
   keyword?: string;
   current?: number;
@@ -292,8 +301,6 @@ export interface UpdateSyncTaskPayload {
 
 export interface PublishSyncTaskPayload {
   enableSchedule?: boolean;
-  approvalConfirmed?: boolean;
-  approvalFactId?: string;
   reason?: string;
 }
 
@@ -893,7 +900,6 @@ function normalizeSyncTask(value: unknown, index: number): SyncTask {
     groupName,
     name: readString(record.name, `sync-task-${id}`),
     currentState: readString(record.currentState, "DRAFT"),
-    approvalState: readString(record.approvalState, "NOT_REQUIRED"),
     priority: readString(record.priority, "MEDIUM"),
     scheduleConfig: readString(record.scheduleConfig),
     scheduleEnabled: readBoolean(record.scheduleEnabled),
@@ -1931,8 +1937,10 @@ export const api = {
   pauseGovernanceTask: (id: number) => postJson<unknown>(`/task/tasks/${id}/pause`),
   retryGovernanceTask: (id: number) => postJson<unknown>(`/task/tasks/${id}/retry`),
   cancelGovernanceTask: (id: number) => postJson<unknown>(`/task/tasks/${id}/cancel`),
-  listGovernanceTasks: () =>
-    pageEndpoint<GovernanceTask>("/task/tasks?current=1&size=20", governanceTasks, normalizeTask),
+  listGovernanceTasks: (params?: GovernanceTaskListParams) => {
+    const query = compactQueryString({ current: 1, size: 20, ...params });
+    return pageEndpoint<GovernanceTask>(`/task/tasks?${query}`, governanceTasks, normalizeTask);
+  },
   createQualityRule: (payload: CreateQualityRulePayload) =>
     postJson<unknown>("/quality/quality-rules", payload),
   runQualityCheck: (id: number, payload: RunQualityCheckPayload) =>
@@ -2108,7 +2116,7 @@ export const api = {
     pageEndpoint<SyncExecution>(`/sync/sync-tasks/${taskId}/executions?current=1&size=20`, [], normalizeSyncExecution),
   listSyncExecutionLogs: (taskId: number, executionId: number) =>
     realPageEndpoint<SyncExecutionLog>(
-      `/sync/sync-tasks/${taskId}/executions/${executionId}/logs?current=1&size=200`,
+      `/sync/sync-tasks/${taskId}/executions/${executionId}/logs?current=1&size=100`,
       normalizeSyncExecutionLog,
     ),
   listSyncExecutionPolicies: (params?: SyncExecutionPolicyQueryParams) =>

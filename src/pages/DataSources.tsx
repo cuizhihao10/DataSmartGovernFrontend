@@ -33,7 +33,7 @@ import type {
 } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import { connectorLabels, labelOf, statusLabels } from "@/utils/labels";
-import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
+import { controlledTablePagination, defaultTablePagination, sortByIdDesc } from "@/utils/table";
 
 const statusColor: Record<DataSourceRecord["status"], string> = {
   ENABLED: "green",
@@ -114,6 +114,8 @@ export function DataSources() {
   const [authorizationForm] = Form.useForm<DataSourceAuthorizationFormValues>();
   const [keyword, setKeyword] = useState("");
   const [type, setType] = useState<string>("ALL");
+  const [dataSourcePage, setDataSourcePage] = useState(1);
+  const [dataSourcePageSize, setDataSourcePageSize] = useState(10);
   const [selected, setSelected] = useState<DataSourceRecord | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -133,8 +135,14 @@ export function DataSources() {
     queryFn: api.getSession,
   });
   const dataSourceQuery = useQuery({
-    queryKey: ["datasources", selectedProjectScopeId],
-    queryFn: () => api.listDataSources({ projectId: selectedProjectScopeId, size: 100 }),
+    queryKey: ["datasources", selectedProjectScopeId, keyword, type, dataSourcePage, dataSourcePageSize],
+    queryFn: () => api.listDataSources({
+      projectId: selectedProjectScopeId,
+      keyword: keyword.trim() || undefined,
+      type: type === "ALL" ? undefined : type,
+      current: dataSourcePage,
+      size: dataSourcePageSize,
+    }),
   });
   const notifyConnectionTestResult = (data: DataSourceConnectionTestResult) => {
     if (String(data.testStatus).toUpperCase() !== "SUCCESS") {
@@ -267,14 +275,11 @@ export function DataSources() {
   const matchCurrentScope = (record: DataSourceRecord) => {
     return !scopedProjectId || record.projectId == null || String(record.projectId) === scopedProjectId;
   };
-  const filtered = records.filter((record) => {
-    const matchKeyword = [record.name, record.owner, record.type]
-      .join(" ")
-      .toLowerCase()
-      .includes(keyword.toLowerCase());
-    const matchType = type === "ALL" || record.type === type;
-    return matchKeyword && matchType && matchCurrentScope(record);
-  });
+  const filtered = records.filter((record) => matchCurrentScope(record));
+
+  useEffect(() => {
+    setDataSourcePage(1);
+  }, [selectedProjectScopeId, keyword, type]);
 
   useEffect(() => {
     const projectIds = Array.from(new Set(records.map((record) => record.projectId).filter((id): id is number => id != null)));
@@ -630,7 +635,15 @@ export function DataSources() {
           dataSource={sortByIdDesc(filtered)}
           loading={dataSourceQuery.isLoading}
           locale={{ emptyText: <RealEmpty meta={dataSourceQuery.data?.meta} description="暂无数据源记录" /> }}
-          pagination={defaultTablePagination(8)}
+          pagination={controlledTablePagination({
+            current: dataSourcePage,
+            pageSize: dataSourcePageSize,
+            total: dataSourceQuery.data?.data.total,
+            onChange: (page, pageSize) => {
+              setDataSourcePage(pageSize !== dataSourcePageSize ? 1 : page);
+              setDataSourcePageSize(pageSize);
+            },
+          })}
         />
       </Card>
 

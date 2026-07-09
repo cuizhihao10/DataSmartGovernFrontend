@@ -9,7 +9,7 @@ import {
 import { App, Button, Card, Form, Input, InputNumber, Modal, Progress, Select, Space, Table, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type CreateTaskPayload } from "@/api/endpoints";
 import { DataSourceIndicator } from "@/components/DataSourceIndicator";
 import { RealEmpty } from "@/components/RealEmpty";
@@ -19,7 +19,7 @@ import { useUiStore } from "@/store/uiStore";
 import type { GovernanceTask, LifecycleStatus } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import { labelOf, optionsOf, priorityLabels, taskTypeLabels } from "@/utils/labels";
-import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
+import { controlledTablePagination, sortByIdDesc } from "@/utils/table";
 
 const priorityColor: Record<GovernanceTask["priority"], string> = {
   LOW: "default",
@@ -50,15 +50,24 @@ export function Tasks() {
   const [form] = Form.useForm<CreateTaskPayload>();
   const [keyword, setKeyword] = useState("");
   const [status, setStatus] = useState<"ALL" | LifecycleStatus>("ALL");
+  const [taskPage, setTaskPage] = useState(1);
+  const [taskPageSize, setTaskPageSize] = useState(10);
   const [createOpen, setCreateOpen] = useState(false);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
+  const selectedProjectScopeId = Number.isFinite(Number(selectedProjectId)) ? Number(selectedProjectId) : undefined;
   const sessionQuery = useQuery({
     queryKey: ["task-gateway-session"],
     queryFn: api.getSession,
   });
   const taskQuery = useQuery({
-    queryKey: ["governance-tasks"],
-    queryFn: api.listGovernanceTasks,
+    queryKey: ["governance-tasks", selectedProjectScopeId, keyword, status, taskPage, taskPageSize],
+    queryFn: () => api.listGovernanceTasks({
+      projectId: selectedProjectScopeId,
+      status: status === "ALL" ? undefined : status,
+      keyword: keyword.trim() || undefined,
+      current: taskPage,
+      size: taskPageSize,
+    }),
   });
   const createMutation = useMutation({
     mutationFn: api.createGovernanceTask,
@@ -88,14 +97,10 @@ export function Tasks() {
   });
 
   const records = taskQuery.data?.data.records ?? [];
-  const filtered = records.filter((record) => {
-    const matchKeyword = [record.taskCode, record.name, record.owner, record.type]
-      .join(" ")
-      .toLowerCase()
-      .includes(keyword.toLowerCase());
-    const matchStatus = status === "ALL" || record.status === status;
-    return matchKeyword && matchStatus;
-  });
+
+  useEffect(() => {
+    setTaskPage(1);
+  }, [selectedProjectScopeId, keyword, status]);
 
   const openCreateModal = () => {
     const session = sessionQuery.data?.data;
@@ -245,10 +250,18 @@ export function Tasks() {
         <Table
           rowKey="id"
           columns={columns}
-          dataSource={sortByIdDesc(filtered)}
+          dataSource={sortByIdDesc(records)}
           loading={taskQuery.isLoading}
           locale={{ emptyText: <RealEmpty meta={taskQuery.data?.meta} description="暂无治理任务记录" /> }}
-          pagination={defaultTablePagination(8)}
+          pagination={controlledTablePagination({
+            current: taskPage,
+            pageSize: taskPageSize,
+            total: taskQuery.data?.data.total,
+            onChange: (page, pageSize) => {
+              setTaskPage(pageSize !== taskPageSize ? 1 : page);
+              setTaskPageSize(pageSize);
+            },
+          })}
         />
       </Card>
 

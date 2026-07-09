@@ -98,7 +98,6 @@ import type {
 } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import {
-  approvalLabels,
   actorRoleLabels,
   importStatusLabels,
   labelOf,
@@ -249,13 +248,6 @@ const executionLogStatusLabels: Record<string, string> = {
   BLOCKED: "阻断",
   RETRYING: "重试中",
   SKIPPED: "跳过",
-};
-
-const approvalColor: Record<string, string> = {
-  NOT_REQUIRED: "default",
-  PENDING: "gold",
-  APPROVED: "success",
-  REJECTED: "error",
 };
 
 const severityColor: Record<string, string> = {
@@ -1015,7 +1007,6 @@ export function DataSync() {
   const [taskGroupFilter, setTaskGroupFilter] = useState<string>();
   const [taskGroupTreeKeyFilter, setTaskGroupTreeKeyFilter] = useState<string>();
   const [taskStateFilter, setTaskStateFilter] = useState<string>();
-  const [taskApprovalFilter, setTaskApprovalFilter] = useState<string>();
   const [taskPage, setTaskPage] = useState(1);
   const [recycleTaskPage, setRecycleTaskPage] = useState(1);
   const [taskPageSize, setTaskPageSize] = useState(SYNC_TASK_TABLE_PAGE_SIZE);
@@ -1088,14 +1079,13 @@ export function DataSync() {
     queryFn: api.listSyncTemplates,
   });
   const taskQuery = useQuery({
-    queryKey: ["sync-tasks", selectedProjectScopeId, taskGroupFilter, taskStateFilter, taskApprovalFilter, normalizedTaskKeyword, taskPage, taskPageSize],
+    queryKey: ["sync-tasks", selectedProjectScopeId, taskGroupFilter, taskStateFilter, normalizedTaskKeyword, taskPage, taskPageSize],
     queryFn: () =>
       api.listSyncTasks(
         compactPayload({
           projectId: selectedProjectScopeId,
           groupCode: taskGroupFilter,
           currentState: taskStateFilter,
-          approvalState: taskApprovalFilter,
           keyword: normalizedTaskKeyword,
           current: taskPage,
           size: taskPageSize,
@@ -1111,13 +1101,12 @@ export function DataSync() {
     queryFn: () => api.listSyncTaskGroupTree(compactPayload({ projectId: selectedProjectScopeId, size: 200 })),
   });
   const recycleBinQuery = useQuery({
-    queryKey: ["sync-recycle-bin", selectedProjectScopeId, taskGroupFilter, taskApprovalFilter, normalizedTaskKeyword, recycleTaskPage, recycleTaskPageSize],
+    queryKey: ["sync-recycle-bin", selectedProjectScopeId, taskGroupFilter, normalizedTaskKeyword, recycleTaskPage, recycleTaskPageSize],
     queryFn: () =>
       api.listRecycledSyncTasks(
         compactPayload({
           projectId: selectedProjectScopeId,
           groupCode: taskGroupFilter,
-          approvalState: taskApprovalFilter,
           keyword: normalizedTaskKeyword,
           current: recycleTaskPage,
           size: recycleTaskPageSize,
@@ -1313,10 +1302,10 @@ export function DataSync() {
   }, [selectedProjectScopeId]);
   useEffect(() => {
     setTaskPage((page) => (page === 1 ? page : 1));
-  }, [selectedProjectScopeId, taskGroupFilter, taskStateFilter, taskApprovalFilter, normalizedTaskKeyword]);
+  }, [selectedProjectScopeId, taskGroupFilter, taskStateFilter, normalizedTaskKeyword]);
   useEffect(() => {
     setRecycleTaskPage((page) => (page === 1 ? page : 1));
-  }, [selectedProjectScopeId, taskGroupFilter, taskApprovalFilter, normalizedTaskKeyword]);
+  }, [selectedProjectScopeId, taskGroupFilter, normalizedTaskKeyword]);
   useEffect(() => {
     const projectIds = Array.from(
       new Set(
@@ -1663,7 +1652,6 @@ export function DataSync() {
         format,
         groupCode: taskGroupFilter,
         currentState: taskStateFilter,
-        approvalState: taskApprovalFilter,
         keyword: normalizedTaskKeyword,
         current: 1,
         size: 500,
@@ -3872,7 +3860,6 @@ export function DataSync() {
       ),
     },
     { title: "状态", dataIndex: "currentState", width: 130, render: (value) => statusTag(value, stateColor, syncTaskStateLabels) },
-    { title: "审批", dataIndex: "approvalState", width: 110, render: (value) => statusTag(value, approvalColor, approvalLabels) },
     { title: "优先级", dataIndex: "priority", width: 90, render: (value) => <Tag>{labelOf(value, priorityLabels)}</Tag> },
     {
       title: "调度",
@@ -4584,20 +4571,11 @@ export function DataSync() {
                       options={optionsOf(taskStateOptions, syncTaskStateLabels)}
                       style={{ width: 180 }}
                     />
-                    <Select
-                      allowClear
-                      placeholder="按审批状态筛选"
-                      value={taskApprovalFilter}
-                      onChange={setTaskApprovalFilter}
-                      options={optionsOf(["NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED"], approvalLabels)}
-                      style={{ width: 180 }}
-                    />
                     <Button onClick={() => {
                       setTaskGroupFilter(undefined);
                       setTaskGroupTreeKeyFilter(undefined);
                       setTaskTreeView("tasks");
                       setTaskStateFilter(undefined);
-                      setTaskApprovalFilter(undefined);
                     }}>
                       清空筛选
                     </Button>
@@ -5515,7 +5493,7 @@ export function DataSync() {
         forceRender
       >
         <div className="page-stack">
-          <Alert showIcon type="warning" message="导入的是任务定义，不是业务数据" description="导入文件只允许创建新的同步任务定义。文件里的任务状态、审批状态和触发方式只作为上下文，最终状态由后端状态机决定；如有命名冲突或校验失败，后端会返回行级诊断并拒绝整批写入。" />
+          <Alert showIcon type="warning" message="导入的是任务定义，不是业务数据" description="导入文件只允许创建新的同步任务定义。文件里的任务状态和触发方式只作为上下文，最终状态由后端状态机决定；如有命名冲突或校验失败，后端会返回行级诊断并拒绝整批写入。" />
           <Form<ImportTaskValues>
             form={importForm}
             layout="vertical"
@@ -5865,7 +5843,6 @@ export function DataSync() {
               <Descriptions.Item label="模板 ID">{selectedTask.templateId}</Descriptions.Item>
               <Descriptions.Item label="任务分组">{selectedTask.groupName || "默认分组"}</Descriptions.Item>
               <Descriptions.Item label="状态">{statusTag(selectedTask.currentState, stateColor, syncTaskStateLabels)}</Descriptions.Item>
-              <Descriptions.Item label="审批">{statusTag(selectedTask.approvalState, approvalColor, approvalLabels)}</Descriptions.Item>
               <Descriptions.Item label="最近执行">{selectedTask.lastExecutionId || "-"}</Descriptions.Item>
               <Descriptions.Item label="负责人">{selectedTask.ownerId || "-"}</Descriptions.Item>
               <Descriptions.Item label="自动调度">{selectedTask.scheduleEnabled ? "已启用" : "未启用"}</Descriptions.Item>
@@ -5895,7 +5872,6 @@ export function DataSync() {
                           <Descriptions.Item label="任务分组">{selectedTask.groupName || "默认分组"}</Descriptions.Item>
                           <Descriptions.Item label="负责人">{selectedTask.ownerId || "-"}</Descriptions.Item>
                           <Descriptions.Item label="任务状态">{statusTag(selectedTask.currentState, stateColor, syncTaskStateLabels)}</Descriptions.Item>
-                          <Descriptions.Item label="审批状态">{statusTag(selectedTask.approvalState, approvalColor, approvalLabels)}</Descriptions.Item>
                           <Descriptions.Item label="同步模式">{labelOf(selectedTaskTemplate?.syncMode, syncModeLabels)}</Descriptions.Item>
                           <Descriptions.Item label="同步范围">{labelOf(selectedTaskTemplate?.syncScopeType, syncScopeLabels)}</Descriptions.Item>
                           <Descriptions.Item label="写入模式">{labelOf(selectedTaskTemplate?.writeStrategy, writeStrategyLabels)}</Descriptions.Item>

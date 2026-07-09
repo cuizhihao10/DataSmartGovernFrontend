@@ -321,7 +321,6 @@ export interface SyncTask {
   groupName?: string;
   name: string;
   currentState: SyncTaskState | string;
-  approvalState: SyncApprovalState | string;
   priority: "LOW" | "MEDIUM" | "NORMAL" | "HIGH" | "URGENT" | string;
   scheduleConfig?: string;
   scheduleEnabled?: boolean;
