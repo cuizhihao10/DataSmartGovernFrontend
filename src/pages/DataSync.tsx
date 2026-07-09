@@ -61,6 +61,7 @@ import {
   type SyncTaskMetadataDiscoveryPayload,
   type SyncTaskScheduleDispatchPayload,
   type SyncTaskRecoveryPayload,
+  type UpsertSyncExecutionPolicyPayload,
   type UpdateSyncTaskGroupPayload,
   type UpdateSyncTaskPayload,
   type SyncWorkerLoopRunPayload,
@@ -79,6 +80,8 @@ import type {
   SyncErrorSample,
   SyncExecution,
   SyncExecutionLog,
+  SyncExecutionPolicy,
+  SyncExecutionPolicySnapshot,
   SyncIncident,
   SyncObjectExecution,
   SyncTask,
@@ -144,6 +147,27 @@ const dataSourceUsageLabels: Record<string, string> = {
   SOURCE: "仅源端",
   TARGET: "仅目标端",
 };
+
+const executionPolicyScopeLabels: Record<string, string> = {
+  SYSTEM: "系统默认",
+  PROJECT: "项目级",
+  CONNECTOR: "连接器级",
+  DATASOURCE: "数据源级",
+  TASK: "任务级",
+};
+
+const executionPolicyConnectorRoleLabels: Record<string, string> = {
+  ANY: "源端或目标端",
+  SOURCE: "仅源端",
+  TARGET: "仅目标端",
+};
+
+const executionPolicyWriteRoles = new Set([
+  "OPERATOR",
+  "TENANT_ADMINISTRATOR",
+  "PLATFORM_ADMINISTRATOR",
+  "SERVICE_ACCOUNT",
+]);
 
 function isNumericScopeValue(value?: string | number) {
   if (value == null || value === "") {
@@ -976,6 +1000,7 @@ export function DataSync() {
   const [dirtyReplayForm] = Form.useForm<SyncDirtyRecordReplayPayload>();
   const [workerForm] = Form.useForm<SyncWorkerLoopRunPayload>();
   const [schedulerForm] = Form.useForm<SyncTaskScheduleDispatchPayload>();
+  const [executionPolicyForm] = Form.useForm<UpsertSyncExecutionPolicyPayload>();
   const [activeTab, setActiveTab] = useState("tasks");
   const [taskTreeView, setTaskTreeView] = useState<"tasks" | "recycle">("tasks");
   const [templateKeyword, setTemplateKeyword] = useState("");
@@ -1022,6 +1047,8 @@ export function DataSync() {
   const [selectedTask, setSelectedTask] = useState<SyncTask | null>(null);
   const [selectedExecutionId, setSelectedExecutionId] = useState<number>();
   const [taskDrawerActiveTab, setTaskDrawerActiveTab] = useState("definition");
+  const [executionPolicyDrawerOpen, setExecutionPolicyDrawerOpen] = useState(false);
+  const [editingExecutionPolicy, setEditingExecutionPolicy] = useState<SyncExecutionPolicy | null>(null);
   const [recoveryAction, setRecoveryAction] = useState<"replay" | "backfill" | null>(null);
   const [recoveryTask, setRecoveryTask] = useState<SyncTask | null>(null);
   const [sourceObjectKeyword, setSourceObjectKeyword] = useState("");
@@ -1032,6 +1059,7 @@ export function DataSync() {
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const setProjectOptions = useUiStore((state) => state.setProjectOptions);
   const selectedProjectScopeId = isNumericScopeValue(selectedProjectId) ? Number(selectedProjectId) : undefined;
+  const executionPolicyScopeType = Form.useWatch("scopeType", executionPolicyForm);
   const normalizedTaskKeyword = taskKeyword.trim();
 
   const sessionQuery = useQuery({
@@ -1090,6 +1118,24 @@ export function DataSync() {
   const incidentQuery = useQuery({
     queryKey: ["sync-incidents"],
     queryFn: api.listSyncIncidents,
+  });
+  const executionPolicyQuery = useQuery({
+    queryKey: ["sync-execution-policies", selectedProjectScopeId],
+    queryFn: () => api.listSyncExecutionPolicies({
+      projectId: selectedProjectScopeId,
+      current: 1,
+      size: 200,
+    }),
+    enabled: activeTab === "executionPolicies",
+  });
+  const executionPolicyTaskQuery = useQuery({
+    queryKey: ["sync-execution-policy-task-options", selectedProjectScopeId],
+    queryFn: () => api.listSyncTasks(compactPayload({
+      projectId: selectedProjectScopeId,
+      current: 1,
+      size: 200,
+    })),
+    enabled: activeTab === "executionPolicies" || executionPolicyDrawerOpen,
   });
   const executionQuery = useQuery({
     queryKey: ["sync-executions", selectedTask?.id],
@@ -1231,8 +1277,15 @@ export function DataSync() {
     enabled: Boolean(selectedTask?.id && selectedExecutionId),
     refetchInterval: selectedExecutionIsLive ? 3000 : false,
   });
+  const executionPolicySnapshotQuery = useQuery({
+    queryKey: ["sync-execution-policy-snapshot", selectedTask?.id, selectedExecutionId],
+    queryFn: () => api.getSyncExecutionPolicySnapshot(selectedTask!.id, selectedExecutionId!),
+    enabled: Boolean(selectedTask?.id && selectedExecutionId && taskDrawerActiveTab === "logs"),
+  });
   const objectExecutions = objectExecutionQuery.data?.data.records ?? [];
   const executionLogs = executionLogQuery.data?.data.records ?? [];
+  const executionPolicies = executionPolicyQuery.data?.data.records ?? [];
+  const executionPolicySnapshot = executionPolicySnapshotQuery.data?.data;
   const errorSamples = errorSampleQuery.data?.data.records ?? [];
   const checkpoints = checkpointQuery.data?.data.records ?? [];
   const auditRecords = auditQuery.data?.data.records ?? [];
@@ -1709,6 +1762,30 @@ export function DataSync() {
       ]);
     },
     onError: (error) => message.error(error instanceof Error ? error.message : "定时任务派发失败"),
+  });
+
+  const executionPolicyMutation = useMutation({
+    mutationFn: ({ id, payload }: { id?: number; payload: UpsertSyncExecutionPolicyPayload }) =>
+      id
+        ? api.updateSyncExecutionPolicy(id, payload)
+        : api.createSyncExecutionPolicy(payload),
+    onSuccess: async (result) => {
+      message.success(`执行策略已${editingExecutionPolicy ? "更新" : "创建"}：${result.data.policyName || result.data.policyCode || result.data.id}`);
+      setExecutionPolicyDrawerOpen(false);
+      setEditingExecutionPolicy(null);
+      executionPolicyForm.resetFields();
+      await executionPolicyQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "执行策略保存失败"),
+  });
+
+  const disableExecutionPolicyMutation = useMutation({
+    mutationFn: (id: number) => api.disableSyncExecutionPolicy(id),
+    onSuccess: async () => {
+      message.success("执行策略已禁用，历史 execution 的策略快照不会被改写");
+      await executionPolicyQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "执行策略禁用失败"),
   });
 
   const filteredTemplates = templates.filter((record) =>
@@ -2769,6 +2846,11 @@ export function DataSync() {
       selectedTask ? executionQuery.refetch() : Promise.resolve(),
       selectedTask && selectedExecutionId ? objectExecutionQuery.refetch() : Promise.resolve(),
       selectedTask && selectedExecutionId ? executionLogQuery.refetch() : Promise.resolve(),
+      activeTab === "executionPolicies" ? executionPolicyQuery.refetch() : Promise.resolve(),
+      activeTab === "executionPolicies" ? executionPolicyTaskQuery.refetch() : Promise.resolve(),
+      selectedTask && selectedExecutionId && taskDrawerActiveTab === "logs"
+        ? executionPolicySnapshotQuery.refetch()
+        : Promise.resolve(),
       selectedTask ? errorSampleQuery.refetch() : Promise.resolve(),
       selectedTask ? checkpointQuery.refetch() : Promise.resolve(),
       selectedTask ? auditQuery.refetch() : Promise.resolve(),
@@ -2779,6 +2861,9 @@ export function DataSync() {
   const currentProject = currentSession?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
   const currentProjectLabel = currentProject?.projectName ?? currentProject?.name ?? currentSession?.projectName ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
   const scopedProjectId = isNumericScopeValue(selectedProjectId) ? String(selectedProjectId) : undefined;
+  const canManageExecutionPolicies = executionPolicyWriteRoles.has(
+    String(currentSession?.actorRole || "").toUpperCase(),
+  );
 
   const matchCurrentDatasourceScope = (record: (typeof dataSources)[number]) => {
     return !scopedProjectId || record.projectId == null || String(record.projectId) === scopedProjectId;
@@ -2794,6 +2879,78 @@ export function DataSync() {
     .filter(matchCurrentDatasourceScope)
     .filter((record) => record.usageRole === "TARGET")
     .map((record) => ({ value: record.id, label: dataSourceOptionLabel(record) }));
+  const executionPolicyDatasourceOptions = dataSources
+    .filter(matchCurrentDatasourceScope)
+    .map((record) => ({ value: record.id, label: dataSourceOptionLabel(record) }));
+  const executionPolicyConnectorOptions = capabilities.map((record) => ({
+    value: record.connectorType,
+    label: `${record.displayName}（${record.connectorType}）`,
+  }));
+  const executionPolicyTaskOptions = (executionPolicyTaskQuery.data?.data.records ?? tasks).map((record) => ({
+    value: record.id,
+    label: `${record.name}（任务 ${record.id}）`,
+  }));
+
+  /**
+   * 打开执行策略编辑抽屉。
+   *
+   * 新建时默认使用当前租户、当前项目和 PROJECT 作用域，让运营人员不需要手工复制上下文 ID；
+   * 编辑时完整回填已有策略。后端仍会再次校验租户、项目和角色，前端默认值不构成安全边界。
+   */
+  const openExecutionPolicyDrawer = (policy?: SyncExecutionPolicy) => {
+    setEditingExecutionPolicy(policy ?? null);
+    executionPolicyForm.resetFields();
+    executionPolicyForm.setFieldsValue(policy
+      ? {
+          ...policy,
+          enabled: policy.enabled,
+        }
+      : {
+          tenantId: isNumericScopeValue(currentSession?.tenantId) ? Number(currentSession?.tenantId) : undefined,
+          projectId: selectedProjectScopeId,
+          scopeType: "PROJECT",
+          connectorRole: "ANY",
+          enabled: true,
+          minShardCount: 1,
+          maxShardCount: 64,
+          priority: 100,
+        });
+    setExecutionPolicyDrawerOpen(true);
+  };
+
+  /**
+   * 将动态表单转换为后端策略合同。
+   *
+   * 不同作用域只提交自身需要的定位字段，避免用户把 CONNECTOR 的 connectorType 残留到 PROJECT 策略中。
+   * 参数为空表示继续继承低优先级策略，不能擅自补 0；0 对批大小、超时等字段是非法值，也会破坏继承语义。
+   */
+  const submitExecutionPolicy = (values: UpsertSyncExecutionPolicyPayload) => {
+    const scopeType = String(values.scopeType || "").toUpperCase();
+    const payload = compactPayload({
+      ...values,
+      id: undefined,
+      scopeType,
+      projectId: ["PROJECT", "TASK"].includes(scopeType)
+        ? values.projectId ?? selectedProjectScopeId
+        : values.projectId,
+      datasourceId: scopeType === "DATASOURCE" ? values.datasourceId : undefined,
+      connectorType: scopeType === "CONNECTOR" ? values.connectorType : undefined,
+      connectorRole: ["CONNECTOR", "DATASOURCE"].includes(scopeType) ? values.connectorRole ?? "ANY" : undefined,
+      syncTaskId: scopeType === "TASK" ? values.syncTaskId : undefined,
+    });
+    executionPolicyMutation.mutate({ id: editingExecutionPolicy?.id, payload });
+  };
+
+  const confirmDisableExecutionPolicy = (policy: SyncExecutionPolicy) => {
+    modal.confirm({
+      title: "确认禁用执行策略？",
+      content: `策略“${policy.policyName || policy.policyCode || policy.id}”禁用后不再参与新 execution 的策略解析；已经保存的历史策略快照不会改变。`,
+      okText: "禁用策略",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: () => disableExecutionPolicyMutation.mutateAsync(policy.id),
+    });
+  };
 
   const sourceObjectRows = filterMetadataTables(sourceDiscovery, sourceObjectKeyword, sourceSchemaFilter);
   const targetObjectRows = filterMetadataTables(targetDiscovery, targetObjectKeyword, targetSchemaFilter);
@@ -4006,6 +4163,123 @@ export function DataSync() {
     },
   ];
 
+  const executionPolicyColumns: ColumnsType<SyncExecutionPolicy> = [
+    {
+      title: "策略",
+      width: 250,
+      render: (_, record) => (
+        <Space direction="vertical" size={2}>
+          <Space wrap size={4}>
+            <Typography.Text strong>{record.policyName || record.policyCode || `策略 ${record.id}`}</Typography.Text>
+            <Tag color={record.enabled ? "green" : "default"}>{record.enabled ? "启用" : "已禁用"}</Tag>
+          </Space>
+          <Typography.Text type="secondary" className="mono">{record.policyCode || "-"}</Typography.Text>
+          {record.description ? <Typography.Text type="secondary">{record.description}</Typography.Text> : null}
+        </Space>
+      ),
+    },
+    {
+      title: "作用范围",
+      width: 220,
+      render: (_, record) => (
+        <Space direction="vertical" size={2}>
+          <Tag color={record.scopeType === "TASK" ? "volcano" : record.scopeType === "PROJECT" ? "blue" : "default"}>
+            {labelOf(record.scopeType, executionPolicyScopeLabels)}
+          </Tag>
+          <Typography.Text>{record.scopeName || record.scopeKey || "-"}</Typography.Text>
+          {record.connectorType ? (
+            <Typography.Text type="secondary">
+              {record.connectorType} / {labelOf(record.connectorRole || "ANY", executionPolicyConnectorRoleLabels)}
+            </Typography.Text>
+          ) : null}
+          {record.datasourceId ? <Typography.Text type="secondary">数据源 {record.datasourceId}</Typography.Text> : null}
+          {record.syncTaskId ? <Typography.Text type="secondary">任务 {record.syncTaskId}</Typography.Text> : null}
+        </Space>
+      ),
+    },
+    {
+      title: "自动分片",
+      width: 170,
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>目标 {record.targetRowsPerShard?.toLocaleString() || "继承"} 行/片</Typography.Text>
+          <Typography.Text type="secondary">
+            范围 {record.minShardCount ?? "继承"} - {record.maxShardCount ?? "继承"} 片
+          </Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: "并发与分组",
+      width: 150,
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>channel {record.maxChannel ?? "继承"}</Typography.Text>
+          <Typography.Text type="secondary">TaskGroup {record.taskGroupSize ?? "继承"}</Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: "批处理",
+      width: 180,
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>读 {record.readBatchSize ?? "继承"} / 写 {record.writeBatchSize ?? "继承"}</Typography.Text>
+          <Typography.Text type="secondary">提交间隔 {record.commitIntervalRecords ?? "继承"}</Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: "容错",
+      width: 190,
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>超时 {record.timeoutSeconds ?? "继承"} 秒 / 重试 {record.maxRetryCount ?? "继承"}</Typography.Text>
+          <Typography.Text type="secondary">
+            脏数据 {record.maxDirtyRecordCount ?? "继承"} 条 / {record.maxDirtyRecordRatio ?? "继承"}
+          </Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: "优先级",
+      dataIndex: "priority",
+      width: 90,
+      render: (value) => value ?? "-",
+    },
+    {
+      title: "更新时间",
+      dataIndex: "updateTime",
+      width: 170,
+      render: (value) => formatDateTime(value),
+    },
+    {
+      title: "操作",
+      fixed: "right",
+      width: 110,
+      render: (_, record) => (
+        <Space>
+          <Button
+            aria-label="编辑执行策略"
+            title="编辑执行策略"
+            icon={<EditOutlined />}
+            disabled={!canManageExecutionPolicies}
+            onClick={() => openExecutionPolicyDrawer(record)}
+          />
+          <Button
+            danger
+            aria-label="禁用执行策略"
+            title="禁用执行策略"
+            icon={<StopOutlined />}
+            disabled={!canManageExecutionPolicies || !record.enabled}
+            loading={disableExecutionPolicyMutation.isPending}
+            onClick={() => confirmDisableExecutionPolicy(record)}
+          />
+        </Space>
+      ),
+    },
+  ];
+
   const capabilityColumns: ColumnsType<SyncConnectorCapability> = [
     {
       title: "连接器",
@@ -4347,6 +4621,60 @@ export function DataSync() {
             key: "capabilities",
             label: "连接器能力",
             children: <Card className="table-card"><Table rowKey="connectorType" columns={capabilityColumns} dataSource={capabilities} loading={capabilityQuery.isLoading} pagination={{ pageSize: 8, showSizeChanger: false }} /></Card>,
+          },
+          {
+            key: "executionPolicies",
+            label: "执行策略",
+            children: (
+              <div className="page-stack">
+                <Alert
+                  showIcon
+                  type="info"
+                  message="分片、并发、批大小、超时和重试由管理员策略统一治理"
+                  description="普通用户创建任务时不填写固定 shardCount。AUTO_SPLIT_PK 会先探测源表 rowCount，再按“目标每片行数”自动计算分片数并应用最小/最大裁剪；channel 只是并发上限，不等于分片数。运行时生效顺序为：任务级 > 项目级 > 数据源/连接器级 > 系统默认。"
+                />
+                {!canManageExecutionPolicies ? (
+                  <Alert
+                    showIcon
+                    type="warning"
+                    message="当前角色仅可查看执行策略"
+                    description="运营、租户管理员、平台管理员或服务账号可以维护策略；项目负责人和审计员用于查看策略及历史 execution 快照。"
+                  />
+                ) : null}
+                {executionPolicyQuery.isError ? (
+                  <Alert
+                    showIcon
+                    type="error"
+                    message="执行策略加载失败"
+                    description={executionPolicyQuery.error instanceof Error ? executionPolicyQuery.error.message : "请检查网关路由与执行策略查看权限。"}
+                  />
+                ) : null}
+                <Card
+                  className="table-card"
+                  title={`当前项目继承链（${currentProjectLabel}）`}
+                  extra={(
+                    <Button
+                      type="primary"
+                      icon={<PlusOutlined />}
+                      disabled={!canManageExecutionPolicies}
+                      onClick={() => openExecutionPolicyDrawer()}
+                    >
+                      新建执行策略
+                    </Button>
+                  )}
+                >
+                  <Table
+                    rowKey="id"
+                    columns={executionPolicyColumns}
+                    dataSource={executionPolicies}
+                    loading={executionPolicyQuery.isLoading || executionPolicyQuery.isFetching}
+                    scroll={{ x: 1540 }}
+                    locale={{ emptyText: <RealEmpty meta={executionPolicyQuery.data?.meta} description="暂无可见执行策略" /> }}
+                    pagination={{ pageSize: 10, showSizeChanger: true }}
+                  />
+                </Card>
+              </div>
+            ),
           },
           {
             key: "incidents",
@@ -5231,6 +5559,240 @@ export function DataSync() {
       </Modal>
 
       <Drawer
+        width={860}
+        title={editingExecutionPolicy ? "编辑数据同步执行策略" : "新建数据同步执行策略"}
+        open={executionPolicyDrawerOpen}
+        onClose={() => {
+          setExecutionPolicyDrawerOpen(false);
+          setEditingExecutionPolicy(null);
+          executionPolicyForm.resetFields();
+        }}
+        extra={(
+          <Space>
+            <Button onClick={() => setExecutionPolicyDrawerOpen(false)}>取消</Button>
+            <Button
+              type="primary"
+              loading={executionPolicyMutation.isPending}
+              onClick={() => executionPolicyForm.submit()}
+            >
+              保存策略
+            </Button>
+          </Space>
+        )}
+        destroyOnHidden
+        forceRender
+      >
+        <div className="page-stack">
+          <Alert
+            showIcon
+            type="info"
+            message="空字段表示继承，不是重置为 0"
+            description="策略按 SYSTEM -> CONNECTOR/DATASOURCE -> PROJECT -> TASK 逐层合并，越具体的作用域越晚覆盖。普通用户无需在任务向导中配置这些参数；每次 execution 会固化最终快照。"
+          />
+          <Form<UpsertSyncExecutionPolicyPayload>
+            form={executionPolicyForm}
+            layout="vertical"
+            onFinish={submitExecutionPolicy}
+          >
+            <div className="grid grid-two-form">
+              <Form.Item
+                name="scopeType"
+                label="策略作用域"
+                rules={[{ required: true, message: "请选择策略作用域" }]}
+              >
+                <Select
+                  options={Object.entries(executionPolicyScopeLabels).map(([value, label]) => ({ value, label }))}
+                />
+              </Form.Item>
+              <Form.Item
+                name="policyName"
+                label="策略名称"
+                rules={[{ required: true, message: "请输入策略名称" }]}
+              >
+                <Input placeholder="例如：FlashSync 项目大表同步策略" />
+              </Form.Item>
+            </div>
+
+            <div className="grid grid-two-form">
+              <Form.Item name="policyCode" label="策略编码">
+                <Input placeholder="留空时由后端按作用域生成" />
+              </Form.Item>
+              <Form.Item name="scopeName" label="作用范围名称">
+                <Input placeholder="例如：FlashSync 项目 / MySQL 源端" />
+              </Form.Item>
+            </div>
+
+            {executionPolicyScopeType === "SYSTEM"
+              && String(currentSession?.actorRole || "").toUpperCase() === "PLATFORM_ADMINISTRATOR" ? (
+                <Form.Item
+                  name="tenantId"
+                  label="系统策略范围"
+                  tooltip="tenantId=0 是平台全局策略；当前租户表示只在当前租户内生效。"
+                  rules={[{ required: true, message: "请选择系统策略范围" }]}
+                >
+                  <Select
+                    options={[
+                      { value: 0, label: "平台全局（所有租户兜底）" },
+                      ...(isNumericScopeValue(currentSession?.tenantId)
+                        ? [{ value: Number(currentSession?.tenantId), label: `当前租户 ${currentSession?.tenantId}` }]
+                        : []),
+                    ]}
+                  />
+                </Form.Item>
+              ) : (
+                <Form.Item name="tenantId" hidden><InputNumber /></Form.Item>
+              )}
+
+            {["PROJECT", "TASK"].includes(String(executionPolicyScopeType || "")) ? (
+              <>
+                <Alert
+                  showIcon
+                  type="success"
+                  message={`策略归属当前项目：${currentProjectLabel}`}
+                  description="项目来自页面顶部项目切换器和登录上下文，不需要手工填写项目 ID。"
+                  style={{ marginBottom: 16 }}
+                />
+                <Form.Item name="projectId" hidden><InputNumber /></Form.Item>
+              </>
+            ) : null}
+
+            {executionPolicyScopeType === "CONNECTOR" ? (
+              <div className="grid grid-two-form">
+                <Form.Item
+                  name="connectorType"
+                  label="连接器类型"
+                  rules={[{ required: true, message: "请选择连接器类型" }]}
+                >
+                  <Select showSearch options={executionPolicyConnectorOptions} />
+                </Form.Item>
+                <Form.Item
+                  name="connectorRole"
+                  label="连接器方向"
+                  rules={[{ required: true, message: "请选择连接器方向" }]}
+                >
+                  <Select options={Object.entries(executionPolicyConnectorRoleLabels).map(([value, label]) => ({ value, label }))} />
+                </Form.Item>
+              </div>
+            ) : null}
+
+            {executionPolicyScopeType === "DATASOURCE" ? (
+              <div className="grid grid-two-form">
+                <Form.Item
+                  name="datasourceId"
+                  label="数据源"
+                  rules={[{ required: true, message: "请选择数据源" }]}
+                >
+                  <Select
+                    showSearch
+                    optionFilterProp="label"
+                    options={executionPolicyDatasourceOptions}
+                    placeholder="按名称选择当前项目数据源"
+                  />
+                </Form.Item>
+                <Form.Item
+                  name="connectorRole"
+                  label="应用方向"
+                  rules={[{ required: true, message: "请选择应用方向" }]}
+                >
+                  <Select options={Object.entries(executionPolicyConnectorRoleLabels).map(([value, label]) => ({ value, label }))} />
+                </Form.Item>
+              </div>
+            ) : null}
+
+            {executionPolicyScopeType === "TASK" ? (
+              <Form.Item
+                name="syncTaskId"
+                label="同步任务"
+                rules={[{ required: true, message: "请选择需要单独覆盖的同步任务" }]}
+              >
+                <Select
+                  showSearch
+                  optionFilterProp="label"
+                  loading={executionPolicyTaskQuery.isLoading}
+                  options={executionPolicyTaskOptions}
+                  placeholder="按任务名称选择"
+                />
+              </Form.Item>
+            ) : null}
+
+            <Card className="compact-card" title="自动分片与并发">
+              <Alert
+                showIcon
+                type="warning"
+                message="系统按数据量自动计算分片数"
+                description="候选分片数 = ceil(源表行数 / 目标每片行数)，再按最小/最大分片数裁剪。最大 channel 只控制同时执行多少个分片，不会改变分片总数。"
+                style={{ marginBottom: 16 }}
+              />
+              <div className="grid grid-two-form">
+                <Form.Item name="targetRowsPerShard" label="目标每片行数">
+                  <InputNumber min={1} step={10000} style={{ width: "100%" }} placeholder="例如 200000；留空继承" />
+                </Form.Item>
+                <Form.Item name="maxChannel" label="最大并发 channel">
+                  <InputNumber min={1} max={256} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+              </div>
+              <div className="grid grid-two-form">
+                <Form.Item name="minShardCount" label="最小分片数">
+                  <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+                <Form.Item name="maxShardCount" label="最大分片数">
+                  <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+              </div>
+              <Form.Item name="taskGroupSize" label="每个 TaskGroup 的分片数">
+                <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+              </Form.Item>
+            </Card>
+
+            <Card className="compact-card" title="批处理与事务">
+              <div className="grid grid-three">
+                <Form.Item name="readBatchSize" label="读取批大小">
+                  <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+                <Form.Item name="writeBatchSize" label="写入批大小">
+                  <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+                <Form.Item name="commitIntervalRecords" label="提交间隔记录数">
+                  <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+              </div>
+            </Card>
+
+            <Card className="compact-card" title="超时、重试与脏数据阈值">
+              <div className="grid grid-two-form">
+                <Form.Item name="timeoutSeconds" label="超时时间（秒）">
+                  <InputNumber min={1} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+                <Form.Item name="maxRetryCount" label="最大重试次数">
+                  <InputNumber min={0} max={100} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+              </div>
+              <div className="grid grid-two-form">
+                <Form.Item name="maxDirtyRecordCount" label="脏数据数量阈值">
+                  <InputNumber min={0} style={{ width: "100%" }} placeholder="留空继承" />
+                </Form.Item>
+                <Form.Item name="maxDirtyRecordRatio" label="脏数据比例阈值">
+                  <InputNumber min={0} max={1} step={0.001} style={{ width: "100%" }} placeholder="0.01 表示 1%" />
+                </Form.Item>
+              </div>
+            </Card>
+
+            <div className="grid grid-two-form">
+              <Form.Item name="priority" label="同层优先级" tooltip="同一作用域中数值越大越晚合并，因此覆盖同层较低优先级策略。">
+                <InputNumber min={0} style={{ width: "100%" }} />
+              </Form.Item>
+              <Form.Item name="enabled" label="启用状态" valuePropName="checked">
+                <Checkbox>创建或保存后立即参与新 execution 的策略解析</Checkbox>
+              </Form.Item>
+            </div>
+            <Form.Item name="description" label="策略说明">
+              <Input.TextArea rows={4} placeholder="说明适用场景、容量依据、风险边界和变更原因，便于后续审计与排障。" />
+            </Form.Item>
+          </Form>
+        </div>
+      </Drawer>
+
+      <Drawer
         width={1080}
         title={selectedTask?.name}
         open={Boolean(selectedTask)}
@@ -5404,6 +5966,77 @@ export function DataSync() {
                         }
                         description="运行日志记录任务入队、执行器认领、预检查/计划、通道创建、对象或分片同步、批次回执、断点与最终完成等关键阶段。日志只展示低敏进度事实，不展示 SQL、连接串、密码、where 原文或样本行。"
                       />
+                      {selectedExecutionId ? (
+                        <Card
+                          className="compact-card"
+                          title={`本次执行实际生效策略 · execution #${selectedExecutionId}`}
+                          loading={executionPolicySnapshotQuery.isLoading || executionPolicySnapshotQuery.isFetching}
+                        >
+                          {executionPolicySnapshotQuery.isError ? (
+                            <Alert
+                              showIcon
+                              type="warning"
+                              message="当前执行记录没有可读取的策略快照"
+                              description={
+                                executionPolicySnapshotQuery.error instanceof Error
+                                  ? executionPolicySnapshotQuery.error.message
+                                  : "这可能是执行策略功能上线前产生的历史 execution，或执行尚未进入计划阶段。"
+                              }
+                            />
+                          ) : executionPolicySnapshot ? (
+                            <div className="page-stack">
+                              <Alert
+                                showIcon
+                                type="success"
+                                message="以下参数是本次 execution 固化后的历史事实"
+                                description="管理员以后修改策略不会反向改写该快照。自动分片数来自本次源表行数探测；实际 channel 会受分片数和策略上限共同约束。"
+                              />
+                              <Descriptions bordered size="small" column={3}>
+                                <Descriptions.Item label="自动分片目标">
+                                  {executionPolicySnapshot.targetRowsPerShard?.toLocaleString() || "-"} 行/片
+                                </Descriptions.Item>
+                                <Descriptions.Item label="实际分片数">
+                                  {executionPolicySnapshot.resolvedShardCount ?? "非分片执行"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="实际 channel">
+                                  {executionPolicySnapshot.resolvedChannel ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="TaskGroup 大小">
+                                  {executionPolicySnapshot.taskGroupSize ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="读取批 / 写入批">
+                                  {executionPolicySnapshot.readBatchSize ?? "-"} / {executionPolicySnapshot.writeBatchSize ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="提交间隔">
+                                  {executionPolicySnapshot.commitIntervalRecords ?? "-"} 条
+                                </Descriptions.Item>
+                                <Descriptions.Item label="超时">
+                                  {executionPolicySnapshot.timeoutSeconds ?? "-"} 秒
+                                </Descriptions.Item>
+                                <Descriptions.Item label="最大重试">
+                                  {executionPolicySnapshot.maxRetryCount ?? "-"} 次
+                                </Descriptions.Item>
+                                <Descriptions.Item label="脏数据阈值">
+                                  {executionPolicySnapshot.maxDirtyRecordCount ?? "-"} 条 / {executionPolicySnapshot.maxDirtyRecordRatio ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="解析顺序" span={3}>
+                                  <Typography.Text className="mono">
+                                    {executionPolicySnapshot.resolutionOrder || "TASK > PROJECT > DATASOURCE/CONNECTOR > SYSTEM"}
+                                  </Typography.Text>
+                                </Descriptions.Item>
+                                <Descriptions.Item label="命中策略" span={3}>
+                                  <Space wrap>
+                                    {(executionPolicySnapshot.matchedPolicyCodes ?? []).map((code) => <Tag key={code}>{code}</Tag>)}
+                                    {!executionPolicySnapshot.matchedPolicyCodes?.length ? <Typography.Text type="secondary">未返回策略编码</Typography.Text> : null}
+                                  </Space>
+                                </Descriptions.Item>
+                              </Descriptions>
+                            </div>
+                          ) : (
+                            <RealEmpty description="尚未加载执行策略快照" />
+                          )}
+                        </Card>
+                      ) : null}
                       {executionLogQuery.isError ? (
                         <Alert
                           showIcon

@@ -46,6 +46,8 @@ import type {
   SyncErrorSample,
   SyncExecution,
   SyncExecutionLog,
+  SyncExecutionPolicy,
+  SyncExecutionPolicySnapshot,
   SyncIncident,
   SyncObjectExecution,
   SyncTaskBatchOperationResult,
@@ -392,6 +394,56 @@ export interface SyncTaskScheduleDispatchPayload {
   tenantId?: number;
   limit?: number;
   dryRun?: boolean;
+}
+
+export interface SyncExecutionPolicyQueryParams {
+  tenantId?: number;
+  projectId?: number;
+  scopeType?: string;
+  scopeKey?: string;
+  datasourceId?: number;
+  connectorType?: string;
+  connectorRole?: string;
+  syncTaskId?: number;
+  enabled?: boolean;
+  current?: number;
+  size?: number;
+}
+
+/**
+ * 管理员执行策略创建/更新载荷。
+ *
+ * 字段留空表示继承更低优先级策略，而不是把配置重置为 0。普通任务创建向导不会使用该载荷；
+ * 它只服务“执行策略”管理页，运行时由后端按任务 > 项目 > 数据源/连接器 > 系统默认逐层合并。
+ */
+export interface UpsertSyncExecutionPolicyPayload {
+  id?: number;
+  tenantId?: number;
+  projectId?: number;
+  scopeType: "SYSTEM" | "PROJECT" | "CONNECTOR" | "DATASOURCE" | "TASK" | string;
+  scopeKey?: string;
+  scopeName?: string;
+  policyCode?: string;
+  policyName?: string;
+  enabled?: boolean;
+  datasourceId?: number;
+  connectorType?: string;
+  connectorRole?: "SOURCE" | "TARGET" | "ANY" | string;
+  syncTaskId?: number;
+  targetRowsPerShard?: number;
+  minShardCount?: number;
+  maxShardCount?: number;
+  maxChannel?: number;
+  taskGroupSize?: number;
+  readBatchSize?: number;
+  writeBatchSize?: number;
+  commitIntervalRecords?: number;
+  timeoutSeconds?: number;
+  maxRetryCount?: number;
+  maxDirtyRecordCount?: number;
+  maxDirtyRecordRatio?: number;
+  priority?: number;
+  description?: string;
 }
 
 export interface SyncObjectRetryPayload {
@@ -1118,6 +1170,70 @@ function normalizeSyncExecutionLog(value: unknown, index: number): SyncExecution
     traceId: readString(record.traceId),
     payloadPolicy: readString(record.payloadPolicy),
     createTime: readString(record.createTime),
+  };
+}
+
+function normalizeSyncExecutionPolicy(value: unknown, index: number): SyncExecutionPolicy {
+  const record = isRecord(value) ? value : {};
+  return {
+    id: readNumber(record.id, index + 1),
+    tenantId: readOptionalNumber(record.tenantId),
+    projectId: readOptionalNumber(record.projectId),
+    scopeType: readString(record.scopeType, "SYSTEM"),
+    scopeKey: readOptionalString(record.scopeKey),
+    scopeName: readOptionalString(record.scopeName),
+    policyCode: readOptionalString(record.policyCode),
+    policyName: readOptionalString(record.policyName),
+    enabled: readBoolean(record.enabled, true),
+    datasourceId: readOptionalNumber(record.datasourceId),
+    connectorType: readOptionalString(record.connectorType),
+    connectorRole: readOptionalString(record.connectorRole),
+    syncTaskId: readOptionalNumber(record.syncTaskId),
+    targetRowsPerShard: readOptionalNumber(record.targetRowsPerShard),
+    minShardCount: readOptionalNumber(record.minShardCount),
+    maxShardCount: readOptionalNumber(record.maxShardCount),
+    maxChannel: readOptionalNumber(record.maxChannel),
+    taskGroupSize: readOptionalNumber(record.taskGroupSize),
+    readBatchSize: readOptionalNumber(record.readBatchSize),
+    writeBatchSize: readOptionalNumber(record.writeBatchSize),
+    commitIntervalRecords: readOptionalNumber(record.commitIntervalRecords),
+    timeoutSeconds: readOptionalNumber(record.timeoutSeconds),
+    maxRetryCount: readOptionalNumber(record.maxRetryCount),
+    maxDirtyRecordCount: readOptionalNumber(record.maxDirtyRecordCount),
+    maxDirtyRecordRatio: readOptionalNumber(record.maxDirtyRecordRatio),
+    priority: readOptionalNumber(record.priority),
+    description: readOptionalString(record.description),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
+  };
+}
+
+function normalizeSyncExecutionPolicySnapshot(value: unknown): SyncExecutionPolicySnapshot {
+  const record = isRecord(value) ? value : {};
+  return {
+    id: readNumber(record.id),
+    tenantId: readOptionalNumber(record.tenantId),
+    projectId: readOptionalNumber(record.projectId),
+    syncTaskId: readNumber(record.syncTaskId),
+    executionId: readNumber(record.executionId),
+    policyCodeSummary: readOptionalString(record.policyCodeSummary),
+    matchedPolicyCodes: readStringArray(record.matchedPolicyCodes),
+    resolutionOrder: readOptionalString(record.resolutionOrder),
+    targetRowsPerShard: readOptionalNumber(record.targetRowsPerShard),
+    resolvedShardCount: readOptionalNumber(record.resolvedShardCount),
+    resolvedChannel: readOptionalNumber(record.resolvedChannel),
+    taskGroupSize: readOptionalNumber(record.taskGroupSize),
+    readBatchSize: readOptionalNumber(record.readBatchSize),
+    writeBatchSize: readOptionalNumber(record.writeBatchSize),
+    commitIntervalRecords: readOptionalNumber(record.commitIntervalRecords),
+    timeoutSeconds: readOptionalNumber(record.timeoutSeconds),
+    maxRetryCount: readOptionalNumber(record.maxRetryCount),
+    maxDirtyRecordCount: readOptionalNumber(record.maxDirtyRecordCount),
+    maxDirtyRecordRatio: readOptionalNumber(record.maxDirtyRecordRatio),
+    payloadPolicy: readOptionalString(record.payloadPolicy),
+    snapshotJson: readOptionalString(record.snapshotJson),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
   };
 }
 
@@ -1994,6 +2110,31 @@ export const api = {
       `/sync/sync-tasks/${taskId}/executions/${executionId}/logs?current=1&size=200`,
       normalizeSyncExecutionLog,
     ),
+  listSyncExecutionPolicies: (params?: SyncExecutionPolicyQueryParams) =>
+    realPageEndpoint<SyncExecutionPolicy>(
+      `/sync/sync-execution-policies?${compactQueryString({
+        ...params,
+        current: params?.current ?? 1,
+        size: params?.size ?? 200,
+      })}`,
+      normalizeSyncExecutionPolicy,
+    ),
+  createSyncExecutionPolicy: async (payload: UpsertSyncExecutionPolicyPayload) => {
+    const result = await postJson<unknown>("/sync/sync-execution-policies", payload);
+    return { ...result, data: normalizeSyncExecutionPolicy(result.data, 0) };
+  },
+  updateSyncExecutionPolicy: async (id: number, payload: UpsertSyncExecutionPolicyPayload) => {
+    const result = await putJson<unknown>(`/sync/sync-execution-policies/${id}`, payload);
+    return { ...result, data: normalizeSyncExecutionPolicy(result.data, 0) };
+  },
+  disableSyncExecutionPolicy: (id: number) =>
+    deleteJson<void>(`/sync/sync-execution-policies/${id}`),
+  getSyncExecutionPolicySnapshot: async (taskId: number, executionId: number) => {
+    const result = await request<unknown>(
+      `/sync/sync-tasks/${taskId}/executions/${executionId}/policy-snapshot`,
+    );
+    return { ...result, data: normalizeSyncExecutionPolicySnapshot(result.data) };
+  },
   listSyncObjectExecutions: (taskId: number, executionId: number) =>
     pageEndpoint<SyncObjectExecution>(
       `/sync/sync-tasks/${taskId}/executions/${executionId}/objects?current=1&size=50`,

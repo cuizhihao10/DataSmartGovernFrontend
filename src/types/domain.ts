@@ -580,6 +580,64 @@ export interface SyncExecutionLog {
   createTime?: string;
 }
 
+export interface SyncExecutionPolicy {
+  id: number;
+  tenantId?: number;
+  projectId?: number;
+  scopeType: string;
+  scopeKey?: string;
+  scopeName?: string;
+  policyCode?: string;
+  policyName?: string;
+  enabled: boolean;
+  datasourceId?: number;
+  connectorType?: string;
+  connectorRole?: string;
+  syncTaskId?: number;
+  targetRowsPerShard?: number;
+  minShardCount?: number;
+  maxShardCount?: number;
+  maxChannel?: number;
+  taskGroupSize?: number;
+  readBatchSize?: number;
+  writeBatchSize?: number;
+  commitIntervalRecords?: number;
+  timeoutSeconds?: number;
+  maxRetryCount?: number;
+  maxDirtyRecordCount?: number;
+  maxDirtyRecordRatio?: number;
+  priority?: number;
+  description?: string;
+  createTime?: string;
+  updateTime?: string;
+}
+
+export interface SyncExecutionPolicySnapshot {
+  id: number;
+  tenantId?: number;
+  projectId?: number;
+  syncTaskId: number;
+  executionId: number;
+  policyCodeSummary?: string;
+  matchedPolicyCodes?: string[];
+  resolutionOrder?: string;
+  targetRowsPerShard?: number;
+  resolvedShardCount?: number;
+  resolvedChannel?: number;
+  taskGroupSize?: number;
+  readBatchSize?: number;
+  writeBatchSize?: number;
+  commitIntervalRecords?: number;
+  timeoutSeconds?: number;
+  maxRetryCount?: number;
+  maxDirtyRecordCount?: number;
+  maxDirtyRecordRatio?: number;
+  payloadPolicy?: string;
+  snapshotJson?: string;
+  createTime?: string;
+  updateTime?: string;
+}
+
 export interface SyncObjectExecution {
   id: number;
   tenantId?: number;
