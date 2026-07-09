@@ -53,6 +53,24 @@ select {
   min-height: 100vh;
 }
 
+.app-sider {
+  /*
+   * 左侧主导航属于全局应用外壳，不应该跟着业务表格、执行日志等长内容一起滚动。
+   * 固定在视口后，页面只滚动右侧工作区；菜单项过多时由侧栏内部自己滚动，避免导航入口消失。
+   */
+  position: fixed !important;
+  inset: 0 auto 0 0;
+  height: 100vh;
+  overflow: auto;
+  z-index: 100;
+}
+
+.app-main-layout {
+  min-width: 0;
+  min-height: 100vh;
+  transition: margin-left 0.2s ease;
+}
+
 .app-shell .ant-layout,
 .app-shell .ant-layout-content {
   min-width: 0;

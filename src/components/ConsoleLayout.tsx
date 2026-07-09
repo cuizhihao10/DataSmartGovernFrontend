@@ -108,6 +108,7 @@ export function ConsoleLayout() {
   return (
     <Layout className="app-shell">
       <Sider
+        className="app-sider"
         collapsible
         collapsed={collapsed}
         trigger={null}
@@ -134,7 +135,7 @@ export function ConsoleLayout() {
           }))}
         />
       </Sider>
-      <Layout>
+      <Layout className="app-main-layout" style={{ marginLeft: collapsed ? 64 : 232 }}>
         <Header className="app-header">
           <Space size={12}>
             <Button
