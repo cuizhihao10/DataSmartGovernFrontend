@@ -1,0 +1,14 @@
+# Docker 构建上下文只需要源码、依赖锁文件和运行配置。
+# 下面这些目录/文件要么体积很大，要么属于本地开发产物，如果一起发送给 Docker daemon，
+# 会明显拖慢 `docker compose build frontend`，也可能把本机环境变量、日志或旧构建结果带入镜像。
+node_modules
+dist
+dist-ssr
+.git
+.codex-logs
+.env.local
+.env.*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
