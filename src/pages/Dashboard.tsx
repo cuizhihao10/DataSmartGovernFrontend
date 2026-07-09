@@ -11,6 +11,7 @@ import { PageHeader } from "@/components/PageHeader";
 import type { QueueSnapshot, ServiceHealth } from "@/types/domain";
 import { formatDateTime, formatDuration, percent } from "@/utils/format";
 import { labelOf } from "@/utils/labels";
+import { defaultListPagination, defaultTablePagination } from "@/utils/table";
 
 const serviceDomainLabels: Record<string, string> = {
   gateway: "网关入口",
@@ -78,7 +79,7 @@ export function Dashboard() {
             size="middle"
             columns={serviceColumns}
             dataSource={services}
-            pagination={false}
+            pagination={defaultTablePagination(8)}
             loading={serviceQuery.isLoading}
             locale={{ emptyText: <RealEmpty meta={serviceQuery.data?.meta} description="暂无服务健康记录" /> }}
           />
@@ -88,6 +89,7 @@ export function Dashboard() {
           <List
             itemLayout="horizontal"
             dataSource={agentSnapshots}
+            pagination={defaultListPagination(8)}
             renderItem={(item) => (
               <List.Item>
                 <List.Item.Meta
@@ -113,7 +115,7 @@ export function Dashboard() {
 
       <div className="grid grid-two">
         <Card className="table-card" title="队列水位">
-          <Table rowKey="key" size="middle" columns={queueColumns} dataSource={queueSnapshots} pagination={false} />
+          <Table rowKey="key" size="middle" columns={queueColumns} dataSource={queueSnapshots} pagination={defaultTablePagination(8)} />
         </Card>
 
         <Card className="compact-card" title="闭环进度">

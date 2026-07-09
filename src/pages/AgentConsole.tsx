@@ -54,6 +54,7 @@ import type {
   RuntimeEvent,
 } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
+import { defaultListPagination, defaultTablePagination, sortByIdDesc } from "@/utils/table";
 import {
   agentToolTypeLabels,
   agentWorkloadLabels,
@@ -783,6 +784,7 @@ export function AgentConsole() {
                           <List
                             size="small"
                             dataSource={plan.nextActions}
+                            pagination={defaultListPagination(8)}
                             renderItem={(item) => (
                               <List.Item>
                                 <Space>
@@ -798,7 +800,7 @@ export function AgentConsole() {
                           size="middle"
                           columns={planToolColumns}
                           dataSource={createPlanMutation.data.data.plan?.toolPlans ?? []}
-                          pagination={false}
+                          pagination={defaultTablePagination(8)}
                         />
                       </Space>
                     </div>
@@ -810,19 +812,19 @@ export function AgentConsole() {
                     <Table
                       rowKey="sessionId"
                       columns={sessionColumns}
-                      dataSource={sessions}
+                      dataSource={sortByIdDesc(sessions)}
                       loading={sessionsQuery.isLoading}
                       locale={{ emptyText: <RealEmpty meta={sessionsQuery.data?.meta} description="暂无智能体会话" /> }}
-                      pagination={{ pageSize: 6, showSizeChanger: false }}
+                      pagination={defaultTablePagination(6)}
                     />
                   </Card>
                   <Card className="table-card" title="运行记录历史">
                     <Table
                       rowKey="runId"
                       columns={runColumns}
-                      dataSource={activeSession?.runs ?? []}
+                      dataSource={sortByIdDesc(activeSession?.runs)}
                       locale={{ emptyText: <RealEmpty meta={sessionsQuery.data?.meta} description="暂无运行记录" /> }}
-                      pagination={{ pageSize: 6, showSizeChanger: false }}
+                      pagination={defaultTablePagination(6)}
                     />
                   </Card>
                 </div>
@@ -838,7 +840,7 @@ export function AgentConsole() {
                   <Table
                     rowKey="auditId"
                     columns={auditColumns}
-                    dataSource={toolExecutionsQuery.data?.data ?? []}
+                    dataSource={sortByIdDesc(toolExecutionsQuery.data?.data)}
                     loading={toolExecutionsQuery.isLoading}
                     expandable={{
                       expandedRowRender: (record) => (
@@ -849,7 +851,7 @@ export function AgentConsole() {
                       ),
                     }}
                     locale={{ emptyText: <RealEmpty meta={toolExecutionsQuery.data?.meta} description="暂无工具审计记录" /> }}
-                    pagination={{ pageSize: 8, showSizeChanger: false }}
+                    pagination={defaultTablePagination(8)}
                   />
                 </Card>
                 <div className="grid grid-three">
@@ -918,6 +920,7 @@ export function AgentConsole() {
                           <List
                             size="small"
                             dataSource={ragResult.citations}
+                            pagination={defaultListPagination(8)}
                             renderItem={(item, index) => (
                               <List.Item>
                                 <Space direction="vertical" size={0}>
@@ -954,7 +957,7 @@ export function AgentConsole() {
                     <Table
                       rowKey="toolCode"
                       columns={toolColumns}
-                      dataSource={tools}
+                      dataSource={sortByIdDesc(tools)}
                       loading={toolsQuery.isLoading}
                       expandable={{
                         expandedRowRender: (record) => (
@@ -969,7 +972,7 @@ export function AgentConsole() {
                               <Table
                                 rowKey="name"
                                 size="small"
-                                pagination={false}
+                                pagination={defaultTablePagination(8)}
                                 dataSource={record.inputSchema}
                                 columns={[
                                   { title: "字段", dataIndex: "name" },
@@ -983,7 +986,7 @@ export function AgentConsole() {
                         ),
                       }}
                       locale={{ emptyText: <RealEmpty meta={toolsQuery.data?.meta} description="暂无智能体工具记录" /> }}
-                      pagination={{ pageSize: 8, showSizeChanger: false }}
+                      pagination={defaultTablePagination(8)}
                     />
                   </Card>
                   <Card className="table-card" title="模型路由">
@@ -993,7 +996,7 @@ export function AgentConsole() {
                       dataSource={routes}
                       loading={routesQuery.isLoading}
                       locale={{ emptyText: <RealEmpty meta={routesQuery.data?.meta} description="暂无模型路由记录" /> }}
-                      pagination={{ pageSize: 8, showSizeChanger: false }}
+                      pagination={defaultTablePagination(8)}
                     />
                   </Card>
                 </div>

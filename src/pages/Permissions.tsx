@@ -10,6 +10,7 @@ import { BooleanTag } from "@/components/StatusTag";
 import { PageHeader } from "@/components/PageHeader";
 import type { PermissionRole, RoutePolicy } from "@/types/domain";
 import { labelOf, scopeLabels } from "@/utils/labels";
+import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
 
 const scopeColor: Record<PermissionRole["scope"], string> = {
   PLATFORM: "red",
@@ -142,10 +143,10 @@ export function Permissions() {
                 <Table
                   rowKey="id"
                   columns={roleColumns}
-                  dataSource={filteredRoles}
+                  dataSource={sortByIdDesc(filteredRoles)}
                   loading={roleQuery.isLoading}
                   locale={{ emptyText: <RealEmpty meta={roleQuery.data?.meta} description="暂无角色记录" /> }}
-                  pagination={false}
+                  pagination={defaultTablePagination(8)}
                 />
               </Card>
             ),
@@ -158,10 +159,10 @@ export function Permissions() {
                 <Table
                   rowKey="id"
                   columns={policyColumns}
-                  dataSource={filteredPolicies}
+                  dataSource={sortByIdDesc(filteredPolicies)}
                   loading={routePolicyQuery.isLoading}
                   locale={{ emptyText: <RealEmpty meta={routePolicyQuery.data?.meta} description="暂无路由策略记录" /> }}
-                  pagination={false}
+                  pagination={defaultTablePagination(8)}
                 />
               </Card>
             ),

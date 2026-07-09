@@ -11,6 +11,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { useUiStore } from "@/store/uiStore";
 import type { QualityReport, QualityRule } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
+import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
 import {
   comparisonLabels,
   labelOf,
@@ -241,10 +242,10 @@ export function Quality() {
                 <Table
                   rowKey="id"
                   columns={ruleColumns}
-                  dataSource={filteredRules}
+                  dataSource={sortByIdDesc(filteredRules)}
                   loading={ruleQuery.isLoading}
                   locale={{ emptyText: <RealEmpty meta={ruleQuery.data?.meta} description="暂无质量规则记录" /> }}
-                  pagination={{ pageSize: 8, showSizeChanger: false }}
+                  pagination={defaultTablePagination(8)}
                 />
               </Card>
             ),
@@ -257,10 +258,10 @@ export function Quality() {
                 <Table
                   rowKey="id"
                   columns={reportColumns}
-                  dataSource={reports}
+                  dataSource={sortByIdDesc(reports)}
                   loading={reportQuery.isLoading}
                   locale={{ emptyText: <RealEmpty meta={reportQuery.data?.meta} description="暂无质量报告记录" /> }}
-                  pagination={false}
+                  pagination={defaultTablePagination(8)}
                 />
               </Card>
             ),

@@ -15,6 +15,7 @@ import { useAuthStore } from "@/store/authStore";
 import type { EndpointProbe, ServiceHealth } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import { actorRoleLabels, labelOf } from "@/utils/labels";
+import { defaultTablePagination } from "@/utils/table";
 
 const serviceDomainLabels: Record<string, string> = {
   gateway: "网关入口",
@@ -175,7 +176,7 @@ export function Closure() {
           columns={probeColumns}
           dataSource={probes}
           loading={probeQuery.isLoading}
-          pagination={false}
+          pagination={defaultTablePagination(8)}
         />
       </Card>
 
@@ -185,7 +186,7 @@ export function Closure() {
           columns={serviceColumns}
           dataSource={services}
           loading={serviceQuery.isLoading}
-          pagination={false}
+          pagination={defaultTablePagination(8)}
         />
       </Card>
     </div>

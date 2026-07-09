@@ -19,6 +19,7 @@ import { useUiStore } from "@/store/uiStore";
 import type { GovernanceTask, LifecycleStatus } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import { labelOf, optionsOf, priorityLabels, taskTypeLabels } from "@/utils/labels";
+import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
 
 const priorityColor: Record<GovernanceTask["priority"], string> = {
   LOW: "default",
@@ -244,10 +245,10 @@ export function Tasks() {
         <Table
           rowKey="id"
           columns={columns}
-          dataSource={filtered}
+          dataSource={sortByIdDesc(filtered)}
           loading={taskQuery.isLoading}
           locale={{ emptyText: <RealEmpty meta={taskQuery.data?.meta} description="暂无治理任务记录" /> }}
-          pagination={{ pageSize: 8, showSizeChanger: false }}
+          pagination={defaultTablePagination(8)}
         />
       </Card>
 

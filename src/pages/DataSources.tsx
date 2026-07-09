@@ -33,6 +33,7 @@ import type {
 } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import { connectorLabels, labelOf, statusLabels } from "@/utils/labels";
+import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
 
 const statusColor: Record<DataSourceRecord["status"], string> = {
   ENABLED: "green",
@@ -626,10 +627,10 @@ export function DataSources() {
         <Table
           rowKey="id"
           columns={columns}
-          dataSource={filtered}
+          dataSource={sortByIdDesc(filtered)}
           loading={dataSourceQuery.isLoading}
           locale={{ emptyText: <RealEmpty meta={dataSourceQuery.data?.meta} description="暂无数据源记录" /> }}
-          pagination={{ pageSize: 8, showSizeChanger: false }}
+          pagination={defaultTablePagination(8)}
         />
       </Card>
 
@@ -912,9 +913,9 @@ export function DataSources() {
           rowKey="id"
           size="small"
           columns={authorizationColumns}
-          dataSource={authorizationQuery.data?.data.records ?? []}
+          dataSource={sortByIdDesc(authorizationQuery.data?.data.records)}
           loading={authorizationQuery.isLoading}
-          pagination={{ pageSize: 6 }}
+          pagination={defaultTablePagination(6)}
         />
       </Modal>
 

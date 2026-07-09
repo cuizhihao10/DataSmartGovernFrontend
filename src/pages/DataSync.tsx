@@ -111,6 +111,12 @@ import {
   syncTaskStateLabels,
   writeStrategyLabels,
 } from "@/utils/labels";
+import {
+  controlledTablePagination,
+  defaultTablePagination,
+  sortByIdDesc,
+  TABLE_PAGE_SIZE_OPTIONS,
+} from "@/utils/table";
 
 const transferModeProfiles = {
   FULL_TRANSFER: { label: "全量传输", syncMode: "FULL", syncScopeType: "OBJECT_LIST", objectScopeType: "TABLES", runMode: "MANUAL" },
@@ -1012,6 +1018,8 @@ export function DataSync() {
   const [taskApprovalFilter, setTaskApprovalFilter] = useState<string>();
   const [taskPage, setTaskPage] = useState(1);
   const [recycleTaskPage, setRecycleTaskPage] = useState(1);
+  const [taskPageSize, setTaskPageSize] = useState(SYNC_TASK_TABLE_PAGE_SIZE);
+  const [recycleTaskPageSize, setRecycleTaskPageSize] = useState(SYNC_TASK_TABLE_PAGE_SIZE);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
   const [editTask, setEditTask] = useState<SyncTask | null>(null);
@@ -1080,7 +1088,7 @@ export function DataSync() {
     queryFn: api.listSyncTemplates,
   });
   const taskQuery = useQuery({
-    queryKey: ["sync-tasks", selectedProjectScopeId, taskGroupFilter, taskStateFilter, taskApprovalFilter, normalizedTaskKeyword, taskPage],
+    queryKey: ["sync-tasks", selectedProjectScopeId, taskGroupFilter, taskStateFilter, taskApprovalFilter, normalizedTaskKeyword, taskPage, taskPageSize],
     queryFn: () =>
       api.listSyncTasks(
         compactPayload({
@@ -1090,7 +1098,7 @@ export function DataSync() {
           approvalState: taskApprovalFilter,
           keyword: normalizedTaskKeyword,
           current: taskPage,
-          size: SYNC_TASK_TABLE_PAGE_SIZE,
+          size: taskPageSize,
         }),
       ),
   });
@@ -1103,7 +1111,7 @@ export function DataSync() {
     queryFn: () => api.listSyncTaskGroupTree(compactPayload({ projectId: selectedProjectScopeId, size: 200 })),
   });
   const recycleBinQuery = useQuery({
-    queryKey: ["sync-recycle-bin", selectedProjectScopeId, taskGroupFilter, taskApprovalFilter, normalizedTaskKeyword, recycleTaskPage],
+    queryKey: ["sync-recycle-bin", selectedProjectScopeId, taskGroupFilter, taskApprovalFilter, normalizedTaskKeyword, recycleTaskPage, recycleTaskPageSize],
     queryFn: () =>
       api.listRecycledSyncTasks(
         compactPayload({
@@ -1112,7 +1120,7 @@ export function DataSync() {
           approvalState: taskApprovalFilter,
           keyword: normalizedTaskKeyword,
           current: recycleTaskPage,
-          size: SYNC_TASK_TABLE_PAGE_SIZE,
+          size: recycleTaskPageSize,
         }),
       ),
   });
@@ -1255,16 +1263,16 @@ export function DataSync() {
       content: formatJsonConfig(selectedTaskTemplate?.customSqlConfig),
     },
   ], [selectedTask?.scheduleConfig, selectedTaskTemplate]);
-  const tasks = useMemo(() => taskQuery.data?.data.records ?? [], [taskQuery.data?.data.records]);
+  const tasks = useMemo(() => sortByIdDesc(taskQuery.data?.data.records), [taskQuery.data?.data.records]);
   const taskGroupTree = useMemo(
     () => normalizeSyncGroupTree(taskGroupTreeQuery.data?.data ?? []),
     [taskGroupTreeQuery.data?.data],
   );
   const allSyncTaskTotal = useMemo(() => sumSyncGroupTaskCount(taskGroupTree), [taskGroupTree]);
   const allNormalSyncTaskTotal = useMemo(() => sumSyncGroupNormalTaskCount(taskGroupTree), [taskGroupTree]);
-  const recycledTasks = useMemo(() => recycleBinQuery.data?.data.records ?? [], [recycleBinQuery.data?.data.records]);
-  const incidents = incidentQuery.data?.data.records ?? [];
-  const executions = executionQuery.data?.data.records ?? [];
+  const recycledTasks = useMemo(() => sortByIdDesc(recycleBinQuery.data?.data.records), [recycleBinQuery.data?.data.records]);
+  const incidents = useMemo(() => sortByIdDesc(incidentQuery.data?.data.records), [incidentQuery.data?.data.records]);
+  const executions = useMemo(() => sortByIdDesc(executionQuery.data?.data.records), [executionQuery.data?.data.records]);
   const selectedExecutionRecord = useMemo(
     () => executions.find((record) => record.id === selectedExecutionId),
     [executions, selectedExecutionId],
@@ -1283,13 +1291,13 @@ export function DataSync() {
     queryFn: () => api.getSyncExecutionPolicySnapshot(selectedTask!.id, selectedExecutionId!),
     enabled: Boolean(selectedTask?.id && selectedExecutionId && taskDrawerActiveTab === "logs"),
   });
-  const objectExecutions = objectExecutionQuery.data?.data.records ?? [];
-  const executionLogs = executionLogQuery.data?.data.records ?? [];
-  const executionPolicies = executionPolicyQuery.data?.data.records ?? [];
+  const objectExecutions = useMemo(() => sortByIdDesc(objectExecutionQuery.data?.data.records), [objectExecutionQuery.data?.data.records]);
+  const executionLogs = useMemo(() => sortByIdDesc(executionLogQuery.data?.data.records), [executionLogQuery.data?.data.records]);
+  const executionPolicies = useMemo(() => sortByIdDesc(executionPolicyQuery.data?.data.records), [executionPolicyQuery.data?.data.records]);
   const executionPolicySnapshot = executionPolicySnapshotQuery.data?.data;
-  const errorSamples = errorSampleQuery.data?.data.records ?? [];
-  const checkpoints = checkpointQuery.data?.data.records ?? [];
-  const auditRecords = auditQuery.data?.data.records ?? [];
+  const errorSamples = useMemo(() => sortByIdDesc(errorSampleQuery.data?.data.records), [errorSampleQuery.data?.data.records]);
+  const checkpoints = useMemo(() => sortByIdDesc(checkpointQuery.data?.data.records), [checkpointQuery.data?.data.records]);
+  const auditRecords = useMemo(() => sortByIdDesc(auditQuery.data?.data.records), [auditQuery.data?.data.records]);
   useEffect(() => {
     /*
      * 项目是数据同步模块的可见范围边界。分组筛选、树节点选中态、批量选择和详情抽屉都必须随项目切换失效，
@@ -1802,11 +1810,13 @@ export function DataSync() {
     onError: (error) => message.error(error instanceof Error ? error.message : "执行策略禁用失败"),
   });
 
-  const filteredTemplates = templates.filter((record) =>
-    [record.name, record.sourceObjectName, record.targetObjectName, record.syncMode, record.syncScopeType]
-      .join(" ")
-      .toLowerCase()
-      .includes(templateKeyword.toLowerCase()),
+  const filteredTemplates = sortByIdDesc(
+    templates.filter((record) =>
+      [record.name, record.sourceObjectName, record.targetObjectName, record.syncMode, record.syncScopeType]
+        .join(" ")
+        .toLowerCase()
+        .includes(templateKeyword.toLowerCase()),
+    ),
   );
 
   const filteredTasks = tasks;
@@ -4532,13 +4542,19 @@ export function DataSync() {
                     loading={recycleBinQuery.isLoading}
                     scroll={{ x: 1200 }}
                     locale={{ emptyText: <RealEmpty meta={recycleBinQuery.data?.meta} description="暂无回收站任务" /> }}
-                    pagination={{
+                    pagination={controlledTablePagination({
                       current: recycleTaskPage,
-                      pageSize: SYNC_TASK_TABLE_PAGE_SIZE,
+                      pageSize: recycleTaskPageSize,
                       total: recycleBinQuery.data?.data.total ?? 0,
-                      showSizeChanger: false,
-                      onChange: (page) => setRecycleTaskPage(page),
-                    }}
+                      onChange: (page, pageSize) => {
+                        if (pageSize !== recycleTaskPageSize) {
+                          setRecycleTaskPage(1);
+                          setRecycleTaskPageSize(pageSize);
+                          return;
+                        }
+                        setRecycleTaskPage(page);
+                      },
+                    })}
                   />
                 </Card>
               </div>
@@ -4618,13 +4634,19 @@ export function DataSync() {
                     loading={taskQuery.isLoading}
                     scroll={{ x: 1520 }}
                     locale={{ emptyText: <RealEmpty meta={taskQuery.data?.meta} description="暂无同步任务记录" /> }}
-                    pagination={{
+                    pagination={controlledTablePagination({
                       current: taskPage,
-                      pageSize: SYNC_TASK_TABLE_PAGE_SIZE,
+                      pageSize: taskPageSize,
                       total: taskQuery.data?.data.total ?? 0,
-                      showSizeChanger: false,
-                      onChange: (page) => setTaskPage(page),
-                    }}
+                      onChange: (page, pageSize) => {
+                        if (pageSize !== taskPageSize) {
+                          setTaskPage(1);
+                          setTaskPageSize(pageSize);
+                          return;
+                        }
+                        setTaskPage(page);
+                      },
+                    })}
                   />
                 </Card>
               </div>
@@ -4641,7 +4663,7 @@ export function DataSync() {
                   </div>
                 </Card>
                 <Card className="table-card">
-                  <Table rowKey="id" columns={templateColumns} dataSource={filteredTemplates} loading={templateQuery.isLoading} locale={{ emptyText: <RealEmpty meta={templateQuery.data?.meta} description="暂无同步模板记录" /> }} pagination={{ pageSize: 8, showSizeChanger: false }} />
+                  <Table rowKey="id" columns={templateColumns} dataSource={filteredTemplates} loading={templateQuery.isLoading} locale={{ emptyText: <RealEmpty meta={templateQuery.data?.meta} description="暂无同步模板记录" /> }} pagination={defaultTablePagination(8)} />
                 </Card>
               </div>
             ),
@@ -4649,7 +4671,7 @@ export function DataSync() {
           {
             key: "capabilities",
             label: "连接器能力",
-            children: <Card className="table-card"><Table rowKey="connectorType" columns={capabilityColumns} dataSource={capabilities} loading={capabilityQuery.isLoading} pagination={{ pageSize: 8, showSizeChanger: false }} /></Card>,
+            children: <Card className="table-card"><Table rowKey="connectorType" columns={capabilityColumns} dataSource={capabilities} loading={capabilityQuery.isLoading} pagination={defaultTablePagination(8)} /></Card>,
           },
           {
             key: "executionPolicies",
@@ -4699,7 +4721,7 @@ export function DataSync() {
                     loading={executionPolicyQuery.isLoading || executionPolicyQuery.isFetching}
                     scroll={{ x: 1540 }}
                     locale={{ emptyText: <RealEmpty meta={executionPolicyQuery.data?.meta} description="暂无可见执行策略" /> }}
-                    pagination={{ pageSize: 10, showSizeChanger: true }}
+                    pagination={defaultTablePagination(10)}
                   />
                 </Card>
               </div>
@@ -4708,7 +4730,7 @@ export function DataSync() {
           {
             key: "incidents",
             label: "事故",
-            children: <Card className="table-card"><Table rowKey="id" columns={incidentColumns} dataSource={incidents} loading={incidentQuery.isLoading} locale={{ emptyText: <RealEmpty meta={incidentQuery.data?.meta} description="暂无同步事故记录" /> }} pagination={{ pageSize: 8, showSizeChanger: false }} /></Card>,
+            children: <Card className="table-card"><Table rowKey="id" columns={incidentColumns} dataSource={incidents} loading={incidentQuery.isLoading} locale={{ emptyText: <RealEmpty meta={incidentQuery.data?.meta} description="暂无同步事故记录" /> }} pagination={defaultTablePagination(8)} /></Card>,
           },
           {
             key: "runtime",
@@ -4970,7 +4992,7 @@ export function DataSync() {
                           },
                         ]}
                         dataSource={sourceObjectRows}
-                        pagination={{ pageSize: sourceObjectPageSize, showSizeChanger: true, pageSizeOptions: [5, 10, 20, 50], onShowSizeChange: (_, size) => setSourceObjectPageSize(size), onChange: (_, size) => size && setSourceObjectPageSize(size) }}
+                        pagination={{ pageSize: sourceObjectPageSize, showSizeChanger: true, pageSizeOptions: TABLE_PAGE_SIZE_OPTIONS, onShowSizeChange: (_, size) => setSourceObjectPageSize(size), onChange: (_, size) => size && setSourceObjectPageSize(size) }}
                       />
                     </Space>
                   </div>
@@ -5019,7 +5041,7 @@ export function DataSync() {
                         },
                       ]}
                       dataSource={targetObjectRows}
-                      pagination={{ pageSize: targetObjectPageSize, showSizeChanger: true, pageSizeOptions: [5, 10, 20, 50], onShowSizeChange: (_, size) => setTargetObjectPageSize(size), onChange: (_, size) => size && setTargetObjectPageSize(size) }}
+                      pagination={{ pageSize: targetObjectPageSize, showSizeChanger: true, pageSizeOptions: TABLE_PAGE_SIZE_OPTIONS, onShowSizeChange: (_, size) => setTargetObjectPageSize(size), onChange: (_, size) => size && setTargetObjectPageSize(size) }}
                     />
                   </Space>
                 </div>
@@ -5058,7 +5080,7 @@ export function DataSync() {
                     pagination={{
                       pageSize: mappingObjectPageSize,
                       showSizeChanger: true,
-                      pageSizeOptions: [5, 10, 20, 50],
+                      pageSizeOptions: TABLE_PAGE_SIZE_OPTIONS,
                       onShowSizeChange: (_, size) => setMappingObjectPageSize(size),
                       onChange: (_, size) => size && setMappingObjectPageSize(size),
                     }}
@@ -5087,7 +5109,7 @@ export function DataSync() {
                           pagination={{
                             pageSize: mappingObjectPageSize,
                             showSizeChanger: true,
-                            pageSizeOptions: [5, 10, 20, 50],
+                            pageSizeOptions: TABLE_PAGE_SIZE_OPTIONS,
                             onShowSizeChange: (_, size) => setMappingObjectPageSize(size),
                             onChange: (_, size) => size && setMappingObjectPageSize(size),
                           }}
@@ -5165,7 +5187,7 @@ export function DataSync() {
                         pagination={{
                           pageSize: fieldMappingPageSize,
                           showSizeChanger: true,
-                          pageSizeOptions: [5, 10, 20, 50, 100],
+                          pageSizeOptions: TABLE_PAGE_SIZE_OPTIONS,
                           onShowSizeChange: (_, size) => setFieldMappingPageSize(size),
                           onChange: (_, size) => size && setFieldMappingPageSize(size),
                         }}
@@ -5198,7 +5220,7 @@ export function DataSync() {
                 size="small"
                 columns={wizardPrecheckColumns}
                 dataSource={wizardPrecheckItems}
-                pagination={false}
+                pagination={defaultTablePagination(8)}
                 loading={wizardPrecheckLoading}
                 style={{ marginTop: 12 }}
               />
@@ -5544,7 +5566,7 @@ export function DataSync() {
                 <Tag color="red">失败 {importResult.failedCount}</Tag>
               </Space>
               <Typography.Paragraph type="secondary">{importResult.message}</Typography.Paragraph>
-              <Table rowKey={(record) => `${record.rowNumber}-${record.name || "-"}`} columns={importRowColumns} dataSource={importResult.rows} pagination={{ pageSize: 6, showSizeChanger: false }} />
+              <Table rowKey={(record) => `${record.rowNumber}-${record.name || "-"}`} columns={importRowColumns} dataSource={sortByIdDesc(importResult.rows)} pagination={defaultTablePagination(6)} />
             </Card>
           ) : null}
         </div>
@@ -5938,7 +5960,7 @@ export function DataSync() {
                           columns={taskObjectMappingColumns}
                           dataSource={selectedDetailObjectMappings}
                           locale={{ emptyText: <RealEmpty description="暂无对象映射配置" /> }}
-                          pagination={{ pageSize: 6, showSizeChanger: true }}
+                          pagination={defaultTablePagination(6)}
                         />
                       </Card>
 
@@ -5948,7 +5970,7 @@ export function DataSync() {
                           columns={taskFieldMappingColumns}
                           dataSource={selectedFieldRowsForDetail}
                           locale={{ emptyText: <RealEmpty description="暂无字段映射配置" /> }}
-                          pagination={{ pageSize: 8, showSizeChanger: true }}
+                          pagination={defaultTablePagination(8)}
                         />
                       </Card>
 
@@ -5964,7 +5986,7 @@ export function DataSync() {
                           rowKey="key"
                           columns={taskRawConfigColumns}
                           dataSource={selectedRawConfigRows}
-                          pagination={false}
+                          pagination={defaultTablePagination(6)}
                         />
                       </Card>
                     </div>
@@ -5980,7 +6002,7 @@ export function DataSync() {
                       dataSource={executions}
                       loading={executionQuery.isLoading}
                       locale={{ emptyText: <RealEmpty meta={executionQuery.data?.meta} description="暂无执行历史记录" /> }}
-                      pagination={{ pageSize: 8, showSizeChanger: false }}
+                      pagination={defaultTablePagination(8)}
                     />
                   ),
                 },
@@ -6095,7 +6117,7 @@ export function DataSync() {
                             />
                           ),
                         }}
-                        pagination={{ pageSize: 10, showSizeChanger: false }}
+                        pagination={defaultTablePagination(10)}
                       />
                     </div>
                   ),
@@ -6112,7 +6134,7 @@ export function DataSync() {
                         dataSource={objectExecutions}
                         loading={objectExecutionQuery.isLoading}
                         locale={{ emptyText: <RealEmpty meta={objectExecutionQuery.data?.meta} description="暂无对象级执行账本" /> }}
-                        pagination={{ pageSize: 8, showSizeChanger: false }}
+                        pagination={defaultTablePagination(8)}
                       />
                       <Card className="compact-card" title="失败对象选择性重试">
                         <Form<SyncObjectRetryPayload>
@@ -6151,7 +6173,7 @@ export function DataSync() {
                         dataSource={errorSamples}
                         loading={errorSampleQuery.isLoading}
                         locale={{ emptyText: <RealEmpty meta={errorSampleQuery.data?.meta} description="暂无错误样本" /> }}
-                        pagination={{ pageSize: 8, showSizeChanger: false }}
+                        pagination={defaultTablePagination(8)}
                       />
                       <Card className="compact-card" title="脏数据修复后回放">
                         <Form<SyncDirtyRecordReplayPayload>
@@ -6207,7 +6229,7 @@ export function DataSync() {
                       dataSource={checkpoints}
                       loading={checkpointQuery.isLoading}
                       locale={{ emptyText: <RealEmpty meta={checkpointQuery.data?.meta} description="暂无断点记录" /> }}
-                      pagination={{ pageSize: 8, showSizeChanger: false }}
+                      pagination={defaultTablePagination(8)}
                     />
                   ),
                 },
@@ -6221,7 +6243,7 @@ export function DataSync() {
                       dataSource={auditRecords}
                       loading={auditQuery.isLoading}
                       locale={{ emptyText: <RealEmpty meta={auditQuery.data?.meta} description="暂无同步审计记录" /> }}
-                      pagination={{ pageSize: 8, showSizeChanger: false }}
+                      pagination={defaultTablePagination(8)}
                     />
                   ),
                 },
@@ -6249,8 +6271,8 @@ export function DataSync() {
             <Table
               rowKey={(record) => `${record.taskId || "-"}-${record.code}-${record.message || ""}`}
               columns={batchItemColumns}
-              dataSource={batchResult.items}
-              pagination={{ pageSize: 8, showSizeChanger: false }}
+              dataSource={sortByIdDesc(batchResult.items)}
+              pagination={defaultTablePagination(8)}
             />
           </div>
         ) : null}

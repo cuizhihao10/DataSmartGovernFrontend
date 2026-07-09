@@ -11,6 +11,7 @@ import { PageHeader } from "@/components/PageHeader";
 import type { QueueSnapshot, RuntimeEvent, ServiceHealth } from "@/types/domain";
 import { formatDateTime, formatDuration, percent } from "@/utils/format";
 import { labelOf } from "@/utils/labels";
+import { defaultTablePagination } from "@/utils/table";
 
 const serviceDomainLabels: Record<string, string> = {
   gateway: "网关入口",
@@ -123,11 +124,11 @@ export function Observability() {
             dataSource={services}
             loading={serviceQuery.isLoading}
             locale={{ emptyText: <RealEmpty meta={serviceQuery.data?.meta} description="暂无服务快照记录" /> }}
-            pagination={false}
+            pagination={defaultTablePagination(8)}
           />
         </Card>
         <Card className="table-card" title="队列快照">
-          <Table rowKey="key" columns={queueColumns} dataSource={queueSnapshots} pagination={false} />
+          <Table rowKey="key" columns={queueColumns} dataSource={queueSnapshots} pagination={defaultTablePagination(8)} />
         </Card>
       </div>
 
