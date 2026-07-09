@@ -73,6 +73,7 @@ import { useUiStore } from "@/store/uiStore";
 import type {
   SyncConnectorCapability,
   SyncConnectorCompatibility,
+  DataSourceRecord,
   SyncAuditRecord,
   SyncCheckpoint,
   SyncErrorSample,
@@ -392,6 +393,18 @@ interface ObjectMappingRow {
   targetObjectName?: string;
   objectType?: string;
   whereCondition?: string;
+}
+
+interface FieldMappingDetailRow extends FieldMappingRow {
+  detailKey: string;
+  objectName: string;
+}
+
+interface TaskRawConfigRow {
+  key: string;
+  name: string;
+  description: string;
+  content: string;
 }
 
 interface SyncWizardValues {
@@ -905,6 +918,31 @@ function compactObjectName(schemaName?: string, objectName?: string) {
   return [schemaName, objectName].filter(Boolean).join(".") || objectName || "-";
 }
 
+function displayValue(value: unknown) {
+  if (value == null) return "-";
+  if (typeof value === "string") return value.trim() || "-";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return String(value);
+}
+
+function formatJsonConfig(text?: string) {
+  if (!text?.trim()) {
+    return "未配置";
+  }
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
+function datasourceDetailLabel(datasource?: DataSourceRecord) {
+  if (!datasource) {
+    return "未找到数据源";
+  }
+  return `${datasource.name}（ID ${datasource.id} / ${datasource.type} / ${datasource.usageRole || "未限定用途"}）`;
+}
+
 function stateOf(task: SyncTask) {
   return String(task.currentState || "").toUpperCase();
 }
@@ -1077,10 +1115,122 @@ export function DataSync() {
     queryFn: () => api.listSyncAuditRecords(selectedTask!.id, selectedExecutionId),
     enabled: Boolean(selectedTask?.id),
   });
+  const selectedTaskTemplateQuery = useQuery({
+    queryKey: ["sync-task-template-detail", selectedTask?.templateId],
+    queryFn: () => api.getSyncTemplate(selectedTask!.templateId),
+    enabled: Boolean(selectedTask?.templateId),
+  });
 
   const dataSources = useMemo(() => dataSourceQuery.data?.data.records ?? [], [dataSourceQuery.data?.data.records]);
   const capabilities = useMemo(() => capabilityQuery.data?.data ?? [], [capabilityQuery.data?.data]);
   const templates = useMemo(() => templateQuery.data?.data.records ?? [], [templateQuery.data?.data.records]);
+  const selectedTaskTemplate = selectedTaskTemplateQuery.data?.data
+    ?? templates.find((template) => template.id === selectedTask?.templateId);
+  const selectedSourceDatasource = dataSources.find((datasource) => datasource.id === selectedTaskTemplate?.sourceDatasourceId);
+  const selectedTargetDatasource = dataSources.find((datasource) => datasource.id === selectedTaskTemplate?.targetDatasourceId);
+  const selectedObjectMappings = useMemo(() => {
+    const parsed = parseObjectMappingsConfig(selectedTaskTemplate?.objectMappingConfig);
+    if (parsed.length || !selectedTaskTemplate) {
+      return parsed;
+    }
+    if (selectedTaskTemplate.sourceObjectName || selectedTaskTemplate.targetObjectName) {
+      return [{
+        key: "single-object-from-template",
+        sourceSchemaName: selectedTaskTemplate.sourceSchemaName,
+        sourceObjectName: selectedTaskTemplate.sourceObjectName,
+        targetSchemaName: selectedTaskTemplate.targetSchemaName,
+        targetObjectName: selectedTaskTemplate.targetObjectName,
+        objectType: "TABLE",
+      } satisfies ObjectMappingRow];
+    }
+    return [];
+  }, [selectedTaskTemplate]);
+  const selectedFieldMappingConfig = useMemo(
+    () => parseFieldMappingConfig(selectedTaskTemplate?.fieldMappingConfig),
+    [selectedTaskTemplate?.fieldMappingConfig],
+  );
+  const selectedDetailObjectMappings = useMemo(
+    () => selectedObjectMappings.length ? selectedObjectMappings : selectedFieldMappingConfig.objectRows,
+    [selectedFieldMappingConfig.objectRows, selectedObjectMappings],
+  );
+  const selectedFieldRowsForDetail = useMemo<FieldMappingDetailRow[]>(() => {
+    /*
+     * 任务详情面向的是“任务已经保存或执行后，用户回来审阅当时到底配置了什么”。
+     * 因此这里不能只展示全局字段映射数组，否则多表迁移时字段行会丢失所属对象上下文。
+     * 后端持久化的 fieldMappingConfig 支持按 objectKey 分组，前端详情页把它展开成扁平表格：
+     * 每行字段都带上“源对象 -> 目标对象”，便于排查某次失败到底是哪张表、哪个字段配置有问题。
+     */
+    if (selectedDetailObjectMappings.length) {
+      return selectedDetailObjectMappings.flatMap((object, objectIndex) => {
+        const rows = selectedFieldMappingConfig.rowsByObjectKey[object.key] ?? [];
+        const objectName = `${compactObjectName(object.sourceSchemaName, object.sourceObjectName)} -> ${compactObjectName(object.targetSchemaName, object.targetObjectName)}`;
+        return rows.map((row, rowIndex) => ({
+          ...row,
+          detailKey: `${object.key}-${row.key || "field"}-${rowIndex}`,
+          objectName: objectName || `对象映射 #${objectIndex + 1}`,
+        }));
+      });
+    }
+    return selectedFieldMappingConfig.rows.map((row, index) => ({
+      ...row,
+      detailKey: `${row.key || "field"}-${index}`,
+      objectName: selectedTaskTemplate?.syncMode === "CUSTOM_SQL_QUERY" ? "SQL 结果集 -> 目标表" : "全局字段映射",
+    }));
+  }, [selectedDetailObjectMappings, selectedFieldMappingConfig, selectedTaskTemplate?.syncMode]);
+  const selectedCustomSqlText = useMemo(
+    () => parseCustomSqlConfig(selectedTaskTemplate?.customSqlConfig),
+    [selectedTaskTemplate?.customSqlConfig],
+  );
+  const selectedRawConfigRows = useMemo<TaskRawConfigRow[]>(() => [
+    {
+      key: "objectMappingConfig",
+      name: "对象映射配置",
+      description: "保存源端 schema/table 到目标端 schema/table 的对应关系，以及每个对象的 where 条件。",
+      content: formatJsonConfig(selectedTaskTemplate?.objectMappingConfig),
+    },
+    {
+      key: "fieldMappingConfig",
+      name: "字段映射配置",
+      description: "保存每个同步对象下源字段、目标字段、是否同步、类型兼容性和转换规则。",
+      content: formatJsonConfig(selectedTaskTemplate?.fieldMappingConfig),
+    },
+    {
+      key: "filterConfig",
+      name: "过滤条件配置",
+      description: "保存任务级过滤配置；对象级 where 会优先展示在对象映射表中。",
+      content: formatJsonConfig(selectedTaskTemplate?.filterConfig),
+    },
+    {
+      key: "partitionConfig",
+      name: "分片/批量窗口配置",
+      description: "保存 splitPk、分片数量、批处理窗口、并发通道等执行规划参数。",
+      content: formatJsonConfig(selectedTaskTemplate?.partitionConfig),
+    },
+    {
+      key: "scheduleConfig",
+      name: "调度周期配置",
+      description: "定期全量和定期批量任务使用；普通全量、SQL 和实时任务通常不需要调度周期。",
+      content: formatJsonConfig(selectedTask?.scheduleConfig),
+    },
+    {
+      key: "retryPolicy",
+      name: "重试策略",
+      description: "控制失败对象、失败分片或执行异常时的重试预算与退避策略。",
+      content: formatJsonConfig(selectedTaskTemplate?.retryPolicy),
+    },
+    {
+      key: "timeoutPolicy",
+      name: "超时策略",
+      description: "控制任务、对象、分片或连接调用的超时边界，避免执行器无限等待。",
+      content: formatJsonConfig(selectedTaskTemplate?.timeoutPolicy),
+    },
+    {
+      key: "customSqlConfig",
+      name: "SQL 语句配置",
+      description: "SQL 自定义传输模式使用；详情页会额外以 SQL 文本形式单独展示。",
+      content: formatJsonConfig(selectedTaskTemplate?.customSqlConfig),
+    },
+  ], [selectedTask?.scheduleConfig, selectedTaskTemplate]);
   const tasks = useMemo(() => taskQuery.data?.data.records ?? [], [taskQuery.data?.data.records]);
   const taskGroupTree = useMemo(
     () => normalizeSyncGroupTree(taskGroupTreeQuery.data?.data ?? []),
@@ -1410,6 +1560,7 @@ export function DataSync() {
       await Promise.all([taskQuery.refetch(), taskGroupQuery.refetch(), taskGroupTreeQuery.refetch(), recycleBinQuery.refetch()]);
       if (selectedTask) {
         await Promise.all([
+          selectedTaskTemplateQuery.refetch(),
           executionQuery.refetch(),
           objectExecutionQuery.refetch(),
           errorSampleQuery.refetch(),
@@ -3796,6 +3947,85 @@ export function DataSync() {
     { title: "时间", dataIndex: "eventTime", width: 170, render: (value) => formatDateTime(value) },
   ];
 
+  const taskObjectMappingColumns: ColumnsType<ObjectMappingRow> = [
+    {
+      title: "源端对象",
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text className="mono">{compactObjectName(record.sourceSchemaName, record.sourceObjectName)}</Typography.Text>
+          {record.sourceTableIndex ? <Typography.Text type="secondary">元数据索引：{record.sourceTableIndex}</Typography.Text> : null}
+        </Space>
+      ),
+    },
+    {
+      title: "目标对象",
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text className="mono">{compactObjectName(record.targetSchemaName, record.targetObjectName)}</Typography.Text>
+          {record.targetTableIndex ? <Typography.Text type="secondary">元数据索引：{record.targetTableIndex}</Typography.Text> : null}
+        </Space>
+      ),
+    },
+    { title: "对象类型", dataIndex: "objectType", width: 110, render: (value) => <Tag>{value || "TABLE"}</Tag> },
+    {
+      title: "where 条件",
+      dataIndex: "whereCondition",
+      render: (value) => value ? <Typography.Text className="mono">{value}</Typography.Text> : <Typography.Text type="secondary">未配置</Typography.Text>,
+    },
+  ];
+
+  const taskFieldMappingColumns: ColumnsType<FieldMappingDetailRow> = [
+    {
+      title: "所属对象",
+      dataIndex: "objectName",
+      width: 260,
+      render: (value) => <Typography.Text className="mono">{value}</Typography.Text>,
+    },
+    {
+      title: "源端字段",
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>{record.sourceField || "-"}</Typography.Text>
+          <Typography.Text type="secondary">{record.sourceType || "-"}</Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: "目标字段",
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>{record.targetField || "未映射"}</Typography.Text>
+          <Typography.Text type="secondary">{record.targetType || "-"}</Typography.Text>
+        </Space>
+      ),
+    },
+    { title: "是否同步", dataIndex: "syncEnabled", width: 100, render: (value) => <BooleanTag value={value !== false} trueLabel="同步" falseLabel="不同步" /> },
+    { title: "主键", dataIndex: "primaryKey", width: 80, render: (value) => value ? <Tag color="blue">主键</Tag> : "-" },
+    { title: "兼容性", dataIndex: "typeCompatible", width: 110, render: (value) => value == null ? "-" : <BooleanTag value={value} trueLabel="兼容" falseLabel="不兼容" /> },
+    { title: "转换/说明", render: (_, record) => record.transform || record.compatibilityNote || "-" },
+  ];
+
+  const taskRawConfigColumns: ColumnsType<TaskRawConfigRow> = [
+    {
+      title: "配置项",
+      width: 190,
+      render: (_, record) => (
+        <Space direction="vertical" size={2}>
+          <Typography.Text strong>{record.name}</Typography.Text>
+          <Typography.Text type="secondary">{record.description}</Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: "持久化快照",
+      render: (_, record) => (
+        <pre className="mono" style={{ margin: 0, maxHeight: 220, overflow: "auto", whiteSpace: "pre-wrap" }}>
+          {record.content}
+        </pre>
+      ),
+    },
+  ];
+
   const capabilityColumns: ColumnsType<SyncConnectorCapability> = [
     {
       title: "连接器",
@@ -5045,6 +5275,116 @@ export function DataSync() {
             </Descriptions>
             <Tabs
               items={[
+                {
+                  key: "definition",
+                  label: "任务配置",
+                  children: (
+                    <div className="page-stack">
+                      <Alert
+                        showIcon
+                        type="info"
+                        message="这里展示的是任务定义快照，不是某一次执行日志"
+                        description="任务配置用于回答“这个任务应该同步什么、从哪里同步到哪里、用什么模式写入”。执行历史和运行日志用于回答“某一次执行实际跑到了哪一步”。连接密码、token、where 原始敏感样本不会在这里展示。"
+                      />
+                      <Card className="compact-card" title="基础定义" loading={selectedTaskTemplateQuery.isLoading}>
+                        <Descriptions column={2} bordered size="small">
+                          <Descriptions.Item label="任务名称">{selectedTask.name}</Descriptions.Item>
+                          <Descriptions.Item label="任务 ID">{selectedTask.id}</Descriptions.Item>
+                          <Descriptions.Item label="模板 ID">{selectedTask.templateId}</Descriptions.Item>
+                          <Descriptions.Item label="项目 ID">{selectedTask.projectId ?? selectedTaskTemplate?.projectId ?? "-"}</Descriptions.Item>
+                          <Descriptions.Item label="任务分组">{selectedTask.groupName || "默认分组"}</Descriptions.Item>
+                          <Descriptions.Item label="负责人">{selectedTask.ownerId || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="任务状态">{statusTag(selectedTask.currentState, stateColor, syncTaskStateLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="审批状态">{statusTag(selectedTask.approvalState, approvalColor, approvalLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="同步模式">{labelOf(selectedTaskTemplate?.syncMode, syncModeLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="同步范围">{labelOf(selectedTaskTemplate?.syncScopeType, syncScopeLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="写入模式">{labelOf(selectedTaskTemplate?.writeStrategy, writeStrategyLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="优先级">{labelOf(selectedTask.priority, priorityLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="创建时间">{formatDateTime(selectedTask.createTime)}</Descriptions.Item>
+                          <Descriptions.Item label="更新时间">{formatDateTime(selectedTask.updateTime)}</Descriptions.Item>
+                          <Descriptions.Item label="任务描述" span={2}>{selectedTask.description || selectedTaskTemplate?.description || "-"}</Descriptions.Item>
+                        </Descriptions>
+                      </Card>
+
+                      <Card className="compact-card" title="源端与目标端数据源" loading={dataSourceQuery.isLoading || selectedTaskTemplateQuery.isLoading}>
+                        <Descriptions column={2} bordered size="small">
+                          <Descriptions.Item label="源端数据源" span={2}>{datasourceDetailLabel(selectedSourceDatasource)}</Descriptions.Item>
+                          <Descriptions.Item label="源端类型">{selectedSourceDatasource?.type || selectedTaskTemplate?.sourceConnectorType || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="源端用途">{selectedSourceDatasource?.usageRole || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="源端环境">{selectedSourceDatasource?.environment || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="源端健康">{selectedSourceDatasource?.connectionHealth || selectedSourceDatasource?.status || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="源端 JDBC" span={2}>{selectedSourceDatasource?.jdbcUrl || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="目标端数据源" span={2}>{datasourceDetailLabel(selectedTargetDatasource)}</Descriptions.Item>
+                          <Descriptions.Item label="目标端类型">{selectedTargetDatasource?.type || selectedTaskTemplate?.targetConnectorType || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="目标端用途">{selectedTargetDatasource?.usageRole || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="目标端环境">{selectedTargetDatasource?.environment || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="目标端健康">{selectedTargetDatasource?.connectionHealth || selectedTargetDatasource?.status || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="目标端 JDBC" span={2}>{selectedTargetDatasource?.jdbcUrl || "-"}</Descriptions.Item>
+                        </Descriptions>
+                      </Card>
+
+                      <Card className="compact-card" title="调度与生命周期">
+                        <Descriptions column={2} bordered size="small">
+                          <Descriptions.Item label="自动调度">{selectedTask.scheduleEnabled ? "已启用" : "未启用"}</Descriptions.Item>
+                          <Descriptions.Item label="下次触发">{formatDateTime(selectedTask.nextFireTime)}</Descriptions.Item>
+                          <Descriptions.Item label="上次触发">{formatDateTime(selectedTask.lastFireTime)}</Descriptions.Item>
+                          <Descriptions.Item label="最近执行">{selectedTask.lastExecutionId || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="已派发次数">{selectedTask.scheduleDispatchCount ?? 0}</Descriptions.Item>
+                          <Descriptions.Item label="错过调度次数">{selectedTask.scheduleMisfireCount ?? 0}</Descriptions.Item>
+                          <Descriptions.Item label="调度版本">{selectedTask.scheduleVersion ?? "-"}</Descriptions.Item>
+                          <Descriptions.Item label="触发类型">{labelOf(selectedTask.triggerType, triggerTypeLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="调度周期配置" span={2}>
+                            <pre className="mono" style={{ margin: 0, whiteSpace: "pre-wrap" }}>{formatJsonConfig(selectedTask.scheduleConfig)}</pre>
+                          </Descriptions.Item>
+                        </Descriptions>
+                      </Card>
+
+                      {selectedTaskTemplate?.syncMode === "CUSTOM_SQL_QUERY" || selectedCustomSqlText ? (
+                        <Card className="compact-card" title="SQL 自定义传输语句">
+                          <Alert
+                            showIcon
+                            type="warning"
+                            message="SQL 详情用于配置审阅，不代表运行日志会泄露 SQL"
+                            description="创建任务时的 SQL 需要在这里可回看，方便确认字段别名、目标字段映射和过滤条件；运行日志仍然保持低敏策略，不写入 SQL 正文。"
+                            style={{ marginBottom: 12 }}
+                          />
+                          <pre className="mono" style={{ margin: 0, maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap" }}>
+                            {selectedCustomSqlText || "未配置 SQL 语句"}
+                          </pre>
+                        </Card>
+                      ) : null}
+
+                      <Card className="compact-card" title="对象映射与 where 条件">
+                        <Table
+                          rowKey="key"
+                          columns={taskObjectMappingColumns}
+                          dataSource={selectedDetailObjectMappings}
+                          locale={{ emptyText: <RealEmpty description="暂无对象映射配置" /> }}
+                          pagination={{ pageSize: 6, showSizeChanger: true }}
+                        />
+                      </Card>
+
+                      <Card className="compact-card" title="字段映射">
+                        <Table
+                          rowKey="detailKey"
+                          columns={taskFieldMappingColumns}
+                          dataSource={selectedFieldRowsForDetail}
+                          locale={{ emptyText: <RealEmpty description="暂无字段映射配置" /> }}
+                          pagination={{ pageSize: 8, showSizeChanger: true }}
+                        />
+                      </Card>
+
+                      <Card className="compact-card" title="持久化配置快照">
+                        <Table
+                          rowKey="key"
+                          columns={taskRawConfigColumns}
+                          dataSource={selectedRawConfigRows}
+                          pagination={false}
+                        />
+                      </Card>
+                    </div>
+                  ),
+                },
                 {
                   key: "executions",
                   label: "执行历史",
