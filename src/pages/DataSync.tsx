@@ -1021,6 +1021,7 @@ export function DataSync() {
   const [selectedRecycleTaskRowKeys, setSelectedRecycleTaskRowKeys] = useState<number[]>([]);
   const [selectedTask, setSelectedTask] = useState<SyncTask | null>(null);
   const [selectedExecutionId, setSelectedExecutionId] = useState<number>();
+  const [taskDrawerActiveTab, setTaskDrawerActiveTab] = useState("definition");
   const [recoveryAction, setRecoveryAction] = useState<"replay" | "backfill" | null>(null);
   const [recoveryTask, setRecoveryTask] = useState<SyncTask | null>(null);
   const [sourceObjectKeyword, setSourceObjectKeyword] = useState("");
@@ -1195,34 +1196,10 @@ export function DataSync() {
       content: formatJsonConfig(selectedTaskTemplate?.fieldMappingConfig),
     },
     {
-      key: "filterConfig",
-      name: "过滤条件配置",
-      description: "保存任务级过滤配置；对象级 where 会优先展示在对象映射表中。",
-      content: formatJsonConfig(selectedTaskTemplate?.filterConfig),
-    },
-    {
-      key: "partitionConfig",
-      name: "分片/批量窗口配置",
-      description: "保存 splitPk、分片数量、批处理窗口、并发通道等执行规划参数。",
-      content: formatJsonConfig(selectedTaskTemplate?.partitionConfig),
-    },
-    {
       key: "scheduleConfig",
       name: "调度周期配置",
       description: "定期全量和定期批量任务使用；普通全量、SQL 和实时任务通常不需要调度周期。",
       content: formatJsonConfig(selectedTask?.scheduleConfig),
-    },
-    {
-      key: "retryPolicy",
-      name: "重试策略",
-      description: "控制失败对象、失败分片或执行异常时的重试预算与退避策略。",
-      content: formatJsonConfig(selectedTaskTemplate?.retryPolicy),
-    },
-    {
-      key: "timeoutPolicy",
-      name: "超时策略",
-      description: "控制任务、对象、分片或连接调用的超时边界，避免执行器无限等待。",
-      content: formatJsonConfig(selectedTaskTemplate?.timeoutPolicy),
     },
     {
       key: "customSqlConfig",
@@ -3576,6 +3553,7 @@ export function DataSync() {
   const openTaskDrawer = (record: SyncTask) => {
     setSelectedTask(record);
     setSelectedExecutionId(record.lastExecutionId);
+    setTaskDrawerActiveTab("executions");
     dirtyReplayForm.setFieldsValue({ executionId: record.lastExecutionId });
   };
 
@@ -3879,7 +3857,9 @@ export function DataSync() {
           title="查看执行详情"
           onClick={() => {
             setSelectedExecutionId(record.id);
+            setTaskDrawerActiveTab("logs");
             dirtyReplayForm.setFieldsValue({ executionId: record.id });
+            message.success(`已切换到执行记录 #${record.id} 的运行日志`);
           }}
         />
       ),
@@ -5257,6 +5237,7 @@ export function DataSync() {
         onClose={() => {
           setSelectedTask(null);
           setSelectedExecutionId(undefined);
+          setTaskDrawerActiveTab("definition");
         }}
         destroyOnHidden
       >
@@ -5274,6 +5255,8 @@ export function DataSync() {
               <Descriptions.Item label="下次触发">{formatDateTime(selectedTask.nextFireTime)}</Descriptions.Item>
             </Descriptions>
             <Tabs
+              activeKey={taskDrawerActiveTab}
+              onChange={setTaskDrawerActiveTab}
               items={[
                 {
                   key: "definition",
@@ -5375,6 +5358,13 @@ export function DataSync() {
                       </Card>
 
                       <Card className="compact-card" title="持久化配置快照">
+                        <Alert
+                          showIcon
+                          type="info"
+                          message="这里只展示用户创建任务时真正配置过的定义"
+                          description="对象级 where 条件已经在“对象映射与 where 条件”表格中展示，并会在执行时下推到 Reader。splitPk、分片数量、批处理窗口、重试、超时、并发通道属于系统自动规划或管理员执行策略，不再作为普通任务定义快照展示。"
+                          style={{ marginBottom: 12 }}
+                        />
                         <Table
                           rowKey="key"
                           columns={taskRawConfigColumns}
