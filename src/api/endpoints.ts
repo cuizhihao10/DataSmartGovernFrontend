@@ -1636,6 +1636,24 @@ async function pageEndpoint<T>(path: string, fallbackRecords: T[], mapper?: (val
   };
 }
 
+async function realPageEndpoint<T>(path: string, mapper?: (value: unknown, index: number) => T) {
+  /*
+   * 执行日志、执行历史、审计证据这类数据属于“生产运行证据”，不能像看板样例数据一样静默降级为 mock。
+   * 如果这里继续复用 requestWithFallback，一旦 token 过期、网关路由策略缺失、权限中心拒绝或后端接口异常，
+   * 页面会收到一个空分页并显示“本地模拟数据未命中记录”，用户会误以为系统没有写运行日志。
+   *
+   * 因此真实证据类接口统一走 request：
+   * 1. 接口成功时，按后端分页结构解析 records；
+   * 2. 接口失败时，把真实 HTTP/平台错误抛给 React Query；
+   * 3. 页面再把错误展示成可读提示，帮助定位是认证、权限、路由还是 data-sync 服务问题。
+   */
+  const result = await request<unknown>(path);
+  return {
+    ...result,
+    data: normalizePage<T>(result.data, [], mapper),
+  };
+}
+
 async function arrayEndpoint<T>(path: string, fallbackRecords: T[], mapper?: (value: unknown, index: number) => T) {
   const result = await requestWithFallback<unknown>(path, fallbackRecords);
   const fallback = result.meta.source === "mock" ? fallbackRecords : [];
@@ -1972,9 +1990,8 @@ export const api = {
   listSyncExecutions: (taskId: number) =>
     pageEndpoint<SyncExecution>(`/sync/sync-tasks/${taskId}/executions?current=1&size=20`, [], normalizeSyncExecution),
   listSyncExecutionLogs: (taskId: number, executionId: number) =>
-    pageEndpoint<SyncExecutionLog>(
+    realPageEndpoint<SyncExecutionLog>(
       `/sync/sync-tasks/${taskId}/executions/${executionId}/logs?current=1&size=200`,
-      [],
       normalizeSyncExecutionLog,
     ),
   listSyncObjectExecutions: (taskId: number, executionId: number) =>

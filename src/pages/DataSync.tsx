@@ -5414,12 +5414,31 @@ export function DataSync() {
                         }
                         description="运行日志记录任务入队、执行器认领、预检查/计划、通道创建、对象或分片同步、批次回执、断点与最终完成等关键阶段。日志只展示低敏进度事实，不展示 SQL、连接串、密码、where 原文或样本行。"
                       />
+                      {executionLogQuery.isError ? (
+                        <Alert
+                          showIcon
+                          type="error"
+                          message="运行日志加载失败"
+                          description={
+                            executionLogQuery.error instanceof Error
+                              ? executionLogQuery.error.message
+                              : "运行日志接口暂时不可用，请检查网关路由、权限策略或 data-sync 日志查询服务。"
+                          }
+                        />
+                      ) : null}
                       <Table
                         rowKey="id"
                         columns={executionLogColumns}
                         dataSource={executionLogs}
                         loading={executionLogQuery.isLoading || executionLogQuery.isFetching}
-                        locale={{ emptyText: <RealEmpty meta={executionLogQuery.data?.meta} description="暂无运行日志" /> }}
+                        locale={{
+                          emptyText: (
+                            <RealEmpty
+                              meta={executionLogQuery.data?.meta}
+                              description={executionLogQuery.isError ? "运行日志加载失败，请查看上方错误详情" : "暂无运行日志"}
+                            />
+                          ),
+                        }}
                         pagination={{ pageSize: 10, showSizeChanger: false }}
                       />
                     </div>
