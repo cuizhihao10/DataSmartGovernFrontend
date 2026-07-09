@@ -415,6 +415,7 @@ export interface SyncExecutionPolicyQueryParams {
  *
  * 字段留空表示继承更低优先级策略，而不是把配置重置为 0。普通任务创建向导不会使用该载荷；
  * 它只服务“执行策略”管理页，运行时由后端按任务 > 项目 > 数据源/连接器 > 系统默认逐层合并。
+ * CONNECTOR 作用域下 connectorType 也可以留空，表示“全部连接器”的通用读取/写入默认策略。
  */
 export interface UpsertSyncExecutionPolicyPayload {
   id?: number;

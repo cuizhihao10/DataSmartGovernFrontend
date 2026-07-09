@@ -151,7 +151,7 @@ const dataSourceUsageLabels: Record<string, string> = {
 const executionPolicyScopeLabels: Record<string, string> = {
   SYSTEM: "系统默认",
   PROJECT: "项目级",
-  CONNECTOR: "连接器级",
+  CONNECTOR: "读写默认 / 连接器级",
   DATASOURCE: "数据源级",
   TASK: "任务级",
 };
@@ -4187,9 +4187,9 @@ export function DataSync() {
             {labelOf(record.scopeType, executionPolicyScopeLabels)}
           </Tag>
           <Typography.Text>{record.scopeName || record.scopeKey || "-"}</Typography.Text>
-          {record.connectorType ? (
+          {record.scopeType === "CONNECTOR" || record.connectorRole ? (
             <Typography.Text type="secondary">
-              {record.connectorType} / {labelOf(record.connectorRole || "ANY", executionPolicyConnectorRoleLabels)}
+              {record.connectorType || "全部连接器"} / {labelOf(record.connectorRole || "ANY", executionPolicyConnectorRoleLabels)}
             </Typography.Text>
           ) : null}
           {record.datasourceId ? <Typography.Text type="secondary">数据源 {record.datasourceId}</Typography.Text> : null}
@@ -5587,7 +5587,7 @@ export function DataSync() {
             showIcon
             type="info"
             message="空字段表示继承，不是重置为 0"
-            description="策略按 SYSTEM -> CONNECTOR/DATASOURCE -> PROJECT -> TASK 逐层合并，越具体的作用域越晚覆盖。普通用户无需在任务向导中配置这些参数；每次 execution 会固化最终快照。"
+            description="策略按 SYSTEM -> CONNECTOR/DATASOURCE -> PROJECT -> TASK 逐层合并，越具体的作用域越晚覆盖。连接器类型留空表示通用读取/通用写入默认策略，不绑定 MySQL、PostgreSQL 等单一数据源类型；每次 execution 会固化最终快照。"
           />
           <Form<UpsertSyncExecutionPolicyPayload>
             form={executionPolicyForm}
@@ -5618,7 +5618,7 @@ export function DataSync() {
                 <Input placeholder="留空时由后端按作用域生成" />
               </Form.Item>
               <Form.Item name="scopeName" label="作用范围名称">
-                <Input placeholder="例如：FlashSync 项目 / MySQL 源端" />
+                <Input placeholder="例如：FlashSync 项目 / 通用源端读取 / Oracle 源端" />
               </Form.Item>
             </div>
 
@@ -5661,9 +5661,13 @@ export function DataSync() {
                 <Form.Item
                   name="connectorType"
                   label="连接器类型"
-                  rules={[{ required: true, message: "请选择连接器类型" }]}
                 >
-                  <Select showSearch options={executionPolicyConnectorOptions} />
+                  <Select
+                    allowClear
+                    showSearch
+                    options={executionPolicyConnectorOptions}
+                    placeholder="留空表示全部连接器，例如通用源端读取或通用目标端写入"
+                  />
                 </Form.Item>
                 <Form.Item
                   name="connectorRole"
