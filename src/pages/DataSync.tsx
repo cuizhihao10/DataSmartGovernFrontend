@@ -181,6 +181,27 @@ function isNumericScopeValue(value?: string | number) {
   return Number.isFinite(Number(value));
 }
 
+function normalizeProjectRole(value?: string) {
+  const role = String(value || "").trim().toUpperCase();
+  if (["OWNER", "PROJECT_OWNER"].includes(role)) return "OWNER";
+  if (["MANAGER", "OPERATOR", "TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(role)) return "MANAGER";
+  if (["READER", "AUDITOR"].includes(role)) return "READER";
+  return role;
+}
+
+function hasDatasourceAction(record: DataSourceRecord, action: string) {
+  const actions = record.effectiveActions?.map((item) => item.toUpperCase()) ?? [];
+  return actions.includes(action.toUpperCase());
+}
+
+function canUseDatasourceInWizard(record: DataSourceRecord, actorId: number, canManageCurrentProject: boolean) {
+  const isOwner = Number.isFinite(actorId) && record.ownerId != null && Number(record.ownerId) === actorId;
+  return canManageCurrentProject
+    || isOwner
+    || hasDatasourceAction(record, "USE")
+    || hasDatasourceAction(record, "MANAGE");
+}
+
 const syncTaskActionLabels: Record<string, string> = {
   run: "运行",
   manualDispatch: "立即执行一次",
@@ -2873,6 +2894,9 @@ export function DataSync() {
   const currentProject = currentSession?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
   const currentProjectLabel = currentProject?.projectName ?? currentProject?.name ?? currentSession?.projectName ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
   const scopedProjectId = isNumericScopeValue(selectedProjectId) ? String(selectedProjectId) : undefined;
+  const actorId = Number(currentSession?.actorId);
+  const currentProjectRole = normalizeProjectRole(currentProject?.projectRole ?? currentProject?.role ?? currentSession?.actorRole);
+  const canManageCurrentProject = currentProjectRole === "OWNER" || currentProjectRole === "MANAGER";
   const canManageExecutionPolicies = executionPolicyWriteRoles.has(
     String(currentSession?.actorRole || "").toUpperCase(),
   );
@@ -2885,10 +2909,12 @@ export function DataSync() {
     `${record.name} · ${record.type} · ${labelOf(record.usageRole || "SOURCE", dataSourceUsageLabels)}`;
   const sourceDataSourceOptions = dataSources
     .filter(matchCurrentDatasourceScope)
+    .filter((record) => canUseDatasourceInWizard(record, actorId, canManageCurrentProject))
     .filter((record) => record.usageRole === "SOURCE")
     .map((record) => ({ value: record.id, label: dataSourceOptionLabel(record) }));
   const targetDataSourceOptions = dataSources
     .filter(matchCurrentDatasourceScope)
+    .filter((record) => canUseDatasourceInWizard(record, actorId, canManageCurrentProject))
     .filter((record) => record.usageRole === "TARGET")
     .map((record) => ({ value: record.id, label: dataSourceOptionLabel(record) }));
   const executionPolicyDatasourceOptions = dataSources

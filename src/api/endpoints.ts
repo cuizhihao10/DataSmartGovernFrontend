@@ -33,6 +33,9 @@ import type {
   PermissionRole,
   PlatformHealth,
   PlatformPageResponse,
+  ProjectCreationRequestRecord,
+  ProjectRecord,
+  ProjectJoinRequestRecord,
   QualityReport,
   QualityRule,
   RiskLevel,
@@ -141,6 +144,83 @@ export interface AuthorizationSubjectCandidateParams {
   projectMembersOnly?: boolean;
   current?: number;
   size?: number;
+}
+
+export interface ProjectJoinRequestApplyPayload {
+  tenantId?: number;
+  projectId: number;
+  applicantName?: string;
+  requestedProjectRole?: "READER" | "MANAGER" | string;
+  requestReason?: string;
+}
+
+export interface ProjectCreatePayload {
+  tenantId?: number;
+  applicationId?: number;
+  projectCode?: string;
+  projectName: string;
+  projectType?: string;
+  ownerActorId?: number;
+  description?: string;
+  reason?: string;
+}
+
+export interface ProjectCreationRequestApplyPayload {
+  tenantId?: number;
+  applicationId?: number;
+  projectCode?: string;
+  projectName: string;
+  projectType?: string;
+  applicantName?: string;
+  ownerActorId?: number;
+  description?: string;
+  requestReason?: string;
+}
+
+export interface ProjectListParams {
+  tenantId?: number;
+  applicationId?: number;
+  projectId?: number;
+  projectCode?: string;
+  projectName?: string;
+  status?: string;
+  onlyMine?: boolean;
+  current?: number;
+  size?: number;
+}
+
+export interface ProjectJoinRequestQueryParams {
+  tenantId?: number;
+  projectId?: number;
+  applicantActorId?: number;
+  status?: string;
+  current?: number;
+  size?: number;
+}
+
+export interface ProjectJoinRequestReviewPayload {
+  approvedProjectRole?: "READER" | "MANAGER" | "OWNER" | string;
+  reviewComment?: string;
+}
+
+export interface ProjectCreationRequestQueryParams {
+  tenantId?: number;
+  applicationId?: number;
+  applicantActorId?: number;
+  createdProjectId?: number;
+  status?: string;
+  current?: number;
+  size?: number;
+}
+
+export interface ProjectCreationRequestReviewPayload {
+  projectCode?: string;
+  projectName?: string;
+  projectType?: string;
+  applicationId?: number;
+  ownerActorId?: number;
+  description?: string;
+  reviewComment?: string;
 }
 
 export interface MetadataDiscoveryPayload {
@@ -567,6 +647,16 @@ function readStringArray(value: unknown) {
   return Array.isArray(value) ? value.map((item) => readString(item)).filter(Boolean) : [];
 }
 
+function readActionArray(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((item) => readString(item).trim().toUpperCase()).filter(Boolean);
+  }
+  return readString(value)
+    .split(",")
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+}
+
 function readOptionalString(value: unknown) {
   const text = readString(value).trim();
   return text || undefined;
@@ -689,6 +779,9 @@ function normalizeDataSource(value: unknown, index: number): DataSourceRecord {
     tenantId: readOptionalNumber(record.tenantId),
     projectId: readOptionalNumber(record.projectId),
     workspaceId: readOptionalNumber(record.workspaceId),
+    ownerId: readOptionalNumber(record.ownerId),
+    createdBy: readOptionalNumber(record.createdBy),
+    effectiveActions: readActionArray(record.effectiveActions ?? record.authorizedActions ?? record.allowedActions),
     name: readString(record.name, `datasource-${id}`),
     type: normalizeDatasourceType(record.type),
     jdbcUrl: readString(record.jdbcUrl),
@@ -1445,6 +1538,68 @@ function normalizeRoutePolicy(value: unknown, index: number): RoutePolicy {
     resourceType: readString(record.resourceType ?? record.roleCode, "UNKNOWN"),
     defaultAction: readString(record.defaultAction ?? record.action ?? record.effect ?? record.httpMethod, "-"),
     enabled: readBoolean(record.enabled, true),
+  };
+}
+
+function normalizeProject(value: unknown, index: number): ProjectRecord {
+  const record = readRecord(value);
+  const projectId = readNumber(record.projectId ?? record.id, index + 1);
+  return {
+    projectId,
+    tenantId: readOptionalNumber(record.tenantId),
+    projectCode: readOptionalString(record.projectCode),
+    projectName: readString(record.projectName ?? record.name, `项目 ${projectId}`),
+    projectType: readOptionalString(record.projectType),
+    status: readOptionalString(record.status),
+    ownerActorId: readOptionalNumber(record.ownerActorId),
+    description: readOptionalString(record.description),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
+  };
+}
+
+function normalizeProjectJoinRequest(value: unknown, index: number): ProjectJoinRequestRecord {
+  const record = readRecord(value);
+  return {
+    id: readNumber(record.id, index + 1),
+    tenantId: readOptionalNumber(record.tenantId),
+    projectId: readNumber(record.projectId),
+    applicantActorId: readNumber(record.applicantActorId),
+    applicantName: readOptionalString(record.applicantName),
+    requestedProjectRole: readString(record.requestedProjectRole, "READER"),
+    status: readString(record.status, "PENDING"),
+    reviewerActorId: readOptionalNumber(record.reviewerActorId),
+    reviewerActorRole: readOptionalString(record.reviewerActorRole),
+    reviewComment: readOptionalString(record.reviewComment),
+    reviewTime: readOptionalString(record.reviewTime),
+    membershipId: readOptionalNumber(record.membershipId),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
+  };
+}
+
+function normalizeProjectCreationRequest(value: unknown, index: number): ProjectCreationRequestRecord {
+  const record = readRecord(value);
+  return {
+    id: readNumber(record.id, index + 1),
+    tenantId: readOptionalNumber(record.tenantId),
+    applicationId: readOptionalNumber(record.applicationId),
+    projectCode: readOptionalString(record.projectCode),
+    projectName: readString(record.projectName, `project-request-${index + 1}`),
+    projectType: readOptionalString(record.projectType),
+    applicantActorId: readNumber(record.applicantActorId),
+    applicantName: readOptionalString(record.applicantName),
+    ownerActorId: readOptionalNumber(record.ownerActorId),
+    description: readOptionalString(record.description),
+    requestReason: readOptionalString(record.requestReason),
+    status: readString(record.status, "PENDING"),
+    reviewerActorId: readOptionalNumber(record.reviewerActorId),
+    reviewerActorRole: readOptionalString(record.reviewerActorRole),
+    reviewComment: readOptionalString(record.reviewComment),
+    reviewTime: readOptionalString(record.reviewTime),
+    createdProjectId: readOptionalNumber(record.createdProjectId),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
   };
 }
 
@@ -2288,4 +2443,58 @@ export const api = {
   listRoles: () => arrayEndpoint<PermissionRole>("/permission/roles", roles, normalizeRole),
   listRoutePolicies: () =>
     arrayEndpoint<RoutePolicy>("/permission/route-policies", routePolicies, normalizeRoutePolicy),
+  listProjects: (params?: ProjectListParams) => {
+    const query = compactQueryString({ current: 1, size: 50, onlyMine: true, ...params });
+    return pageEndpoint<ProjectRecord>("/permission/projects?" + query, [], normalizeProject);
+  },
+  createProject: (payload: ProjectCreatePayload) =>
+    postJson<ProjectRecord>("/permission/projects", payload),
+  applyProjectCreationRequest: (payload: ProjectCreationRequestApplyPayload) =>
+    postJson<ProjectCreationRequestRecord>("/permission/project-creation-requests", payload),
+  listMyProjectCreationRequests: (params?: ProjectCreationRequestQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, ...params });
+    return pageEndpoint<ProjectCreationRequestRecord>(
+      `/permission/project-creation-requests/my?${query}`,
+      [],
+      normalizeProjectCreationRequest,
+    );
+  },
+  listProjectCreationApprovals: (params?: ProjectCreationRequestQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, status: "PENDING", ...params });
+    return pageEndpoint<ProjectCreationRequestRecord>(
+      `/permission/project-creation-requests/approvals?${query}`,
+      [],
+      normalizeProjectCreationRequest,
+    );
+  },
+  approveProjectCreationRequest: (requestId: number, payload?: ProjectCreationRequestReviewPayload) =>
+    postJson<ProjectCreationRequestRecord>(`/permission/project-creation-requests/${requestId}/approve`, payload ?? {}),
+  rejectProjectCreationRequest: (requestId: number, payload?: ProjectCreationRequestReviewPayload) =>
+    postJson<ProjectCreationRequestRecord>(`/permission/project-creation-requests/${requestId}/reject`, payload ?? {}),
+  cancelProjectCreationRequest: (requestId: number) =>
+    postJson<ProjectCreationRequestRecord>(`/permission/project-creation-requests/${requestId}/cancel`),
+  applyProjectJoinRequest: (payload: ProjectJoinRequestApplyPayload) =>
+    postJson<ProjectJoinRequestRecord>("/permission/project-join-requests", payload),
+  listMyProjectJoinRequests: (params?: ProjectJoinRequestQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, ...params });
+    return pageEndpoint<ProjectJoinRequestRecord>(
+      `/permission/project-join-requests/my?${query}`,
+      [],
+      normalizeProjectJoinRequest,
+    );
+  },
+  listProjectJoinApprovals: (params?: ProjectJoinRequestQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, status: "PENDING", ...params });
+    return pageEndpoint<ProjectJoinRequestRecord>(
+      `/permission/project-join-requests/approvals?${query}`,
+      [],
+      normalizeProjectJoinRequest,
+    );
+  },
+  approveProjectJoinRequest: (requestId: number, payload?: ProjectJoinRequestReviewPayload) =>
+    postJson<ProjectJoinRequestRecord>(`/permission/project-join-requests/${requestId}/approve`, payload ?? {}),
+  rejectProjectJoinRequest: (requestId: number, payload?: ProjectJoinRequestReviewPayload) =>
+    postJson<ProjectJoinRequestRecord>(`/permission/project-join-requests/${requestId}/reject`, payload ?? {}),
+  cancelProjectJoinRequest: (requestId: number) =>
+    postJson<ProjectJoinRequestRecord>(`/permission/project-join-requests/${requestId}/cancel`),
 };

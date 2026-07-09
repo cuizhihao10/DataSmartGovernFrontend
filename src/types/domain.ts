@@ -125,6 +125,9 @@ export interface DataSourceRecord {
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
+  ownerId?: number;
+  createdBy?: number;
+  effectiveActions?: string[];
   name: string;
   type: string;
   jdbcUrl?: string;
@@ -801,6 +804,58 @@ export interface RoutePolicy {
   enabled: boolean;
 }
 
+export interface ProjectRecord {
+  projectId: number;
+  tenantId?: number;
+  projectCode?: string;
+  projectName: string;
+  projectType?: string;
+  status?: string;
+  ownerActorId?: number;
+  description?: string;
+  createTime?: string;
+  updateTime?: string;
+}
+
+export interface ProjectJoinRequestRecord {
+  id: number;
+  tenantId?: number;
+  projectId: number;
+  applicantActorId: number;
+  applicantName?: string;
+  requestedProjectRole: "READER" | "MANAGER" | "OWNER" | string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED" | string;
+  reviewerActorId?: number;
+  reviewerActorRole?: string;
+  reviewComment?: string;
+  reviewTime?: string;
+  membershipId?: number;
+  createTime?: string;
+  updateTime?: string;
+}
+
+export interface ProjectCreationRequestRecord {
+  id: number;
+  tenantId?: number;
+  applicationId?: number;
+  projectCode?: string;
+  projectName: string;
+  projectType?: string;
+  applicantActorId: number;
+  applicantName?: string;
+  ownerActorId?: number;
+  description?: string;
+  requestReason?: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED" | string;
+  reviewerActorId?: number;
+  reviewerActorRole?: string;
+  reviewComment?: string;
+  reviewTime?: string;
+  createdProjectId?: number;
+  createTime?: string;
+  updateTime?: string;
+}
+
 export type JsonObject = Record<string, unknown>;
 export type AgentExecutionMode =
   | "SYNC"
@@ -1039,6 +1094,8 @@ export interface GatewaySession {
     projectId?: number | string;
     name?: string;
     projectName?: string;
+    role?: string;
+    projectRole?: string;
   }>;
   issueCodes?: string[];
   payloadPolicy?: string;

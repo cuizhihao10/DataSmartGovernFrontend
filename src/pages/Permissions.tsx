@@ -1,16 +1,39 @@
-import { AuditOutlined, SafetyCertificateOutlined, SearchOutlined } from "@ant-design/icons";
-import { Button, Card, Input, Space, Table, Tabs, Tag, Typography } from "antd";
+import {
+  AuditOutlined,
+  CheckOutlined,
+  CloseOutlined,
+  PlusOutlined,
+  SafetyCertificateOutlined,
+  SearchOutlined,
+  UserAddOutlined,
+} from "@ant-design/icons";
+import { Alert, App, Button, Card, Form, Input, Select, Space, Table, Tabs, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
-import { api } from "@/api/endpoints";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import {
+  api,
+  type ProjectCreationRequestApplyPayload,
+  type ProjectCreationRequestReviewPayload,
+  type ProjectCreatePayload,
+  type ProjectJoinRequestApplyPayload,
+  type ProjectJoinRequestReviewPayload,
+} from "@/api/endpoints";
 import { DataSourceIndicator } from "@/components/DataSourceIndicator";
 import { RealEmpty } from "@/components/RealEmpty";
 import { BooleanTag } from "@/components/StatusTag";
 import { PageHeader } from "@/components/PageHeader";
-import type { PermissionRole, RoutePolicy } from "@/types/domain";
+import { useUiStore } from "@/store/uiStore";
+import type {
+  PermissionRole,
+  ProjectCreationRequestRecord,
+  ProjectJoinRequestRecord,
+  ProjectRecord,
+  RoutePolicy,
+} from "@/types/domain";
+import { formatDateTime } from "@/utils/format";
 import { labelOf, scopeLabels } from "@/utils/labels";
-import { defaultTablePagination } from "@/utils/table";
+import { defaultTablePagination, sortByIdDesc } from "@/utils/table";
 
 const scopeColor: Record<PermissionRole["scope"], string> = {
   PLATFORM: "red",
@@ -27,6 +50,8 @@ const resourceTypeLabels: Record<string, string> = {
   AI_RUNTIME: "智能体运行时",
   TASK: "治理任务",
   QUALITY_RULE: "质量规则",
+  PROJECT_JOIN_REQUEST: "项目加入申请",
+  PROJECT_CREATION_REQUEST: "项目创建申请",
 };
 
 const actionLabels: Record<string, string> = {
@@ -36,11 +61,67 @@ const actionLabels: Record<string, string> = {
   DELETE: "删除",
   EXECUTE: "执行",
   APPROVE: "审批",
+  APPLY: "申请",
+  REVIEW: "审核",
   VIEW_EVENTS: "查看事件",
 };
 
+const joinStatusColor: Record<string, string> = {
+  PENDING: "gold",
+  APPROVED: "green",
+  REJECTED: "red",
+  CANCELLED: "default",
+};
+
+function normalizeRole(value?: string) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function canReviewProjectJoinRequests(actorRole?: string) {
+  return ["PROJECT_OWNER", "TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR", "OWNER"].includes(normalizeRole(actorRole));
+}
+
+function canDirectCreateProject(actorRole?: string) {
+  return ["TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(normalizeRole(actorRole));
+}
+
+function canApplyProjectCreation(actorRole?: string) {
+  return ["ORDINARY_USER", "PROJECT_OWNER", "OPERATOR", "OWNER"].includes(normalizeRole(actorRole));
+}
+
+function canUseProjectCreationEntry(actorRole?: string) {
+  return canDirectCreateProject(actorRole) || canApplyProjectCreation(actorRole);
+}
+
+function canReviewProjectCreationRequests(actorRole?: string) {
+  return ["TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(normalizeRole(actorRole));
+}
+
+type ProjectFormPayload = ProjectCreatePayload & ProjectCreationRequestApplyPayload;
+
 export function Permissions() {
+  const { message } = App.useApp();
   const [keyword, setKeyword] = useState("");
+  const [projectForm] = Form.useForm<ProjectFormPayload>();
+  const [joinForm] = Form.useForm<ProjectJoinRequestApplyPayload>();
+  const [reviewForm] = Form.useForm<ProjectJoinRequestReviewPayload>();
+  const selectedProjectId = useUiStore((state) => state.selectedProjectId);
+  const setSelectedProjectId = useUiStore((state) => state.setSelectedProjectId);
+  const setProjectOptions = useUiStore((state) => state.setProjectOptions);
+
+  const sessionQuery = useQuery({
+    queryKey: ["permission-gateway-session"],
+    queryFn: api.getSession,
+  });
+  const session = sessionQuery.data?.data;
+  const actorRole = session?.actorRole;
+  const selectedProjectNumber = Number(selectedProjectId ?? session?.authorizedProjectIds?.[0]);
+  const currentProjectId = Number.isFinite(selectedProjectNumber) ? selectedProjectNumber : undefined;
+  const currentProjectLabel = useMemo(() => {
+    const project = session?.authorizedProjects?.find((item) => String(item.projectId ?? item.id) === String(currentProjectId));
+    return project?.projectName ?? project?.name ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
+  }, [currentProjectId, session?.authorizedProjects]);
+
   const roleQuery = useQuery({
     queryKey: ["permission-roles"],
     queryFn: api.listRoles,
@@ -49,9 +130,148 @@ export function Permissions() {
     queryKey: ["permission-route-policies"],
     queryFn: api.listRoutePolicies,
   });
+  const projectQuery = useQuery({
+    queryKey: ["permission-projects"],
+    queryFn: () => api.listProjects({ current: 1, size: 100 }),
+  });
+  const myJoinQuery = useQuery({
+    queryKey: ["permission-project-join-my", currentProjectId],
+    queryFn: () => api.listMyProjectJoinRequests({ projectId: currentProjectId, size: 100 }),
+  });
+  const approvalQuery = useQuery({
+    queryKey: ["permission-project-join-approvals", currentProjectId],
+    queryFn: () => api.listProjectJoinApprovals({ projectId: currentProjectId, status: "PENDING", size: 100 }),
+    enabled: canReviewProjectJoinRequests(actorRole),
+  });
+  const myCreationQuery = useQuery({
+    queryKey: ["permission-project-creation-my"],
+    queryFn: () => api.listMyProjectCreationRequests({ size: 100 }),
+    enabled: canApplyProjectCreation(actorRole),
+  });
+  const creationApprovalQuery = useQuery({
+    queryKey: ["permission-project-creation-approvals"],
+    queryFn: () => api.listProjectCreationApprovals({ status: "PENDING", size: 100 }),
+    enabled: canReviewProjectCreationRequests(actorRole),
+  });
+
+  useEffect(() => {
+    const projects = projectQuery.data?.data.records ?? [];
+    if (!projects.length) {
+      return;
+    }
+    setProjectOptions(projects.map((project) => ({
+      value: String(project.projectId),
+      label: project.projectName || `项目 ${project.projectId}`,
+    })));
+  }, [projectQuery.data?.data.records, setProjectOptions]);
+
+  useEffect(() => {
+    if (currentProjectId != null) {
+      joinForm.setFieldsValue({ projectId: currentProjectId, requestedProjectRole: "READER" });
+    }
+  }, [currentProjectId, joinForm]);
+
+  const createProjectMutation = useMutation({
+    mutationFn: api.createProject,
+    onSuccess: async (result) => {
+      message.success(result.data.projectName ? `项目已创建：${result.data.projectName}` : "项目已创建");
+      if (result.data.projectId) {
+        setSelectedProjectId(String(result.data.projectId));
+      }
+      projectForm.resetFields();
+      await projectQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "项目创建失败"),
+  });
+
+  const applyCreationMutation = useMutation({
+    mutationFn: api.applyProjectCreationRequest,
+    onSuccess: async () => {
+      message.success("项目创建申请已提交，等待管理员审批");
+      projectForm.resetFields();
+      await myCreationQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "项目创建申请提交失败"),
+  });
+
+  const approveCreationMutation = useMutation({
+    mutationFn: ({ requestId, payload }: { requestId: number; payload: ProjectCreationRequestReviewPayload }) =>
+      api.approveProjectCreationRequest(requestId, payload),
+    onSuccess: async () => {
+      message.success("项目创建申请已审批通过，项目已创建");
+      await Promise.all([creationApprovalQuery.refetch(), projectQuery.refetch(), sessionQuery.refetch()]);
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "项目创建审批通过失败"),
+  });
+
+  const rejectCreationMutation = useMutation({
+    mutationFn: ({ requestId, payload }: { requestId: number; payload: ProjectCreationRequestReviewPayload }) =>
+      api.rejectProjectCreationRequest(requestId, payload),
+    onSuccess: async () => {
+      message.success("项目创建申请已拒绝");
+      await creationApprovalQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "项目创建申请拒绝失败"),
+  });
+
+  const cancelCreationMutation = useMutation({
+    mutationFn: api.cancelProjectCreationRequest,
+    onSuccess: async () => {
+      message.success("项目创建申请已撤销");
+      await myCreationQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "项目创建申请撤销失败"),
+  });
+
+  const applyJoinMutation = useMutation({
+    mutationFn: api.applyProjectJoinRequest,
+    onSuccess: async () => {
+      message.success("项目加入申请已提交");
+      joinForm.setFieldsValue({ requestReason: undefined, requestedProjectRole: "READER" });
+      await myJoinQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "项目加入申请提交失败"),
+  });
+
+  const approveMutation = useMutation({
+    mutationFn: ({ requestId, payload }: { requestId: number; payload: ProjectJoinRequestReviewPayload }) =>
+      api.approveProjectJoinRequest(requestId, payload),
+    onSuccess: async () => {
+      message.success("已审批通过并授予项目角色");
+      reviewForm.resetFields();
+      await Promise.all([approvalQuery.refetch(), myJoinQuery.refetch(), sessionQuery.refetch()]);
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "审批通过失败"),
+  });
+
+  const rejectMutation = useMutation({
+    mutationFn: ({ requestId, payload }: { requestId: number; payload: ProjectJoinRequestReviewPayload }) =>
+      api.rejectProjectJoinRequest(requestId, payload),
+    onSuccess: async () => {
+      message.success("已拒绝申请");
+      reviewForm.resetFields();
+      await approvalQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "拒绝申请失败"),
+  });
+
+  const cancelMutation = useMutation({
+    mutationFn: api.cancelProjectJoinRequest,
+    onSuccess: async () => {
+      message.success("已撤销申请");
+      await myJoinQuery.refetch();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : "撤销申请失败"),
+  });
 
   const roles = roleQuery.data?.data ?? [];
   const routePolicies = routePolicyQuery.data?.data ?? [];
+  const projects = projectQuery.data?.data.records ?? [];
+  const myCreationRequests = myCreationQuery.data?.data.records ?? [];
+  const creationApprovalRequests = creationApprovalQuery.data?.data.records ?? [];
+  const myRequests = myJoinQuery.data?.data.records ?? [];
+  const approvalRequests = approvalQuery.data?.data.records ?? [];
+
   const filteredRoles = roles.filter((role) =>
     [role.name, role.code, role.scope].join(" ").toLowerCase().includes(keyword.toLowerCase()),
   );
@@ -61,6 +281,41 @@ export function Permissions() {
       .toLowerCase()
       .includes(keyword.toLowerCase()),
   );
+
+  const submitCreateProject = (values: ProjectFormPayload) => {
+    const payload = {
+      ...values,
+      projectType: values.projectType || "DATA_GOVERNANCE",
+    };
+    if (canDirectCreateProject(actorRole)) {
+      createProjectMutation.mutate({
+        ...payload,
+        reason: values.reason || "前端项目管理页创建",
+      });
+      return;
+    }
+    if (canApplyProjectCreation(actorRole)) {
+      applyCreationMutation.mutate({
+        ...payload,
+        requestReason: values.requestReason || values.reason || "申请创建项目",
+      });
+      return;
+    }
+    message.error("当前角色没有项目创建或申请权限");
+  };
+
+  const submitJoinRequest = (values: ProjectJoinRequestApplyPayload) => {
+    const projectId = Number(values.projectId ?? currentProjectId);
+    if (!Number.isFinite(projectId)) {
+      message.error("请先选择要加入的项目");
+      return;
+    }
+    applyJoinMutation.mutate({
+      ...values,
+      projectId,
+      requestedProjectRole: values.requestedProjectRole || "READER",
+    });
+  };
 
   const roleColumns: ColumnsType<PermissionRole> = [
     {
@@ -104,16 +359,162 @@ export function Permissions() {
     { title: "状态", dataIndex: "enabled", render: (value) => <BooleanTag value={value} /> },
   ];
 
+  const projectColumns: ColumnsType<ProjectRecord> = [
+    { title: "项目 ID", dataIndex: "projectId", width: 100, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
+    { title: "项目名称", dataIndex: "projectName", render: (value, record) => (
+      <Space direction="vertical" size={0}>
+        <Typography.Text strong>{value}</Typography.Text>
+        <Typography.Text type="secondary" className="mono">{record.projectCode || "-"}</Typography.Text>
+      </Space>
+    ) },
+    { title: "租户", dataIndex: "tenantId", width: 90 },
+    { title: "类型", dataIndex: "projectType", render: (value) => <Tag>{value || "DATA_GOVERNANCE"}</Tag> },
+    { title: "状态", dataIndex: "status", render: (value) => <Tag color={value === "ACTIVE" ? "green" : "default"}>{value || "-"}</Tag> },
+    { title: "负责人", dataIndex: "ownerActorId", render: (value) => value == null ? "-" : `Actor ${value}` },
+    { title: "更新时间", dataIndex: "updateTime", render: (value) => formatDateTime(value) },
+  ];
+
+  const joinColumns: ColumnsType<ProjectJoinRequestRecord> = [
+    { title: "申请 ID", dataIndex: "id", width: 100, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
+    { title: "项目", dataIndex: "projectId", width: 100, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
+    { title: "申请人", dataIndex: "applicantActorId", render: (value, record) => record.applicantName || `Actor ${value}` },
+    { title: "申请角色", dataIndex: "requestedProjectRole", render: (value) => <Tag color={value === "MANAGER" ? "blue" : "default"}>{value}</Tag> },
+    { title: "状态", dataIndex: "status", render: (value) => <Tag color={joinStatusColor[value] || "default"}>{value}</Tag> },
+    { title: "审批人", dataIndex: "reviewerActorId", render: (value) => value == null ? "-" : `Actor ${value}` },
+    { title: "更新时间", dataIndex: "updateTime", render: (value) => formatDateTime(value) },
+    {
+      title: "操作",
+      width: 110,
+      render: (_, record) => (
+        <Button
+          size="small"
+          danger
+          disabled={record.status !== "PENDING"}
+          loading={cancelMutation.isPending}
+          onClick={() => cancelMutation.mutate(record.id)}
+        >
+          撤销
+        </Button>
+      ),
+    },
+  ];
+
+  const approvalColumns: ColumnsType<ProjectJoinRequestRecord> = [
+    ...joinColumns.filter((column) => column.title !== "操作"),
+    {
+      title: "审批操作",
+      width: 220,
+      render: (_, record) => (
+        <Space>
+          <Button
+            size="small"
+            type="primary"
+            icon={<CheckOutlined />}
+            loading={approveMutation.isPending}
+            onClick={() => approveMutation.mutate({
+              requestId: record.id,
+              payload: { approvedProjectRole: record.requestedProjectRole, reviewComment: "同意加入项目" },
+            })}
+          >
+            通过
+          </Button>
+          <Button
+            size="small"
+            danger
+            icon={<CloseOutlined />}
+            loading={rejectMutation.isPending}
+            onClick={() => rejectMutation.mutate({
+              requestId: record.id,
+              payload: { reviewComment: "暂不满足项目加入条件" },
+            })}
+          >
+            拒绝
+          </Button>
+        </Space>
+      ),
+    },
+  ];
+
+  const creationColumns: ColumnsType<ProjectCreationRequestRecord> = [
+    { title: "申请 ID", dataIndex: "id", width: 100, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
+    {
+      title: "项目",
+      dataIndex: "projectName",
+      render: (value, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text strong>{value}</Typography.Text>
+          <Typography.Text type="secondary" className="mono">{record.projectCode || "-"}</Typography.Text>
+        </Space>
+      ),
+    },
+    { title: "申请人", dataIndex: "applicantActorId", render: (value, record) => record.applicantName || `Actor ${value}` },
+    { title: "负责人", dataIndex: "ownerActorId", render: (value) => value == null ? "-" : `Actor ${value}` },
+    { title: "状态", dataIndex: "status", render: (value) => <Tag color={joinStatusColor[value] || "default"}>{value}</Tag> },
+    { title: "创建项目", dataIndex: "createdProjectId", render: (value) => value == null ? "-" : <Typography.Text className="mono">{value}</Typography.Text> },
+    { title: "更新时间", dataIndex: "updateTime", render: (value) => formatDateTime(value) },
+    {
+      title: "操作",
+      width: 110,
+      render: (_, record) => (
+        <Button
+          size="small"
+          danger
+          disabled={record.status !== "PENDING"}
+          loading={cancelCreationMutation.isPending}
+          onClick={() => cancelCreationMutation.mutate(record.id)}
+        >
+          撤销
+        </Button>
+      ),
+    },
+  ];
+
+  const creationApprovalColumns: ColumnsType<ProjectCreationRequestRecord> = [
+    ...creationColumns.filter((column) => column.title !== "操作"),
+    {
+      title: "审批操作",
+      width: 220,
+      render: (_, record) => (
+        <Space>
+          <Button
+            size="small"
+            type="primary"
+            icon={<CheckOutlined />}
+            loading={approveCreationMutation.isPending}
+            onClick={() => approveCreationMutation.mutate({
+              requestId: record.id,
+              payload: { reviewComment: "同意创建项目" },
+            })}
+          >
+            通过并创建
+          </Button>
+          <Button
+            size="small"
+            danger
+            icon={<CloseOutlined />}
+            loading={rejectCreationMutation.isPending}
+            onClick={() => rejectCreationMutation.mutate({
+              requestId: record.id,
+              payload: { reviewComment: "暂不满足项目创建条件" },
+            })}
+          >
+            拒绝
+          </Button>
+        </Space>
+      ),
+    },
+  ];
+
   return (
     <div className="page-stack">
       <PageHeader
         title="权限"
-        subtitle="角色、菜单、路由策略、数据范围和智能体工具准入"
+        subtitle="角色、项目、项目加入审批、菜单、路由策略、数据范围和智能体工具准入"
         actions={
           <>
-            <DataSourceIndicator meta={roleQuery.data?.meta ?? routePolicyQuery.data?.meta} />
-            <Button type="primary" icon={<SafetyCertificateOutlined />}>
-              新建策略
+            <DataSourceIndicator meta={roleQuery.data?.meta ?? routePolicyQuery.data?.meta ?? projectQuery.data?.meta} />
+            <Button type="primary" icon={<SafetyCertificateOutlined />} disabled>
+              策略编辑由后端权限中心控制
             </Button>
           </>
         }
@@ -130,11 +531,177 @@ export function Permissions() {
             style={{ width: 300 }}
           />
           <Button icon={<AuditOutlined />}>审计记录</Button>
+          <Tag color="blue">当前项目：{currentProjectLabel}</Tag>
         </div>
       </Card>
 
       <Tabs
         items={[
+          {
+            key: "projects",
+            label: "项目管理",
+            children: (
+              <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+                <Card className="compact-card" title={canDirectCreateProject(actorRole) ? "创建项目" : "申请创建项目"}>
+                  {!canUseProjectCreationEntry(actorRole) ? (
+                    <Alert
+                      showIcon
+                      type="info"
+                      message="当前角色没有项目创建入口"
+                      description="项目创建由后端权限策略最终判定。普通用户可以申请创建项目或申请加入已有项目，直接调接口也会由后端再次校验。"
+                      style={{ marginBottom: 12 }}
+                    />
+                  ) : null}
+                  <Form<ProjectFormPayload> form={projectForm} layout="vertical" onFinish={submitCreateProject} disabled={!canUseProjectCreationEntry(actorRole)}>
+                    <div className="grid grid-two-form">
+                      <Form.Item name="projectName" label="项目名称" rules={[{ required: true, message: "请输入项目名称" }]}>
+                        <Input placeholder="客户同步项目 / 财务数据迁移项目" />
+                      </Form.Item>
+                      <Form.Item name="projectCode" label="项目编码">
+                        <Input placeholder="CUSTOMER_SYNC" />
+                      </Form.Item>
+                    </div>
+                    <Form.Item name="description" label="项目描述">
+                      <Input.TextArea rows={2} placeholder="说明业务域、维护人、数据同步目标，禁止填写密码、Token、连接串等敏感信息" />
+                    </Form.Item>
+                    {!canDirectCreateProject(actorRole) ? (
+                      <Form.Item name="requestReason" label="申请原因">
+                        <Input.TextArea rows={2} placeholder="说明为什么需要创建该项目，审批通过后你会成为项目 OWNER" />
+                      </Form.Item>
+                    ) : null}
+                    <Button
+                      type="primary"
+                      icon={<PlusOutlined />}
+                      htmlType="submit"
+                      loading={createProjectMutation.isPending || applyCreationMutation.isPending}
+                    >
+                      {canDirectCreateProject(actorRole) ? "创建项目" : "提交创建申请"}
+                    </Button>
+                  </Form>
+                </Card>
+                {canApplyProjectCreation(actorRole) ? (
+                  <Card className="table-card" title="我的创建申请">
+                    <Table
+                      rowKey="id"
+                      columns={creationColumns}
+                      dataSource={sortByIdDesc(myCreationRequests)}
+                      loading={myCreationQuery.isLoading}
+                      locale={{ emptyText: <RealEmpty meta={myCreationQuery.data?.meta} description="暂无项目创建申请" /> }}
+                      pagination={defaultTablePagination(10)}
+                    />
+                  </Card>
+                ) : null}
+                <Card className="table-card" title="可见项目">
+                  <Table
+                    rowKey="projectId"
+                    columns={projectColumns}
+                    dataSource={sortByIdDesc(projects)}
+                    loading={projectQuery.isLoading}
+                    locale={{ emptyText: <RealEmpty meta={projectQuery.data?.meta} description="暂无项目记录" /> }}
+                    pagination={defaultTablePagination(10)}
+                  />
+                </Card>
+              </Space>
+            ),
+          },
+          {
+            key: "join",
+            label: "加入申请",
+            children: (
+              <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+                <Card className="compact-card" title="申请加入项目">
+                  <Alert
+                    showIcon
+                    type="info"
+                    message="申请不会直接产生项目数据范围"
+                    description="只有管理员或项目 Owner 审批通过后，后端才会写入 permission_project_membership，gateway 随后才能把项目放入可信数据范围。"
+                    style={{ marginBottom: 12 }}
+                  />
+                  <Form<ProjectJoinRequestApplyPayload> form={joinForm} layout="vertical" onFinish={submitJoinRequest}>
+                    <div className="grid grid-two-form">
+                      <Form.Item name="projectId" label="目标项目 ID" rules={[{ required: true, message: "请选择或输入项目 ID" }]}>
+                        <Input placeholder="当前项目会自动填入，也可输入目标项目 ID" />
+                      </Form.Item>
+                      <Form.Item name="requestedProjectRole" label="申请角色" rules={[{ required: true, message: "请选择申请角色" }]}>
+                        <Select
+                          options={[
+                            { value: "READER", label: "READER 只读" },
+                            { value: "MANAGER", label: "MANAGER 管理" },
+                          ]}
+                        />
+                      </Form.Item>
+                    </div>
+                    <Form.Item name="requestReason" label="申请原因">
+                      <Input.TextArea rows={2} placeholder="说明为什么需要加入该项目，例如需要使用某条被授权的数据源创建同步任务" />
+                    </Form.Item>
+                    <Button type="primary" icon={<UserAddOutlined />} htmlType="submit" loading={applyJoinMutation.isPending}>
+                      提交加入申请
+                    </Button>
+                  </Form>
+                </Card>
+                <Card className="table-card" title="我的申请">
+                  <Table
+                    rowKey="id"
+                    columns={joinColumns}
+                    dataSource={sortByIdDesc(myRequests)}
+                    loading={myJoinQuery.isLoading}
+                    locale={{ emptyText: <RealEmpty meta={myJoinQuery.data?.meta} description="暂无项目加入申请" /> }}
+                    pagination={defaultTablePagination(10)}
+                  />
+                </Card>
+              </Space>
+            ),
+          },
+          {
+            key: "approvals",
+            label: "加入审批",
+            children: (
+              <Card className="table-card">
+                {!canReviewProjectJoinRequests(actorRole) ? (
+                  <Alert
+                    showIcon
+                    type="info"
+                    message="当前账号不是项目 Owner / 租户管理员 / 平台管理员"
+                    description="前端隐藏审批能力只是体验优化；直接调接口仍会由后端按租户和项目边界拒绝越权审批。"
+                    style={{ marginBottom: 12 }}
+                  />
+                ) : null}
+                <Table
+                  rowKey="id"
+                  columns={approvalColumns}
+                  dataSource={sortByIdDesc(approvalRequests)}
+                  loading={approvalQuery.isLoading}
+                  locale={{ emptyText: <RealEmpty meta={approvalQuery.data?.meta} description="暂无待审批项目加入申请" /> }}
+                  pagination={defaultTablePagination(10)}
+                />
+              </Card>
+            ),
+          },
+          {
+            key: "creation-approvals",
+            label: "创建审批",
+            children: (
+              <Card className="table-card">
+                {!canReviewProjectCreationRequests(actorRole) ? (
+                  <Alert
+                    showIcon
+                    type="info"
+                    message="当前账号不是租户管理员 / 平台管理员"
+                    description="项目创建会新开项目隔离单元并授予申请人 OWNER，因此必须由租户或平台管理员审批；后端会重复校验，前端按钮隐藏不能绕过权限。"
+                    style={{ marginBottom: 12 }}
+                  />
+                ) : null}
+                <Table
+                  rowKey="id"
+                  columns={creationApprovalColumns}
+                  dataSource={sortByIdDesc(creationApprovalRequests)}
+                  loading={creationApprovalQuery.isLoading}
+                  locale={{ emptyText: <RealEmpty meta={creationApprovalQuery.data?.meta} description="暂无待审批项目创建申请" /> }}
+                  pagination={defaultTablePagination(10)}
+                />
+              </Card>
+            ),
+          },
           {
             key: "roles",
             label: "角色",

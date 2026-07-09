@@ -77,6 +77,19 @@ function hasChangedConnectionField(changedValues: Record<string, unknown>) {
   );
 }
 
+function normalizeProjectRole(value?: string) {
+  const role = String(value || "").trim().toUpperCase();
+  if (["OWNER", "PROJECT_OWNER"].includes(role)) return "OWNER";
+  if (["MANAGER", "OPERATOR", "TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(role)) return "MANAGER";
+  if (["READER", "AUDITOR"].includes(role)) return "READER";
+  return role;
+}
+
+function hasDatasourceAction(record: DataSourceRecord, action: string) {
+  const actions = record.effectiveActions?.map((item) => item.toUpperCase()) ?? [];
+  return actions.includes(action.toUpperCase());
+}
+
 function ConnectionTestInlineResult({ result }: { result: DataSourceConnectionTestResult | null }) {
   if (!result) {
     return null;
@@ -225,6 +238,9 @@ export function DataSources() {
   const currentProjectId = selectedProjectId ?? session?.authorizedProjectIds?.[0];
   const currentProject = session?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
   const currentProjectLabel = currentProject?.projectName ?? currentProject?.name ?? session?.projectName ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
+  const actorId = Number(session?.actorId);
+  const currentProjectRole = normalizeProjectRole(currentProject?.projectRole ?? currentProject?.role ?? session?.actorRole);
+  const canManageCurrentProject = currentProjectRole === "OWNER" || currentProjectRole === "MANAGER";
   const scopedProjectId = selectedProjectScopeId == null ? undefined : String(selectedProjectScopeId);
   const authorizationQuery = useQuery({
     queryKey: ["datasource-authorizations", authorizationTarget?.id],
@@ -258,7 +274,7 @@ export function DataSources() {
     onSuccess: async () => {
       message.success("数据源授权已保存");
       authorizationForm.resetFields();
-      authorizationForm.setFieldsValue({ subjectType: authorizationSubjectType, authorizedActions: ["VIEW", "USE"] });
+      authorizationForm.setFieldsValue({ subjectType: authorizationSubjectType, authorizedActions: ["VIEW", "USE", "MANAGE"] });
       await authorizationQuery.refetch();
     },
     onError: (error) => message.error(error instanceof Error ? error.message : "数据源授权失败"),
@@ -395,6 +411,18 @@ export function DataSources() {
     });
   };
 
+  const isDatasourceOwner = (record: DataSourceRecord) => (
+    Number.isFinite(actorId) && record.ownerId != null && Number(record.ownerId) === actorId
+  );
+  const canEditDatasource = (record: DataSourceRecord) => (
+    canManageCurrentProject || isDatasourceOwner(record) || hasDatasourceAction(record, "MANAGE")
+  );
+  const canUseDatasource = (record: DataSourceRecord) => (
+    canManageCurrentProject || isDatasourceOwner(record) || hasDatasourceAction(record, "USE") || hasDatasourceAction(record, "MANAGE")
+  );
+  const canDeleteDatasource = (record: DataSourceRecord) => canManageCurrentProject || isDatasourceOwner(record);
+  const canGrantDatasource = (record: DataSourceRecord) => canManageCurrentProject || isDatasourceOwner(record);
+
   const openAuthorizationModal = (record: DataSourceRecord) => {
     setAuthorizationTarget(record);
     setAuthorizationOpen(true);
@@ -403,7 +431,7 @@ export function DataSources() {
     authorizationForm.resetFields();
     authorizationForm.setFieldsValue({
       subjectType: "USER",
-      authorizedActions: ["VIEW", "USE"],
+      authorizedActions: ["VIEW", "USE", "MANAGE"],
       grantReason: "项目内数据同步协作授权",
     });
   };
@@ -538,12 +566,19 @@ export function DataSources() {
       render: (_, record) => (
         <Space>
           <Button aria-label="查看详情" title="查看详情" icon={<EyeOutlined />} onClick={() => setSelected(record)} />
-          <Button aria-label="编辑" title="编辑" icon={<EditOutlined />} onClick={() => openEditModal(record)} />
+          <Button
+            aria-label="编辑"
+            title={canEditDatasource(record) ? "编辑" : "需要项目管理角色、数据源所有者或数据源 MANAGE 授权"}
+            icon={<EditOutlined />}
+            disabled={!canEditDatasource(record)}
+            onClick={() => openEditModal(record)}
+          />
           <Button
             aria-label="测试连接"
             title="测试连接"
             icon={<ApiOutlined />}
             loading={testMutation.isPending}
+            disabled={!canUseDatasource(record)}
             onClick={() => testMutation.mutate(record.id)}
           />
           <Button
@@ -551,6 +586,7 @@ export function DataSources() {
             title="采集元数据"
             icon={<CloudSyncOutlined />}
             loading={metadataMutation.isPending}
+            disabled={!canUseDatasource(record)}
             onClick={() => {
               const payload = buildMetadataPayload();
               if (payload) {
@@ -558,13 +594,20 @@ export function DataSources() {
               }
             }}
           />
-          <Button aria-label="授权" title="授权" icon={<TeamOutlined />} onClick={() => openAuthorizationModal(record)} />
+          <Button
+            aria-label="授权"
+            title={canGrantDatasource(record) ? "授权" : "只有项目管理者或数据源所有者可以授权"}
+            icon={<TeamOutlined />}
+            disabled={!canGrantDatasource(record)}
+            onClick={() => openAuthorizationModal(record)}
+          />
           <Button
             danger
             aria-label="删除"
-            title="删除"
+            title={canDeleteDatasource(record) ? "删除" : "只有项目管理者或数据源所有者可以删除"}
             icon={<DeleteOutlined />}
             loading={deleteMutation.isPending}
+            disabled={!canDeleteDatasource(record)}
             onClick={() => confirmDelete(record)}
           />
         </Space>
@@ -580,7 +623,13 @@ export function DataSources() {
         actions={
           <>
             <DataSourceIndicator meta={dataSourceQuery.data?.meta} />
-            <Button type="primary" icon={<DatabaseOutlined />} onClick={openCreateModal}>
+            <Button
+              type="primary"
+              icon={<DatabaseOutlined />}
+              disabled={!canManageCurrentProject}
+              title={canManageCurrentProject ? "新建数据源" : "需要当前项目 MANAGER 或 OWNER 权限"}
+              onClick={openCreateModal}
+            >
               新建数据源
             </Button>
           </>
@@ -856,7 +905,7 @@ export function DataSources() {
           showIcon
           type="info"
           message="授权只写入数据源实例 ACL，不会修改用户账号或项目成员关系"
-          description="VIEW 表示可查看低敏信息，USE 表示可在任务配置/元数据发现中使用，MANAGE 表示可继续管理授权。建议普通协作用户授予 VIEW+USE。"
+          description="被授权用户仍必须先加入该数据源所在项目。VIEW 表示可查看低敏信息，USE 表示可在任务配置/元数据发现中使用，MANAGE 表示可编辑和维护连接配置，但不能删除，也不能自动转授权给其他人。"
           style={{ marginBottom: 12 }}
         />
         <Form<DataSourceAuthorizationFormValues> form={authorizationForm} layout="vertical" onFinish={submitAuthorization}>
@@ -908,7 +957,7 @@ export function DataSources() {
               options={[
                 { value: "VIEW", label: "VIEW 查看" },
                 { value: "USE", label: "USE 使用" },
-                { value: "MANAGE", label: "MANAGE 管理授权" },
+                { value: "MANAGE", label: "MANAGE 编辑维护" },
               ]}
             />
           </Form.Item>
