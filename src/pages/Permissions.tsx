@@ -394,7 +394,7 @@ export function Permissions() {
     { title: "租户", dataIndex: "tenantId", width: 90 },
     { title: "类型", dataIndex: "projectType", render: (value) => <Tag>{value || "DATA_GOVERNANCE"}</Tag> },
     { title: "状态", dataIndex: "status", render: (value) => <Tag color={value === "ACTIVE" ? "green" : "default"}>{value || "-"}</Tag> },
-    { title: "负责人", dataIndex: "ownerActorId", render: (value) => value == null ? "-" : `Actor ${value}` },
+    { title: "负责人", dataIndex: "ownerUsername", render: (value) => value || "用户已删除或未同步" },
     { title: "更新时间", dataIndex: "updateTime", render: (value) => formatDateTime(value) },
   ];
 
@@ -412,10 +412,10 @@ export function Permissions() {
         </Space>
       ),
     },
-    { title: "申请人", dataIndex: "applicantActorId", render: (value, record) => record.applicantName || `Actor ${value}` },
+    { title: "申请人", dataIndex: "applicantUsername", render: (value, record) => value || record.applicantName || "用户已删除或未同步" },
     { title: "申请角色", dataIndex: "requestedProjectRole", render: (value) => <Tag color={value === "MANAGER" ? "blue" : "default"}>{value}</Tag> },
     { title: "状态", dataIndex: "status", render: (value) => <Tag color={joinStatusColor[value] || "default"}>{value}</Tag> },
-    { title: "审批人", dataIndex: "reviewerActorId", render: (value) => value == null ? "-" : `Actor ${value}` },
+    { title: "审批人", dataIndex: "reviewerUsername", render: (value, record) => value || (record.reviewerActorId ? "用户已删除或未同步" : "待审批") },
     { title: "更新时间", dataIndex: "updateTime", render: (value) => formatDateTime(value) },
     {
       title: "操作",
@@ -482,8 +482,8 @@ export function Permissions() {
         </Space>
       ),
     },
-    { title: "申请人", dataIndex: "applicantActorId", render: (value, record) => record.applicantName || `Actor ${value}` },
-    { title: "负责人", dataIndex: "ownerActorId", render: (value) => value == null ? "-" : `Actor ${value}` },
+    { title: "申请人", dataIndex: "applicantUsername", render: (value, record) => value || record.applicantName || "用户已删除或未同步" },
+    { title: "负责人", dataIndex: "ownerUsername", render: (value) => value || "用户已删除或未同步" },
     { title: "状态", dataIndex: "status", render: (value) => <Tag color={joinStatusColor[value] || "default"}>{value}</Tag> },
     { title: "创建项目", dataIndex: "createdProjectId", render: (value) => value == null ? "-" : <Typography.Text className="mono">{value}</Typography.Text> },
     { title: "更新时间", dataIndex: "updateTime", render: (value) => formatDateTime(value) },

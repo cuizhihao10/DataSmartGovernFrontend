@@ -228,8 +228,8 @@ export function ApprovalCenter() {
     },
     {
       title: "申请人",
-      dataIndex: "applicantActorId",
-      render: (value, record) => record.applicantName || `Actor ${value}`,
+      dataIndex: "applicantUsername",
+      render: (value, record) => value || record.applicantName || "用户已删除或未同步",
     },
     {
       title: "申请角色",
@@ -471,11 +471,14 @@ export function ApprovalCenter() {
             <Descriptions.Item label="租户 ID">{selected.tenantId ?? "-"}</Descriptions.Item>
             <Descriptions.Item label="项目">{selected.projectName || (selected.projectId ? "未找到项目名称" : "待创建")}</Descriptions.Item>
             <Descriptions.Item label="项目编码">{selected.projectCode || "-"}</Descriptions.Item>
-            <Descriptions.Item label="申请人">{selected.applicantName || `Actor ${selected.applicantActorId}`}</Descriptions.Item>
+            <Descriptions.Item label="申请人">{selected.applicantUsername || selected.applicantName || "用户已删除或未同步"}</Descriptions.Item>
+            {selected.requestType === "PROJECT_CREATION" ? (
+              <Descriptions.Item label="负责人">{selected.ownerUsername || "用户已删除或未同步"}</Descriptions.Item>
+            ) : null}
             <Descriptions.Item label="申请角色">{selected.requestedProjectRole || "-"}</Descriptions.Item>
             <Descriptions.Item label="申请原因">{selected.requestReason || "未填写"}</Descriptions.Item>
             <Descriptions.Item label="状态"><Tag color={statusColors[selected.status]}>{selected.status}</Tag></Descriptions.Item>
-            <Descriptions.Item label="审批人">{selected.reviewerActorId ? `Actor ${selected.reviewerActorId}` : "待审批"}</Descriptions.Item>
+            <Descriptions.Item label="审批人">{selected.reviewerUsername || (selected.reviewerActorId ? "用户已删除或未同步" : "待审批")}</Descriptions.Item>
             <Descriptions.Item label="审批意见">{selected.reviewComment || "-"}</Descriptions.Item>
             <Descriptions.Item label="申请时间">{formatDateTime(selected.createTime)}</Descriptions.Item>
             <Descriptions.Item label="审批时间">{formatDateTime(selected.reviewTime)}</Descriptions.Item>

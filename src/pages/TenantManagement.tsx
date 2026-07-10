@@ -196,14 +196,7 @@ export function TenantManagement() {
     {
       title: "管理账号",
       width: 190,
-      render: (_, record) => (
-        <Space direction="vertical" size={0}>
-          <Typography.Text>{record.administratorUsername || "尚未绑定管理账号"}</Typography.Text>
-          <Typography.Text type="secondary" className="mono">
-            {record.administratorActorId ? `Actor ${record.administratorActorId}` : "-"}
-          </Typography.Text>
-        </Space>
-      ),
+      render: (_, record) => record.administratorUsername || "尚未绑定管理账号",
     },
     { title: "开租时间", dataIndex: "openedAt", width: 170, render: formatDateTime },
     {
