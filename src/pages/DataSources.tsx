@@ -233,7 +233,13 @@ export function DataSources() {
     onError: (error) => message.error(error instanceof Error ? error.message : "元数据采集失败"),
   });
 
-  const records = useMemo(() => dataSourceQuery.data?.data.records ?? [], [dataSourceQuery.data?.data.records]);
+  const records = useMemo(() => (dataSourceQuery.data?.data.records ?? []).map((record) => ({
+    ...record,
+    projectName: projectOptions.find((project) => project.value === String(record.projectId))?.label
+      ?? record.projectName
+      ?? (record.projectId == null ? "未归属项目" : `未找到项目名称（ID ${record.projectId}）`),
+    ownerName: record.ownerName ?? (record.ownerId == null ? "未标注所有者" : `Actor ${record.ownerId}`),
+  })), [dataSourceQuery.data?.data.records, projectOptions]);
   const session = sessionQuery.data?.data;
   const currentProjectId = selectedProjectId ?? session?.authorizedProjectIds?.[0];
   const currentProject = session?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
@@ -541,7 +547,7 @@ export function DataSources() {
         <Space direction="vertical" size={0}>
           <Typography.Text strong>{value}</Typography.Text>
           <Typography.Text type="secondary">
-            {labelOf(record.environment, environmentLabels)}环境 / {record.owner}
+            {labelOf(record.environment, environmentLabels)}环境 / {record.projectName}
           </Typography.Text>
         </Space>
       ),
@@ -705,7 +711,8 @@ export function DataSources() {
             <Descriptions.Item label="数据源 ID">{selected.id}</Descriptions.Item>
             <Descriptions.Item label="类型">{labelOf(selected.type, connectorLabels)}</Descriptions.Item>
             <Descriptions.Item label="环境">{labelOf(selected.environment, environmentLabels)}</Descriptions.Item>
-            <Descriptions.Item label="负责人">{selected.owner}</Descriptions.Item>
+            <Descriptions.Item label="所属项目">{selected.projectName || "-"}</Descriptions.Item>
+            <Descriptions.Item label="所有者">{selected.ownerName || selected.owner}</Descriptions.Item>
             <Descriptions.Item label="用途">{labelOf(selected.usageRole || "SOURCE", usageRoleLabels)}</Descriptions.Item>
             <Descriptions.Item label="JDBC URL">{selected.jdbcUrl || "-"}</Descriptions.Item>
             <Descriptions.Item label="用户名">{selected.username || "-"}</Descriptions.Item>

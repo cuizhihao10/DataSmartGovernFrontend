@@ -11,6 +11,7 @@ import { DataSync } from "@/pages/DataSync";
 import { Login } from "@/pages/Login";
 import { Observability } from "@/pages/Observability";
 import { Permissions } from "@/pages/Permissions";
+import { ProjectMembers } from "@/pages/ProjectMembers";
 import { Quality } from "@/pages/Quality";
 import { Tasks } from "@/pages/Tasks";
 import { TenantManagement } from "@/pages/TenantManagement";
@@ -34,6 +35,7 @@ export const router = createBrowserRouter([
       { path: "quality", element: <Quality /> },
       { path: "agent", element: <AgentConsole /> },
       { path: "approvals", element: <ApprovalCenter /> },
+      { path: "project-members", element: <ProjectMembers /> },
       { path: "observability", element: <Observability /> },
       { path: "permissions", element: <Permissions /> },
       { path: "tenants", element: <TenantManagement /> },

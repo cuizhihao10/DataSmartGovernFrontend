@@ -127,6 +127,8 @@ export interface DataSourceRecord {
   workspaceId?: number;
   ownerId?: number;
   createdBy?: number;
+  projectName?: string;
+  ownerName?: string;
   effectiveActions?: string[];
   name: string;
   type: string;
@@ -844,6 +846,27 @@ export interface ProjectRecord {
   status?: string;
   ownerActorId?: number;
   description?: string;
+  createTime?: string;
+  updateTime?: string;
+}
+
+export interface ProjectMembershipRecord {
+  membershipId: number;
+  tenantId?: number;
+  actorId: number;
+  identityUserId?: number;
+  username?: string;
+  email?: string;
+  actorRole?: string;
+  actorType?: string;
+  userStatus?: string;
+  projectId: number;
+  projectCode?: string;
+  projectName?: string;
+  projectStatus?: string;
+  projectRole: "OWNER" | "MANAGER" | "READER" | "SERVICE" | string;
+  grantSource?: string;
+  enabled: boolean;
   createTime?: string;
   updateTime?: string;
 }

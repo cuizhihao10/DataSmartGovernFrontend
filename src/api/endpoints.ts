@@ -38,6 +38,7 @@ import type {
   PlatformPageResponse,
   ProjectCreationRequestRecord,
   ProjectJoinCandidateRecord,
+  ProjectMembershipRecord,
   ProjectRecord,
   ProjectJoinRequestRecord,
   QualityReport,
@@ -191,6 +192,24 @@ export interface ProjectListParams {
   onlyMine?: boolean;
   current?: number;
   size?: number;
+}
+
+export interface ProjectMembershipQueryParams {
+  tenantId?: number;
+  actorId?: number;
+  projectId?: number;
+  projectRole?: string;
+  grantSource?: string;
+  enabled?: boolean;
+  current?: number;
+  size?: number;
+}
+
+export interface ProjectMembershipUpdatePayload {
+  projectRole?: "MANAGER" | "READER" | string;
+  grantSource?: string;
+  enabled?: boolean;
+  reason?: string;
 }
 
 export interface ProjectJoinRequestQueryParams {
@@ -834,7 +853,6 @@ function normalizeDataSource(value: unknown, index: number): DataSourceRecord {
   const record = isRecord(value) ? value : {};
   const id = readNumber(record.id, index + 1);
   const status = normalizeDatasourceStatus(record.status);
-  const projectId = record.projectId == null ? "-" : readString(record.projectId);
   return {
     id,
     tenantId: readOptionalNumber(record.tenantId),
@@ -842,6 +860,8 @@ function normalizeDataSource(value: unknown, index: number): DataSourceRecord {
     workspaceId: readOptionalNumber(record.workspaceId),
     ownerId: readOptionalNumber(record.ownerId),
     createdBy: readOptionalNumber(record.createdBy),
+    projectName: readOptionalString(record.projectName),
+    ownerName: readOptionalString(record.ownerName),
     effectiveActions: readActionArray(record.effectiveActions ?? record.authorizedActions ?? record.allowedActions),
     name: readString(record.name, `datasource-${id}`),
     type: normalizeDatasourceType(record.type),
@@ -849,7 +869,7 @@ function normalizeDataSource(value: unknown, index: number): DataSourceRecord {
     username: readString(record.username),
     description: readString(record.description),
     environment: "DEV",
-    owner: readString(record.projectName ?? record.owner, projectId === "-" ? "未标注租户名称" : "未标注项目名称"),
+    owner: readString(record.ownerName ?? record.owner, readOptionalNumber(record.ownerId) == null ? "未标注所有者" : `Actor ${readNumber(record.ownerId)}`),
     usageRole: inferDataSourceUsageRole(record),
     status,
     sensitivity: "LOW",
@@ -1614,6 +1634,30 @@ function normalizeProject(value: unknown, index: number): ProjectRecord {
     status: readOptionalString(record.status),
     ownerActorId: readOptionalNumber(record.ownerActorId),
     description: readOptionalString(record.description),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
+  };
+}
+
+function normalizeProjectMembership(value: unknown, index: number): ProjectMembershipRecord {
+  const record = readRecord(value);
+  return {
+    membershipId: readNumber(record.membershipId ?? record.id, index + 1),
+    tenantId: readOptionalNumber(record.tenantId),
+    actorId: readNumber(record.actorId),
+    identityUserId: readOptionalNumber(record.identityUserId),
+    username: readOptionalString(record.username),
+    email: readOptionalString(record.email),
+    actorRole: readOptionalString(record.actorRole),
+    actorType: readOptionalString(record.actorType),
+    userStatus: readOptionalString(record.userStatus),
+    projectId: readNumber(record.projectId),
+    projectCode: readOptionalString(record.projectCode),
+    projectName: readOptionalString(record.projectName),
+    projectStatus: readOptionalString(record.projectStatus),
+    projectRole: readString(record.projectRole, "READER"),
+    grantSource: readOptionalString(record.grantSource),
+    enabled: readBoolean(record.enabled, true),
     createTime: readOptionalString(record.createTime),
     updateTime: readOptionalString(record.updateTime),
   };
@@ -2606,6 +2650,20 @@ export const api = {
   },
   createProject: (payload: ProjectCreatePayload) =>
     postJson<ProjectRecord>("/permission/projects", payload),
+  listProjectMemberships: (params?: ProjectMembershipQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, ...params });
+    return pageEndpoint<ProjectMembershipRecord>(
+      `/permission/project-memberships?${query}`,
+      [],
+      normalizeProjectMembership,
+    );
+  },
+  updateProjectMembership: (membershipId: number, payload: ProjectMembershipUpdatePayload) =>
+    putJson<unknown>(`/permission/project-memberships/${membershipId}`, payload),
+  enableProjectMembership: (membershipId: number, reason?: string) =>
+    postJson<unknown>(`/permission/project-memberships/${membershipId}/enable`, { reason }),
+  disableProjectMembership: (membershipId: number, reason?: string) =>
+    postJson<unknown>(`/permission/project-memberships/${membershipId}/disable`, { reason }),
   applyProjectCreationRequest: (payload: ProjectCreationRequestApplyPayload) =>
     postJson<ProjectCreationRequestRecord>("/permission/project-creation-requests", payload),
   listMyProjectCreationRequests: (params?: ProjectCreationRequestQueryParams) => {
