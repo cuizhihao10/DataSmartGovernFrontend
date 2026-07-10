@@ -10,7 +10,7 @@ import {
 import { Alert, App, Button, Card, Form, Input, Select, Space, Table, Tabs, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
   api,
   type ProjectCreationRequestApplyPayload,
@@ -107,7 +107,10 @@ export function Permissions() {
   const [reviewForm] = Form.useForm<ProjectJoinRequestReviewPayload>();
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const setSelectedProjectId = useUiStore((state) => state.setSelectedProjectId);
+  const projectOptions = useUiStore((state) => state.projectOptions);
   const setProjectOptions = useUiStore((state) => state.setProjectOptions);
+  const [joinProjectKeyword, setJoinProjectKeyword] = useState("");
+  const deferredJoinProjectKeyword = useDeferredValue(joinProjectKeyword);
 
   const sessionQuery = useQuery({
     queryKey: ["permission-gateway-session"],
@@ -118,9 +121,9 @@ export function Permissions() {
   const selectedProjectNumber = Number(selectedProjectId ?? session?.authorizedProjectIds?.[0]);
   const currentProjectId = Number.isFinite(selectedProjectNumber) ? selectedProjectNumber : undefined;
   const currentProjectLabel = useMemo(() => {
-    const project = session?.authorizedProjects?.find((item) => String(item.projectId ?? item.id) === String(currentProjectId));
-    return project?.projectName ?? project?.name ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
-  }, [currentProjectId, session?.authorizedProjects]);
+    const project = projectOptions.find((item) => item.value === String(currentProjectId));
+    return project?.label ?? (currentProjectId == null ? "未选择项目" : "未找到项目名称");
+  }, [currentProjectId, projectOptions]);
 
   const roleQuery = useQuery({
     queryKey: ["permission-roles"],
@@ -134,6 +137,23 @@ export function Permissions() {
     queryKey: ["permission-projects"],
     queryFn: () => api.listProjects({ current: 1, size: 100 }),
   });
+  const joinCandidateQuery = useQuery({
+    queryKey: ["permission-project-join-candidates", session?.tenantId, deferredJoinProjectKeyword],
+    queryFn: () => api.listProjectJoinCandidates({
+      keyword: deferredJoinProjectKeyword || undefined,
+      current: 1,
+      size: 100,
+    }),
+    enabled: Boolean(session?.authenticated),
+  });
+  const joinProjectOptions = useMemo(() => (
+    joinCandidateQuery.data?.data.records ?? []
+  ).map((project) => ({
+    value: project.projectId,
+    label: project.projectCode
+      ? `${project.projectName}（${project.projectCode}）`
+      : project.projectName,
+  })), [joinCandidateQuery.data?.data.records]);
   const myJoinQuery = useQuery({
     queryKey: ["permission-project-join-my", currentProjectId],
     queryFn: () => api.listMyProjectJoinRequests({ projectId: currentProjectId, size: 100 }),
@@ -161,15 +181,13 @@ export function Permissions() {
     }
     setProjectOptions(projects.map((project) => ({
       value: String(project.projectId),
-      label: project.projectName || `项目 ${project.projectId}`,
+      label: project.projectName,
     })));
   }, [projectQuery.data?.data.records, setProjectOptions]);
 
   useEffect(() => {
-    if (currentProjectId != null) {
-      joinForm.setFieldsValue({ projectId: currentProjectId, requestedProjectRole: "READER" });
-    }
-  }, [currentProjectId, joinForm]);
+    joinForm.setFieldsValue({ requestedProjectRole: "READER" });
+  }, [joinForm]);
 
   const createProjectMutation = useMutation({
     mutationFn: api.createProject,
@@ -376,7 +394,18 @@ export function Permissions() {
 
   const joinColumns: ColumnsType<ProjectJoinRequestRecord> = [
     { title: "申请 ID", dataIndex: "id", width: 100, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
-    { title: "项目", dataIndex: "projectId", width: 100, render: (value) => <Typography.Text className="mono">{value}</Typography.Text> },
+    {
+      title: "项目",
+      dataIndex: "projectName",
+      render: (value, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text strong>{value || "未找到项目名称"}</Typography.Text>
+          <Typography.Text type="secondary" className="mono">
+            {record.projectCode || `ID ${record.projectId}`}
+          </Typography.Text>
+        </Space>
+      ),
+    },
     { title: "申请人", dataIndex: "applicantActorId", render: (value, record) => record.applicantName || `Actor ${value}` },
     { title: "申请角色", dataIndex: "requestedProjectRole", render: (value) => <Tag color={value === "MANAGER" ? "blue" : "default"}>{value}</Tag> },
     { title: "状态", dataIndex: "status", render: (value) => <Tag color={joinStatusColor[value] || "default"}>{value}</Tag> },
@@ -619,8 +648,16 @@ export function Permissions() {
                   />
                   <Form<ProjectJoinRequestApplyPayload> form={joinForm} layout="vertical" onFinish={submitJoinRequest}>
                     <div className="grid grid-two-form">
-                      <Form.Item name="projectId" label="目标项目 ID" rules={[{ required: true, message: "请选择或输入项目 ID" }]}>
-                        <Input placeholder="当前项目会自动填入，也可输入目标项目 ID" />
+                      <Form.Item name="projectId" label="目标项目" rules={[{ required: true, message: "请选择目标项目" }]}>
+                        <Select
+                          showSearch
+                          filterOption={false}
+                          options={joinProjectOptions}
+                          loading={joinCandidateQuery.isLoading || joinCandidateQuery.isFetching}
+                          onSearch={setJoinProjectKeyword}
+                          placeholder="按项目名称或编码搜索"
+                          notFoundContent="本租户暂无可申请加入的启用项目"
+                        />
                       </Form.Item>
                       <Form.Item name="requestedProjectRole" label="申请角色" rules={[{ required: true, message: "请选择申请角色" }]}>
                         <Select

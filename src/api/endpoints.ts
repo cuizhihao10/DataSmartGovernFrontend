@@ -37,6 +37,7 @@ import type {
   PlatformHealth,
   PlatformPageResponse,
   ProjectCreationRequestRecord,
+  ProjectJoinCandidateRecord,
   ProjectRecord,
   ProjectJoinRequestRecord,
   QualityReport,
@@ -197,6 +198,13 @@ export interface ProjectJoinRequestQueryParams {
   projectId?: number;
   applicantActorId?: number;
   status?: string;
+  current?: number;
+  size?: number;
+}
+
+export interface ProjectJoinCandidateParams {
+  tenantId?: number;
+  keyword?: string;
   current?: number;
   size?: number;
 }
@@ -841,7 +849,7 @@ function normalizeDataSource(value: unknown, index: number): DataSourceRecord {
     username: readString(record.username),
     description: readString(record.description),
     environment: "DEV",
-    owner: readString(record.projectName ?? record.owner, projectId === "-" ? `租户 ${readString(record.tenantId, "-")}` : `项目 ${projectId}`),
+    owner: readString(record.projectName ?? record.owner, projectId === "-" ? "未标注租户名称" : "未标注项目名称"),
     usageRole: inferDataSourceUsageRole(record),
     status,
     sensitivity: "LOW",
@@ -1601,7 +1609,7 @@ function normalizeProject(value: unknown, index: number): ProjectRecord {
     projectId,
     tenantId: readOptionalNumber(record.tenantId),
     projectCode: readOptionalString(record.projectCode),
-    projectName: readString(record.projectName ?? record.name, `项目 ${projectId}`),
+    projectName: readString(record.projectName ?? record.name, `未命名项目（ID ${projectId}）`),
     projectType: readOptionalString(record.projectType),
     status: readOptionalString(record.status),
     ownerActorId: readOptionalNumber(record.ownerActorId),
@@ -1611,12 +1619,25 @@ function normalizeProject(value: unknown, index: number): ProjectRecord {
   };
 }
 
+function normalizeProjectJoinCandidate(value: unknown, index: number): ProjectJoinCandidateRecord {
+  const record = readRecord(value);
+  const projectId = readNumber(record.projectId ?? record.id, index + 1);
+  return {
+    projectId,
+    projectCode: readOptionalString(record.projectCode),
+    projectName: readString(record.projectName ?? record.name, `未命名项目（ID ${projectId}）`),
+    projectType: readOptionalString(record.projectType),
+  };
+}
+
 function normalizeProjectJoinRequest(value: unknown, index: number): ProjectJoinRequestRecord {
   const record = readRecord(value);
   return {
     id: readNumber(record.id, index + 1),
     tenantId: readOptionalNumber(record.tenantId),
     projectId: readNumber(record.projectId),
+    projectCode: readOptionalString(record.projectCode),
+    projectName: readOptionalString(record.projectName),
     applicantActorId: readNumber(record.applicantActorId),
     applicantName: readOptionalString(record.applicantName),
     requestedProjectRole: readString(record.requestedProjectRole, "READER"),
@@ -2641,6 +2662,14 @@ export const api = {
     ),
   applyProjectJoinRequest: (payload: ProjectJoinRequestApplyPayload) =>
     postJson<ProjectJoinRequestRecord>("/permission/project-join-requests", payload),
+  listProjectJoinCandidates: (params?: ProjectJoinCandidateParams) => {
+    const query = compactQueryString({ current: 1, size: 100, ...params });
+    return pageEndpoint<ProjectJoinCandidateRecord>(
+      `/permission/project-join-requests/candidates?${query}`,
+      [],
+      normalizeProjectJoinCandidate,
+    );
+  },
   listMyProjectJoinRequests: (params?: ProjectJoinRequestQueryParams) => {
     const query = compactQueryString({ current: 1, size: 20, ...params });
     return pageEndpoint<ProjectJoinRequestRecord>(

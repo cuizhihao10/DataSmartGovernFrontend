@@ -58,7 +58,6 @@ export function ConsoleLayout() {
   const setCollapsed = useUiStore((state) => state.setCollapsed);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const setSelectedProjectId = useUiStore((state) => state.setSelectedProjectId);
-  const discoveredProjectOptions = useUiStore((state) => state.projectOptions);
   const setDiscoveredProjectOptions = useUiStore((state) => state.setProjectOptions);
   const authUser = useAuthStore((state) => state.user);
   const logout = useAuthStore((state) => state.logout);
@@ -69,6 +68,12 @@ export function ConsoleLayout() {
   });
   const session = sessionQuery.data?.data;
   const actorRole = String(session?.actorRole ?? authUser?.actorRole ?? "").trim().toUpperCase();
+  const projectQuery = useQuery({
+    queryKey: ["layout-permission-projects", session?.tenantId, session?.actorId],
+    queryFn: () => api.listProjects({ current: 1, size: 100, onlyMine: true }),
+    enabled: Boolean(session?.authenticated),
+    retry: false,
+  });
   const menuQuery = useQuery({
     queryKey: ["layout-permission-menus", session?.tenantId ?? authUser?.tenantId, actorRole],
     queryFn: () => api.listPermissionMenus(session?.tenantId ?? authUser?.tenantId, actorRole),
@@ -84,34 +89,33 @@ export function ConsoleLayout() {
       : new Set(fallbackMenuCodesByRole[actorRole] ?? ["dashboard"]);
     return navItems.filter((item) => menuCodes.has(item.menuCode));
   }, [actorRole, menuQuery.data?.data, menuQuery.data?.meta.source]);
-  const sessionProjectOptions = useMemo(() => {
-    if (session?.authorizedProjects?.length) {
-      return session.authorizedProjects
-        .map((project) => {
-          const id = project.projectId ?? project.id;
-          if (id == null) return null;
-          return {
-            value: String(id),
-            label: project.projectName ?? project.name ?? `项目 ${id}`,
-          };
-        })
-        .filter((option): option is { value: string; label: string } => Boolean(option));
-    }
-    const ids = session?.authorizedProjectIds?.length ? session.authorizedProjectIds : [];
-    return Array.from(new Set(ids.map((id) => String(id)))).map((id) => ({ value: id, label: session?.projectName ?? `项目 ${id}` }));
-  }, [session?.authorizedProjectIds, session?.authorizedProjects, session?.projectName]);
   const projectOptions = useMemo(() => {
-    if (sessionProjectOptions.length) {
-      return sessionProjectOptions;
-    }
     const optionMap = new Map<string, { value: string; label: string }>();
-    discoveredProjectOptions.forEach((option) => {
-      if (option.value && !optionMap.has(option.value)) {
-        optionMap.set(option.value, option);
+    (projectQuery.data?.data.records ?? []).forEach((project) => {
+      optionMap.set(String(project.projectId), {
+        value: String(project.projectId),
+        label: project.projectName,
+      });
+    });
+    session?.authorizedProjects?.forEach((project) => {
+      const id = project.projectId ?? project.id;
+      if (id != null && !optionMap.has(String(id))) {
+        optionMap.set(String(id), {
+          value: String(id),
+          label: project.projectName ?? project.name ?? `未找到项目名称（ID ${id}）`,
+        });
+      }
+    });
+    session?.authorizedProjectIds?.forEach((id) => {
+      if (!optionMap.has(String(id))) {
+        optionMap.set(String(id), {
+          value: String(id),
+          label: `未找到项目名称（ID ${id}）`,
+        });
       }
     });
     return Array.from(optionMap.values());
-  }, [discoveredProjectOptions, sessionProjectOptions]);
+  }, [projectQuery.data?.data.records, session?.authorizedProjectIds, session?.authorizedProjects]);
   const activeKey = visibleNavItems.find((item) => location.pathname.startsWith(item.path))?.key
     ?? visibleNavItems[0]?.key
     ?? "dashboard";
@@ -124,6 +128,10 @@ export function ConsoleLayout() {
     setSelectedProjectId(undefined);
     setDiscoveredProjectOptions([]);
   }, [authUser?.id, session?.actorId, setDiscoveredProjectOptions, setSelectedProjectId]);
+
+  useEffect(() => {
+    setDiscoveredProjectOptions(projectOptions);
+  }, [projectOptions, setDiscoveredProjectOptions]);
 
   useEffect(() => {
     if (!projectOptions.length) {
@@ -200,7 +208,9 @@ export function ConsoleLayout() {
                 value={selectedProjectId ?? projectOptions[0]?.value}
                 options={projectOptions}
                 onChange={setSelectedProjectId}
-                style={{ width: 132 }}
+                showSearch
+                optionFilterProp="label"
+                style={{ width: 240 }}
                 aria-label="切换项目"
               />
             ) : null}

@@ -141,7 +141,7 @@ export function DataSources() {
   const [createConnectionTestResult, setCreateConnectionTestResult] = useState<DataSourceConnectionTestResult | null>(null);
   const [editConnectionTestResult, setEditConnectionTestResult] = useState<DataSourceConnectionTestResult | null>(null);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
-  const setProjectOptions = useUiStore((state) => state.setProjectOptions);
+  const projectOptions = useUiStore((state) => state.projectOptions);
   const selectedProjectScopeId = isNumericScopeValue(selectedProjectId) ? Number(selectedProjectId) : undefined;
   const sessionQuery = useQuery({
     queryKey: ["datasource-gateway-session"],
@@ -237,7 +237,11 @@ export function DataSources() {
   const session = sessionQuery.data?.data;
   const currentProjectId = selectedProjectId ?? session?.authorizedProjectIds?.[0];
   const currentProject = session?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
-  const currentProjectLabel = currentProject?.projectName ?? currentProject?.name ?? session?.projectName ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
+  const currentProjectLabel = projectOptions.find((project) => project.value === String(currentProjectId))?.label
+    ?? currentProject?.projectName
+    ?? currentProject?.name
+    ?? session?.projectName
+    ?? (currentProjectId == null ? "未选择项目" : "未找到项目名称");
   const actorId = Number(session?.actorId);
   const currentProjectRole = normalizeProjectRole(currentProject?.projectRole ?? currentProject?.role ?? session?.actorRole);
   const canManageCurrentProject = currentProjectRole === "OWNER" || currentProjectRole === "MANAGER";
@@ -296,13 +300,6 @@ export function DataSources() {
   useEffect(() => {
     setDataSourcePage(1);
   }, [selectedProjectScopeId, keyword, type]);
-
-  useEffect(() => {
-    const projectIds = Array.from(new Set(records.map((record) => record.projectId).filter((id): id is number => id != null)));
-    if (projectIds.length) {
-      setProjectOptions(projectIds.map((id) => ({ value: String(id), label: `项目 ${id}` })));
-    }
-  }, [records, setProjectOptions]);
 
   const openCreateModal = () => {
     form.resetFields();

@@ -42,6 +42,7 @@ import { DataSourceIndicator } from "@/components/DataSourceIndicator";
 import { PageHeader } from "@/components/PageHeader";
 import { RealEmpty } from "@/components/RealEmpty";
 import { BooleanTag, RiskTag } from "@/components/StatusTag";
+import { useUiStore } from "@/store/uiStore";
 import type {
   AgentModelRoute,
   AgentPlanResponse,
@@ -239,6 +240,8 @@ function DiagnosticsBlock({
 
 export function AgentConsole() {
   const { message } = App.useApp();
+  const selectedProjectId = useUiStore((state) => state.selectedProjectId);
+  const projectOptions = useUiStore((state) => state.projectOptions);
   const [agentForm] = Form.useForm<AgentConsoleFormValues>();
   const [ragForm] = Form.useForm<RagFormValues>();
   const [activeSessionId, setActiveSessionId] = useState<string>();
@@ -301,12 +304,19 @@ export function AgentConsole() {
   const events = eventsQuery.data?.data.records ?? [];
   const activeSession = sessions.find((session) => session.sessionId === activeSessionId) ?? sessions[0];
   const activeRun = selectedRunFromSession(activeSession, activeRunId);
+  const projectSelectOptions = useMemo(() => projectOptions.map((project) => ({
+    value: Number(project.value),
+    label: project.label,
+  })).filter((project) => Number.isFinite(project.value)), [projectOptions]);
+  const projectNameOf = (projectId?: number) => projectOptions.find(
+    (project) => project.value === String(projectId),
+  )?.label ?? (projectId == null ? "未选择项目" : "未找到项目名称");
   const ragDefaults = useMemo<RagFormValues>(() => {
     const gatewaySession = gatewaySessionQuery.data?.data;
     const tenantId = numeric(gatewaySession?.tenantId);
     return {
       tenantId,
-      projectId: numeric(gatewaySession?.authorizedProjectIds?.[0]) ?? 1,
+      projectId: numeric(selectedProjectId) ?? numeric(gatewaySession?.authorizedProjectIds?.[0]),
       actorId: String(gatewaySession?.actorId ?? ""),
       question: "数据质量规则建议为什么需要人工确认？",
       topK: 5,
@@ -314,7 +324,7 @@ export function AgentConsole() {
       maxContextChars: 4000,
       generateAnswer: true,
     };
-  }, [gatewaySessionQuery.data?.data]);
+  }, [gatewaySessionQuery.data?.data, selectedProjectId]);
 
   const toolExecutionsQuery = useQuery({
     queryKey: ["agent-tool-executions", activeSession?.sessionId, activeRun?.runId],
@@ -342,7 +352,7 @@ export function AgentConsole() {
     if (!gatewaySession) return;
     const defaults = {
       tenantId: numeric(gatewaySession.tenantId),
-      projectId: numeric(gatewaySession.authorizedProjectIds?.[0]) ?? 1,
+      projectId: numeric(selectedProjectId) ?? numeric(gatewaySession.authorizedProjectIds?.[0]),
       actorId: String(gatewaySession.actorId ?? ""),
       channel: "WEB",
       objective: defaultObjective,
@@ -351,7 +361,7 @@ export function AgentConsole() {
       requireHumanApproval: true,
     };
     agentForm.setFieldsValue(defaults);
-  }, [agentForm, gatewaySessionQuery.data?.data]);
+  }, [agentForm, gatewaySessionQuery.data?.data, selectedProjectId]);
 
   useEffect(() => {
     if (activeTab === "rag") {
@@ -502,7 +512,7 @@ export function AgentConsole() {
       ),
     },
     { title: "状态", dataIndex: "state", render: statusTag },
-    { title: "租户/项目", render: (_, record) => `${record.tenantId ?? "-"} / ${record.projectId ?? "-"}` },
+    { title: "所属项目", render: (_, record) => projectNameOf(record.projectId) },
     { title: "操作者", dataIndex: "actorId" },
     { title: "工具", render: (_, record) => record.toolBindings.length },
     {
@@ -676,11 +686,11 @@ export function AgentConsole() {
                   <Card className="compact-card" title="会话输入">
                     <Form<AgentConsoleFormValues> form={agentForm} layout="vertical">
                       <div className="grid grid-two-form">
-                        <Form.Item name="tenantId" label="租户 ID" rules={[{ required: true, message: "请输入租户 ID" }]}>
-                          <InputNumber min={1} style={{ width: "100%" }} />
+                        <Form.Item name="tenantId" label="当前租户" rules={[{ required: true, message: "缺少登录租户上下文" }]}>
+                          <InputNumber min={1} disabled style={{ width: "100%" }} />
                         </Form.Item>
-                        <Form.Item name="projectId" label="项目 ID" rules={[{ required: true, message: "请输入项目 ID" }]}>
-                          <InputNumber min={1} style={{ width: "100%" }} />
+                        <Form.Item name="projectId" label="所属项目" rules={[{ required: true, message: "请选择项目" }]}>
+                          <Select showSearch optionFilterProp="label" options={projectSelectOptions} placeholder="选择项目" />
                         </Form.Item>
                       </div>
                       <div className="grid grid-two-form">
@@ -871,11 +881,11 @@ export function AgentConsole() {
                   <Card className="compact-card" title="治理知识查询">
                     <Form<RagFormValues> form={ragForm} layout="vertical" initialValues={ragDefaults}>
                       <div className="grid grid-three">
-                        <Form.Item name="tenantId" label="租户 ID">
-                          <InputNumber min={1} style={{ width: "100%" }} />
+                        <Form.Item name="tenantId" label="当前租户">
+                          <InputNumber min={1} disabled style={{ width: "100%" }} />
                         </Form.Item>
-                        <Form.Item name="projectId" label="项目 ID">
-                          <InputNumber min={1} style={{ width: "100%" }} />
+                        <Form.Item name="projectId" label="所属项目">
+                          <Select showSearch optionFilterProp="label" options={projectSelectOptions} placeholder="选择项目" />
                         </Form.Item>
                         <Form.Item name="actorId" label="操作者">
                           <Input />

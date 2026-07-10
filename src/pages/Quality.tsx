@@ -43,6 +43,7 @@ export function Quality() {
   const [createOpen, setCreateOpen] = useState(false);
   const [runningRule, setRunningRule] = useState<QualityRule | null>(null);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
+  const projectOptions = useUiStore((state) => state.projectOptions);
   const sessionQuery = useQuery({
     queryKey: ["quality-gateway-session"],
     queryFn: api.getSession,
@@ -281,7 +282,9 @@ export function Quality() {
           <div className="scope-summary">
             <Typography.Text strong>创建到当前项目</Typography.Text>
             <Typography.Text type="secondary">
-              {selectedProjectId ? `项目 ${selectedProjectId}` : "未选择项目"}
+              {selectedProjectId
+                ? projectOptions.find((project) => project.value === selectedProjectId)?.label ?? "未找到项目名称"
+                : "未选择项目"}
             </Typography.Text>
           </div>
           <Form.Item name="name" label="规则名称" rules={[{ required: true, message: "请输入规则名称" }]}>

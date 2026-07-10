@@ -848,10 +848,19 @@ export interface ProjectRecord {
   updateTime?: string;
 }
 
+export interface ProjectJoinCandidateRecord {
+  projectId: number;
+  projectCode?: string;
+  projectName: string;
+  projectType?: string;
+}
+
 export interface ProjectJoinRequestRecord {
   id: number;
   tenantId?: number;
   projectId: number;
+  projectCode?: string;
+  projectName?: string;
   applicantActorId: number;
   applicantName?: string;
   requestedProjectRole: "READER" | "MANAGER" | "OWNER" | string;

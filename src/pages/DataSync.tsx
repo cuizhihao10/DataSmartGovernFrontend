@@ -1078,7 +1078,7 @@ export function DataSync() {
   const [targetSchemaFilter, setTargetSchemaFilter] = useState<string>();
   const [excludedSourceObjects, setExcludedSourceObjects] = useState<string[]>([]);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
-  const setProjectOptions = useUiStore((state) => state.setProjectOptions);
+  const projectOptions = useUiStore((state) => state.projectOptions);
   const selectedProjectScopeId = isNumericScopeValue(selectedProjectId) ? Number(selectedProjectId) : undefined;
   const executionPolicyScopeType = Form.useWatch("scopeType", executionPolicyForm);
   const normalizedTaskKeyword = taskKeyword.trim();
@@ -1327,18 +1327,6 @@ export function DataSync() {
   useEffect(() => {
     setRecycleTaskPage((page) => (page === 1 ? page : 1));
   }, [selectedProjectScopeId, taskGroupFilter, normalizedTaskKeyword]);
-  useEffect(() => {
-    const projectIds = Array.from(
-      new Set(
-        [...dataSources, ...templates, ...tasks, ...recycledTasks]
-          .map((record) => record.projectId)
-          .filter((id): id is number => id != null),
-      ),
-    );
-    if (projectIds.length) {
-      setProjectOptions(projectIds.map((id) => ({ value: String(id), label: `项目 ${id}` })));
-    }
-  }, [dataSources, recycledTasks, setProjectOptions, tasks, templates]);
   const flatGroupNodes = useMemo(() => {
     const walk = (nodes: UiSyncTaskGroupTreeNode[], parentPath: string[] = []): UiSyncTaskGroupTreeNode[] =>
       nodes.flatMap((node) => {
@@ -2896,7 +2884,11 @@ export function DataSync() {
   const currentSession = sessionQuery.data?.data;
   const currentProjectId = selectedProjectId ?? currentSession?.authorizedProjectIds?.[0];
   const currentProject = currentSession?.authorizedProjects?.find((project) => String(project.projectId ?? project.id) === String(currentProjectId));
-  const currentProjectLabel = currentProject?.projectName ?? currentProject?.name ?? currentSession?.projectName ?? (currentProjectId == null ? "未选择项目" : `项目 ${currentProjectId}`);
+  const currentProjectLabel = projectOptions.find((project) => project.value === String(currentProjectId))?.label
+    ?? currentProject?.projectName
+    ?? currentProject?.name
+    ?? currentSession?.projectName
+    ?? (currentProjectId == null ? "未选择项目" : `未找到项目名称（ID ${currentProjectId}）`);
   const scopedProjectId = isNumericScopeValue(selectedProjectId) ? String(selectedProjectId) : undefined;
   const actorId = Number(currentSession?.actorId);
   const currentProjectRole = normalizeProjectRole(currentProject?.projectRole ?? currentProject?.role ?? currentSession?.actorRole);
@@ -5711,7 +5703,7 @@ export function DataSync() {
                   showIcon
                   type="success"
                   message={`策略归属当前项目：${currentProjectLabel}`}
-                  description="项目来自页面顶部项目切换器和登录上下文，不需要手工填写项目 ID。"
+                  description="项目来自页面顶部项目切换器和登录上下文，不需要手工填写内部标识。"
                   style={{ marginBottom: 16 }}
                 />
                 <Form.Item name="projectId" hidden><InputNumber /></Form.Item>
@@ -5901,7 +5893,10 @@ export function DataSync() {
                           <Descriptions.Item label="任务名称">{selectedTask.name}</Descriptions.Item>
                           <Descriptions.Item label="任务 ID">{selectedTask.id}</Descriptions.Item>
                           <Descriptions.Item label="模板 ID">{selectedTask.templateId}</Descriptions.Item>
-                          <Descriptions.Item label="项目 ID">{selectedTask.projectId ?? selectedTaskTemplate?.projectId ?? "-"}</Descriptions.Item>
+                          <Descriptions.Item label="所属项目">
+                            {projectOptions.find((project) => project.value === String(selectedTask.projectId ?? selectedTaskTemplate?.projectId))?.label
+                              ?? "未找到项目名称"}
+                          </Descriptions.Item>
                           <Descriptions.Item label="任务分组">{selectedTask.groupName || "默认分组"}</Descriptions.Item>
                           <Descriptions.Item label="负责人">{selectedTask.ownerId || "-"}</Descriptions.Item>
                           <Descriptions.Item label="任务状态">{statusTag(selectedTask.currentState, stateColor, syncTaskStateLabels)}</Descriptions.Item>

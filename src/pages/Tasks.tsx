@@ -54,6 +54,7 @@ export function Tasks() {
   const [taskPageSize, setTaskPageSize] = useState(10);
   const [createOpen, setCreateOpen] = useState(false);
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
+  const projectOptions = useUiStore((state) => state.projectOptions);
   const selectedProjectScopeId = Number.isFinite(Number(selectedProjectId)) ? Number(selectedProjectId) : undefined;
   const sessionQuery = useQuery({
     queryKey: ["task-gateway-session"],
@@ -277,7 +278,9 @@ export function Tasks() {
           <div className="scope-summary">
             <Typography.Text strong>创建到当前项目</Typography.Text>
             <Typography.Text type="secondary">
-              {selectedProjectId ? `项目 ${selectedProjectId}` : "未选择项目"}
+              {selectedProjectId
+                ? projectOptions.find((project) => project.value === selectedProjectId)?.label ?? "未找到项目名称"
+                : "未选择项目"}
             </Typography.Text>
           </div>
           <Form.Item name="name" label="任务名称" rules={[{ required: true, message: "请输入任务名称" }]}>

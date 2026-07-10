@@ -25,7 +25,7 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useDeferredValue, useMemo, useState } from "react";
 import {
   api,
   type ApprovalCenterReviewPayload,
@@ -89,6 +89,8 @@ export function ApprovalCenter() {
   const [myType, setMyType] = useState<string | undefined>();
   const [myStatus, setMyStatus] = useState<string | undefined>();
   const [pendingType, setPendingType] = useState<string | undefined>();
+  const [joinProjectKeyword, setJoinProjectKeyword] = useState("");
+  const deferredJoinProjectKeyword = useDeferredValue(joinProjectKeyword);
 
   const sessionQuery = useQuery({
     queryKey: ["approval-center-session"],
@@ -100,6 +102,23 @@ export function ApprovalCenter() {
   const projectOwnerReviewer = ownsAnyProject(session);
   const reviewer = administratorReviewer || projectOwnerReviewer;
   const applicant = canApplyForProjects(actorRole);
+  const joinCandidateQuery = useQuery({
+    queryKey: ["approval-center-project-join-candidates", session?.tenantId, deferredJoinProjectKeyword],
+    queryFn: () => api.listProjectJoinCandidates({
+      keyword: deferredJoinProjectKeyword || undefined,
+      current: 1,
+      size: 100,
+    }),
+    enabled: applicant && Boolean(session?.authenticated),
+  });
+  const joinProjectOptions = useMemo(() => (
+    joinCandidateQuery.data?.data.records ?? []
+  ).map((project) => ({
+    value: project.projectId,
+    label: project.projectCode
+      ? `${project.projectName}（${project.projectCode}）`
+      : project.projectName,
+  })), [joinCandidateQuery.data?.data.records]);
 
   const myQuery = useQuery({
     queryKey: ["approval-center-my", myPage.current, myPage.size, myType, myStatus],
@@ -200,7 +219,7 @@ export function ApprovalCenter() {
       title: "项目",
       render: (_, record) => (
         <Space direction="vertical" size={0}>
-          <Typography.Text strong>{record.projectName || (record.projectId ? `项目 ${record.projectId}` : "待创建")}</Typography.Text>
+          <Typography.Text strong>{record.projectName || (record.projectId ? "未找到项目名称" : "待创建")}</Typography.Text>
           <Typography.Text type="secondary" className="mono">
             {record.projectCode || (record.projectId ? `ID ${record.projectId}` : "-")}
           </Typography.Text>
@@ -353,8 +372,16 @@ export function ApprovalCenter() {
 
           <Card title={<Space><UserAddOutlined />申请加入项目</Space>}>
             <Form<ProjectJoinRequestApplyPayload> form={joinForm} layout="vertical" onFinish={submitJoin} initialValues={{ requestedProjectRole: "READER" }}>
-              <Form.Item name="projectId" label="目标项目 ID" rules={[{ required: true, message: "请输入目标项目 ID" }]}>
-                <Input type="number" min={1} placeholder="由项目负责人或管理员提供" />
+              <Form.Item name="projectId" label="目标项目" rules={[{ required: true, message: "请选择目标项目" }]}>
+                <Select
+                  showSearch
+                  filterOption={false}
+                  options={joinProjectOptions}
+                  loading={joinCandidateQuery.isLoading || joinCandidateQuery.isFetching}
+                  onSearch={setJoinProjectKeyword}
+                  placeholder="按项目名称或编码搜索"
+                  notFoundContent="本租户暂无可申请加入的启用项目"
+                />
               </Form.Item>
               <Form.Item name="requestedProjectRole" label="申请项目角色" rules={[{ required: true }]}>
                 <Select options={[
@@ -442,7 +469,7 @@ export function ApprovalCenter() {
             <Descriptions.Item label="申请类型">{requestTypeLabels[selected.requestType] || selected.requestType}</Descriptions.Item>
             <Descriptions.Item label="申请 ID">{selected.requestId}</Descriptions.Item>
             <Descriptions.Item label="租户 ID">{selected.tenantId ?? "-"}</Descriptions.Item>
-            <Descriptions.Item label="项目">{selected.projectName || selected.projectId || "待创建"}</Descriptions.Item>
+            <Descriptions.Item label="项目">{selected.projectName || (selected.projectId ? "未找到项目名称" : "待创建")}</Descriptions.Item>
             <Descriptions.Item label="项目编码">{selected.projectCode || "-"}</Descriptions.Item>
             <Descriptions.Item label="申请人">{selected.applicantName || `Actor ${selected.applicantActorId}`}</Descriptions.Item>
             <Descriptions.Item label="申请角色">{selected.requestedProjectRole || "-"}</Descriptions.Item>
