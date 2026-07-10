@@ -1944,6 +1944,10 @@ export function DataSync() {
     action: "manualDispatch" | "offline" | "recycle" | "hardDelete",
     taskIds: number[],
   ) => {
+    if (!canManageCurrentProject) {
+      message.error("当前账号在该项目中没有任务管理权限");
+      return;
+    }
     if (!taskIds.length) {
       message.warning("请先勾选需要批量处理的同步任务");
       return;
@@ -1982,7 +1986,7 @@ export function DataSync() {
         <Button
           danger
           icon={<DeleteOutlined />}
-          disabled={!taskIds.length}
+          disabled={!canManageCurrentProject || !taskIds.length}
           loading={batchOperationMutation.isPending}
           onClick={() => runBatchOperation("hardDelete", taskIds)}
         >
@@ -1992,7 +1996,7 @@ export function DataSync() {
         <>
           <Button
             icon={<PlayCircleOutlined />}
-            disabled={!taskIds.length}
+            disabled={!canManageCurrentProject || !taskIds.length}
             loading={batchOperationMutation.isPending}
             onClick={() => runBatchOperation("manualDispatch", taskIds)}
           >
@@ -2000,7 +2004,7 @@ export function DataSync() {
           </Button>
           <Button
             icon={<InboxOutlined />}
-            disabled={!taskIds.length}
+            disabled={!canManageCurrentProject || !taskIds.length}
             loading={batchOperationMutation.isPending}
             onClick={() => runBatchOperation("offline", taskIds)}
           >
@@ -2009,7 +2013,7 @@ export function DataSync() {
           <Button
             danger
             icon={<DeleteOutlined />}
-            disabled={!taskIds.length}
+            disabled={!canManageCurrentProject || !taskIds.length}
             loading={batchOperationMutation.isPending}
             onClick={() => runBatchOperation("recycle", taskIds)}
           >
@@ -3752,26 +3756,28 @@ export function DataSync() {
     dirtyReplayForm.setFieldsValue({ executionId: record.lastExecutionId });
   };
 
-  const renderTaskActions = (record: SyncTask, recycleView = false) => (
+  const renderTaskActions = (record: SyncTask, recycleView = false) => {
+    const canManageTask = canManageCurrentProject;
+    return (
     <Space wrap>
       <Button aria-label="执行历史" title="执行历史" icon={<EyeOutlined />} onClick={() => openTaskDrawer(record)} />
       <Button
         aria-label="编辑任务"
         title="编辑任务定义"
         icon={<EditOutlined />}
-        disabled={!canOperate(record, editAllowedStates)}
+        disabled={!canManageTask || !canOperate(record, editAllowedStates)}
         onClick={() => openEditTask(record)}
       />
       <Button
         aria-label="发布任务"
         title="发布任务定义"
         icon={<SendOutlined />}
-        disabled={!canOperate(record, publishAllowedStates)}
+        disabled={!canManageTask || !canOperate(record, publishAllowedStates)}
         loading={taskDefinitionMutation.isPending}
         onClick={() => openPublishTask(record)}
       />
-      <Button aria-label="调整分组" title="调整分组" icon={<FolderOutlined />} onClick={() => openGroupTask(record)} />
-      <Button aria-label="克隆任务" title="克隆任务" icon={<CopyOutlined />} loading={taskDefinitionMutation.isPending} onClick={() => openCloneTask(record)} />
+      <Button aria-label="调整分组" title="调整分组" icon={<FolderOutlined />} disabled={!canManageTask} onClick={() => openGroupTask(record)} />
+      <Button aria-label="克隆任务" title="克隆任务" icon={<CopyOutlined />} disabled={!canManageTask} loading={taskDefinitionMutation.isPending} onClick={() => openCloneTask(record)} />
       {recycleView ? (
         <Button
           danger
@@ -3779,7 +3785,7 @@ export function DataSync() {
           title="彻底删除"
           icon={<DeleteOutlined />}
           loading={taskActionMutation.isPending}
-          disabled={stateOf(record) !== "RECYCLED"}
+          disabled={!canManageTask || stateOf(record) !== "RECYCLED"}
           onClick={() => confirmTaskAction(record, "hardDelete", "确认彻底删除回收站任务？", "前端确认彻底删除回收站任务")}
         />
       ) : (
@@ -3789,7 +3795,7 @@ export function DataSync() {
             title="立即执行一次"
             icon={<PlayCircleOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, runAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, runAllowedStates)}
             onClick={() => taskActionMutation.mutate({ id: record.id, action: "manualDispatch" })}
           />
           <Button
@@ -3797,7 +3803,7 @@ export function DataSync() {
             title="暂停"
             icon={<PauseCircleOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, pauseAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, pauseAllowedStates)}
             onClick={() => taskActionMutation.mutate({ id: record.id, action: "pause", payload: { reason: "前端人工暂停" } })}
           />
           <Button
@@ -3805,7 +3811,7 @@ export function DataSync() {
             title="恢复"
             icon={<SyncOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, resumeAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, resumeAllowedStates)}
             onClick={() => taskActionMutation.mutate({ id: record.id, action: "resume", payload: { reason: "前端人工恢复" } })}
           />
           <Button
@@ -3813,18 +3819,18 @@ export function DataSync() {
             title="重试"
             icon={<RedoOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, retryAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, retryAllowedStates)}
             onClick={() => taskActionMutation.mutate({ id: record.id, action: "retry", payload: { reason: "前端人工重试" } })}
           />
-          <Button aria-label="回放" title="回放" icon={<CloudSyncOutlined />} onClick={() => openRecoveryModal(record, "replay")} />
-          <Button aria-label="补数" title="补数" icon={<ReloadOutlined />} onClick={() => openRecoveryModal(record, "backfill")} />
+          <Button aria-label="回放" title="回放" icon={<CloudSyncOutlined />} disabled={!canManageTask} onClick={() => openRecoveryModal(record, "replay")} />
+          <Button aria-label="补数" title="补数" icon={<ReloadOutlined />} disabled={!canManageTask} onClick={() => openRecoveryModal(record, "backfill")} />
           <Button
             danger
             aria-label="手工结束"
             title="手工结束"
             icon={<StopOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, terminateAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, terminateAllowedStates)}
             onClick={() => confirmTaskAction(record, "terminate", "确认手工结束当前运行？", "前端手工结束同步任务")}
           />
           <Button
@@ -3832,7 +3838,7 @@ export function DataSync() {
             title="下线任务"
             icon={<InboxOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, offlineAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, offlineAllowedStates)}
             onClick={() => confirmTaskAction(record, "offline", "确认下线任务？", "前端下线同步任务")}
           />
           <Button
@@ -3841,7 +3847,7 @@ export function DataSync() {
             title="移入回收站"
             icon={<DeleteOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={stateOf(record) !== "OFFLINE"}
+            disabled={!canManageTask || stateOf(record) !== "OFFLINE"}
             onClick={() => confirmTaskAction(record, "recycle", "确认移入回收站？", "前端删除同步任务到回收站")}
           />
           <Button
@@ -3850,13 +3856,14 @@ export function DataSync() {
             title="取消任务"
             icon={<StopOutlined />}
             loading={taskActionMutation.isPending}
-            disabled={!canOperate(record, cancelAllowedStates)}
+            disabled={!canManageTask || !canOperate(record, cancelAllowedStates)}
             onClick={() => confirmTaskAction(record, "cancel", "确认取消任务？", "前端人工取消")}
           />
         </>
       )}
     </Space>
-  );
+    );
+  };
 
   const makeTaskColumns = (recycleView = false): ColumnsType<SyncTask> => [
     {
@@ -4437,9 +4444,9 @@ export function DataSync() {
           <>
             <DataSourceIndicator meta={templateQuery.data?.meta ?? dataSourceQuery.data?.meta} />
             <Button aria-label="刷新同步数据" title="刷新同步数据" icon={<ReloadOutlined />} onClick={refetchAll} />
-            <Button icon={<UploadOutlined />} onClick={() => setImportOpen(true)}>导入任务定义</Button>
+            <Button icon={<UploadOutlined />} disabled={!canManageCurrentProject} onClick={() => setImportOpen(true)}>导入任务定义</Button>
             <Button icon={<DownloadOutlined />} loading={exportMutation.isPending} onClick={() => exportMutation.mutate("CSV")}>导出任务定义</Button>
-            <Button type="primary" icon={<CloudSyncOutlined />} onClick={openWizard}>新建同步任务</Button>
+            <Button type="primary" icon={<CloudSyncOutlined />} disabled={!canManageCurrentProject} onClick={openWizard}>新建同步任务</Button>
           </>
         }
       />
@@ -4477,13 +4484,13 @@ export function DataSync() {
               <Typography.Text type="secondary">按业务域管理同步任务</Typography.Text>
             </Space>
             <Space>
-              <Button aria-label="新增分组" title="新增分组" icon={<PlusOutlined />} onClick={openCreateGroup} />
+              <Button aria-label="新增分组" title="新增分组" icon={<PlusOutlined />} disabled={!canManageCurrentProject} onClick={openCreateGroup} />
               <Button
                 danger
                 aria-label="删除分组"
                 title="删除当前分组"
                 icon={<DeleteOutlined />}
-                disabled={!selectedGroupNode || selectedGroupNode.defaultGroup || selectedGroupNode.legacyOnly}
+                disabled={!canManageCurrentProject || !selectedGroupNode || selectedGroupNode.defaultGroup || selectedGroupNode.legacyOnly}
                 loading={deleteGroupMutation.isPending}
                 onClick={confirmDeleteSelectedGroup}
               />

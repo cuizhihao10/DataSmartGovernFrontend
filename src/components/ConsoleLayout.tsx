@@ -1,6 +1,7 @@
 import {
   ApartmentOutlined,
   ApiOutlined,
+  AuditOutlined,
   BarChartOutlined,
   CheckCircleOutlined,
   ClusterOutlined,
@@ -25,17 +26,27 @@ import { labelOf, actorRoleLabels } from "@/utils/labels";
 
 const { Header, Sider, Content } = Layout;
 
-const navItems: NavItem[] = [
-  { key: "dashboard", path: "/dashboard", label: "总览", icon: <BarChartOutlined /> },
-  { key: "datasources", path: "/datasources", label: "数据源管理", icon: <DatabaseOutlined /> },
-  { key: "sync", path: "/sync", label: "数据同步", icon: <CloudSyncOutlined /> },
-  { key: "tasks", path: "/tasks", label: "任务中心", icon: <ScheduleOutlined /> },
-  { key: "quality", path: "/quality", label: "数据质量", icon: <ExperimentOutlined /> },
-  { key: "agent", path: "/agent", label: "智能体助手", icon: <ClusterOutlined /> },
-  { key: "observability", path: "/observability", label: "运行监控", icon: <ApiOutlined /> },
-  { key: "permissions", path: "/permissions", label: "权限管理", icon: <SafetyCertificateOutlined /> },
-  { key: "closure", path: "/closure", label: "闭环验收", icon: <CheckCircleOutlined /> },
+const navItems: Array<NavItem & { menuCode: string }> = [
+  { key: "dashboard", menuCode: "dashboard", path: "/dashboard", label: "总览", icon: <BarChartOutlined /> },
+  { key: "datasources", menuCode: "datasource", path: "/datasources", label: "数据源管理", icon: <DatabaseOutlined /> },
+  { key: "sync", menuCode: "data-sync", path: "/sync", label: "数据同步", icon: <CloudSyncOutlined /> },
+  { key: "tasks", menuCode: "task", path: "/tasks", label: "任务中心", icon: <ScheduleOutlined /> },
+  { key: "quality", menuCode: "quality", path: "/quality", label: "数据质量", icon: <ExperimentOutlined /> },
+  { key: "agent", menuCode: "agent-runtime", path: "/agent", label: "智能体助手", icon: <ClusterOutlined /> },
+  { key: "observability", menuCode: "observability", path: "/observability", label: "运行监控", icon: <ApiOutlined /> },
+  { key: "approvals", menuCode: "approval-center", path: "/approvals", label: "申请与审批", icon: <AuditOutlined /> },
+  { key: "permissions", menuCode: "permission", path: "/permissions", label: "权限管理", icon: <SafetyCertificateOutlined /> },
+  { key: "closure", menuCode: "closure", path: "/closure", label: "闭环验收", icon: <CheckCircleOutlined /> },
 ];
+
+const fallbackMenuCodesByRole: Record<string, string[]> = {
+  ORDINARY_USER: ["dashboard", "datasource", "data-sync", "task", "approval-center"],
+  PROJECT_OWNER: ["dashboard", "datasource", "data-sync", "task", "quality", "agent-runtime", "approval-center"],
+  OPERATOR: ["dashboard", "data-sync", "task", "observability", "approval-center"],
+  AUDITOR: ["dashboard", "agent-runtime", "observability"],
+  TENANT_ADMINISTRATOR: navItems.map((item) => item.menuCode),
+  PLATFORM_ADMINISTRATOR: navItems.map((item) => item.menuCode),
+};
 
 export function ConsoleLayout() {
   const location = useLocation();
@@ -54,6 +65,22 @@ export function ConsoleLayout() {
     retry: false,
   });
   const session = sessionQuery.data?.data;
+  const actorRole = String(session?.actorRole ?? authUser?.actorRole ?? "").trim().toUpperCase();
+  const menuQuery = useQuery({
+    queryKey: ["layout-permission-menus", session?.tenantId ?? authUser?.tenantId, actorRole],
+    queryFn: () => api.listPermissionMenus(session?.tenantId ?? authUser?.tenantId, actorRole),
+    enabled: Boolean(actorRole),
+    retry: false,
+  });
+  const visibleNavItems = useMemo(() => {
+    const apiMenuCodes = menuQuery.data?.data
+      .filter((menu) => menu.enabled)
+      .map((menu) => menu.menuCode);
+    const menuCodes = menuQuery.data?.meta.source === "api"
+      ? new Set(apiMenuCodes)
+      : new Set(fallbackMenuCodesByRole[actorRole] ?? ["dashboard"]);
+    return navItems.filter((item) => menuCodes.has(item.menuCode));
+  }, [actorRole, menuQuery.data?.data, menuQuery.data?.meta.source]);
   const sessionProjectOptions = useMemo(() => {
     if (session?.authorizedProjects?.length) {
       return session.authorizedProjects
@@ -82,7 +109,9 @@ export function ConsoleLayout() {
     });
     return Array.from(optionMap.values());
   }, [discoveredProjectOptions, sessionProjectOptions]);
-  const activeKey = navItems.find((item) => location.pathname.startsWith(item.path))?.key ?? "dashboard";
+  const activeKey = visibleNavItems.find((item) => location.pathname.startsWith(item.path))?.key
+    ?? visibleNavItems[0]?.key
+    ?? "dashboard";
 
   useEffect(() => {
     /*
@@ -104,6 +133,16 @@ export function ConsoleLayout() {
       setSelectedProjectId(projectOptions[0].value);
     }
   }, [projectOptions, selectedProjectId, setSelectedProjectId]);
+
+  useEffect(() => {
+    if (menuQuery.data?.meta.source !== "api") {
+      return;
+    }
+    const requestedMenu = navItems.find((item) => location.pathname.startsWith(item.path));
+    if (requestedMenu && !visibleNavItems.some((item) => item.key === requestedMenu.key)) {
+      navigate(visibleNavItems[0]?.path ?? "/dashboard", { replace: true });
+    }
+  }, [location.pathname, menuQuery.data?.meta.source, navigate, visibleNavItems]);
 
   return (
     <Layout className="app-shell">
@@ -127,7 +166,7 @@ export function ConsoleLayout() {
           theme="dark"
           mode="inline"
           selectedKeys={[activeKey]}
-          items={navItems.map((item) => ({
+          items={visibleNavItems.map((item) => ({
             key: item.key,
             icon: item.icon,
             label: item.label,

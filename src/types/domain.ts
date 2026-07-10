@@ -804,6 +804,18 @@ export interface RoutePolicy {
   enabled: boolean;
 }
 
+export interface PermissionMenuRecord {
+  id: number;
+  menuCode: string;
+  parentCode?: string;
+  menuName: string;
+  path: string;
+  icon?: string;
+  sortOrder?: number;
+  enabled: boolean;
+  description?: string;
+}
+
 export interface ProjectRecord {
   projectId: number;
   tenantId?: number;
@@ -854,6 +866,29 @@ export interface ProjectCreationRequestRecord {
   createdProjectId?: number;
   createTime?: string;
   updateTime?: string;
+}
+
+export interface ApprovalCenterRecord {
+  requestType: "PROJECT_CREATION" | "PROJECT_JOIN" | string;
+  requestId: number;
+  tenantId?: number;
+  applicationId?: number;
+  projectId?: number;
+  projectCode?: string;
+  projectName?: string;
+  applicantActorId: number;
+  applicantName?: string;
+  requestedProjectRole?: string;
+  requestReason?: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED" | string;
+  reviewerActorId?: number;
+  reviewerActorRole?: string;
+  reviewComment?: string;
+  reviewTime?: string;
+  resultResourceId?: number;
+  createTime?: string;
+  updateTime?: string;
+  availableActions: string[];
 }
 
 export type JsonObject = Record<string, unknown>;

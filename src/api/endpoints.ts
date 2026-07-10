@@ -10,6 +10,7 @@ import {
   serviceHealth,
 } from "@/api/mockData";
 import type {
+  ApprovalCenterRecord,
   AgentModelRoute,
   AgentPlanCore,
   AgentPlanResponse,
@@ -31,6 +32,7 @@ import type {
   GovernanceTask,
   LifecycleStatus,
   PermissionRole,
+  PermissionMenuRecord,
   PlatformHealth,
   PlatformPageResponse,
   ProjectCreationRequestRecord,
@@ -214,6 +216,25 @@ export interface ProjectCreationRequestQueryParams {
 }
 
 export interface ProjectCreationRequestReviewPayload {
+  projectCode?: string;
+  projectName?: string;
+  projectType?: string;
+  applicationId?: number;
+  ownerActorId?: number;
+  description?: string;
+  reviewComment?: string;
+}
+
+export interface ApprovalCenterQueryParams {
+  tenantId?: number;
+  requestType?: "PROJECT_CREATION" | "PROJECT_JOIN" | string;
+  status?: string;
+  current?: number;
+  size?: number;
+}
+
+export interface ApprovalCenterReviewPayload {
+  approvedProjectRole?: "READER" | "MANAGER" | "OWNER" | string;
   projectCode?: string;
   projectName?: string;
   projectType?: string;
@@ -1603,6 +1624,47 @@ function normalizeProjectCreationRequest(value: unknown, index: number): Project
   };
 }
 
+function normalizeApprovalCenterRecord(value: unknown, index: number): ApprovalCenterRecord {
+  const record = readRecord(value);
+  return {
+    requestType: readString(record.requestType),
+    requestId: readNumber(record.requestId, index + 1),
+    tenantId: readOptionalNumber(record.tenantId),
+    applicationId: readOptionalNumber(record.applicationId),
+    projectId: readOptionalNumber(record.projectId),
+    projectCode: readOptionalString(record.projectCode),
+    projectName: readOptionalString(record.projectName),
+    applicantActorId: readNumber(record.applicantActorId),
+    applicantName: readOptionalString(record.applicantName),
+    requestedProjectRole: readOptionalString(record.requestedProjectRole),
+    requestReason: readOptionalString(record.requestReason),
+    status: readString(record.status, "PENDING"),
+    reviewerActorId: readOptionalNumber(record.reviewerActorId),
+    reviewerActorRole: readOptionalString(record.reviewerActorRole),
+    reviewComment: readOptionalString(record.reviewComment),
+    reviewTime: readOptionalString(record.reviewTime),
+    resultResourceId: readOptionalNumber(record.resultResourceId),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
+    availableActions: readActionArray(record.availableActions),
+  };
+}
+
+function normalizePermissionMenu(value: unknown, index: number): PermissionMenuRecord {
+  const record = readRecord(value);
+  return {
+    id: readNumber(record.id, index + 1),
+    menuCode: readString(record.menuCode),
+    parentCode: readOptionalString(record.parentCode),
+    menuName: readString(record.menuName),
+    path: readString(record.path),
+    icon: readOptionalString(record.icon),
+    sortOrder: readOptionalNumber(record.sortOrder),
+    enabled: readBoolean(record.enabled, true),
+    description: readOptionalString(record.description),
+  };
+}
+
 function normalizeAgentExecutionMode(value: unknown) {
   const mode = readString(value, "SYNC").toUpperCase();
   const modeMap: Record<string, string> = {
@@ -2441,6 +2503,10 @@ export const api = {
     };
   },
   listRoles: () => arrayEndpoint<PermissionRole>("/permission/roles", roles, normalizeRole),
+  listPermissionMenus: (tenantId: number | string | undefined, roleCode: string) => {
+    const query = compactQueryString({ tenantId, roleCode });
+    return arrayEndpoint<PermissionMenuRecord>(`/permission/menus?${query}`, [], normalizePermissionMenu);
+  },
   listRoutePolicies: () =>
     arrayEndpoint<RoutePolicy>("/permission/route-policies", routePolicies, normalizeRoutePolicy),
   listProjects: (params?: ProjectListParams) => {
@@ -2473,6 +2539,36 @@ export const api = {
     postJson<ProjectCreationRequestRecord>(`/permission/project-creation-requests/${requestId}/reject`, payload ?? {}),
   cancelProjectCreationRequest: (requestId: number) =>
     postJson<ProjectCreationRequestRecord>(`/permission/project-creation-requests/${requestId}/cancel`),
+  listMyApprovalRequests: (params?: ApprovalCenterQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, ...params });
+    return pageEndpoint<ApprovalCenterRecord>(
+      `/permission/approval-center/my?${query}`,
+      [],
+      normalizeApprovalCenterRecord,
+    );
+  },
+  listPendingApprovalRequests: (params?: ApprovalCenterQueryParams) => {
+    const query = compactQueryString({ current: 1, size: 20, status: "PENDING", ...params });
+    return pageEndpoint<ApprovalCenterRecord>(
+      `/permission/approval-center/pending?${query}`,
+      [],
+      normalizeApprovalCenterRecord,
+    );
+  },
+  approveApprovalRequest: (requestType: string, requestId: number, payload?: ApprovalCenterReviewPayload) =>
+    postJson<ApprovalCenterRecord>(
+      `/permission/approval-center/${encodeURIComponent(requestType)}/${requestId}/approve`,
+      payload ?? {},
+    ),
+  rejectApprovalRequest: (requestType: string, requestId: number, payload?: ApprovalCenterReviewPayload) =>
+    postJson<ApprovalCenterRecord>(
+      `/permission/approval-center/${encodeURIComponent(requestType)}/${requestId}/reject`,
+      payload ?? {},
+    ),
+  cancelApprovalRequest: (requestType: string, requestId: number) =>
+    postJson<ApprovalCenterRecord>(
+      `/permission/approval-center/${encodeURIComponent(requestType)}/${requestId}/cancel`,
+    ),
   applyProjectJoinRequest: (payload: ProjectJoinRequestApplyPayload) =>
     postJson<ProjectJoinRequestRecord>("/permission/project-join-requests", payload),
   listMyProjectJoinRequests: (params?: ProjectJoinRequestQueryParams) => {
