@@ -89,6 +89,10 @@ function canApplyProjectCreation(actorRole?: string) {
   return ["ORDINARY_USER", "PROJECT_OWNER", "OPERATOR", "OWNER"].includes(normalizeRole(actorRole));
 }
 
+function canApplyProjectJoin(actorRole?: string) {
+  return ["ORDINARY_USER", "PROJECT_OWNER", "OPERATOR", "OWNER"].includes(normalizeRole(actorRole));
+}
+
 function canUseProjectCreationEntry(actorRole?: string) {
   return canDirectCreateProject(actorRole) || canApplyProjectCreation(actorRole);
 }
@@ -118,6 +122,7 @@ export function Permissions() {
   });
   const session = sessionQuery.data?.data;
   const actorRole = session?.actorRole;
+  const administratorScope = ["TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(normalizeRole(actorRole));
   const selectedProjectNumber = Number(selectedProjectId ?? session?.authorizedProjectIds?.[0]);
   const currentProjectId = Number.isFinite(selectedProjectNumber) ? selectedProjectNumber : undefined;
   const currentProjectLabel = useMemo(() => {
@@ -134,8 +139,8 @@ export function Permissions() {
     queryFn: api.listRoutePolicies,
   });
   const projectQuery = useQuery({
-    queryKey: ["permission-projects"],
-    queryFn: () => api.listProjects({ current: 1, size: 100 }),
+    queryKey: ["permission-projects", session?.tenantId, actorRole],
+    queryFn: () => api.listProjects({ current: 1, size: 100, onlyMine: !administratorScope }),
   });
   const joinCandidateQuery = useQuery({
     queryKey: ["permission-project-join-candidates", session?.tenantId, deferredJoinProjectKeyword],
@@ -144,7 +149,7 @@ export function Permissions() {
       current: 1,
       size: 100,
     }),
-    enabled: Boolean(session?.authenticated),
+    enabled: canApplyProjectJoin(actorRole) && Boolean(session?.authenticated),
   });
   const joinProjectOptions = useMemo(() => (
     joinCandidateQuery.data?.data.records ?? []
@@ -157,6 +162,7 @@ export function Permissions() {
   const myJoinQuery = useQuery({
     queryKey: ["permission-project-join-my", currentProjectId],
     queryFn: () => api.listMyProjectJoinRequests({ projectId: currentProjectId, size: 100 }),
+    enabled: canApplyProjectJoin(actorRole),
   });
   const approvalQuery = useQuery({
     queryKey: ["permission-project-join-approvals", currentProjectId],
@@ -638,54 +644,63 @@ export function Permissions() {
             label: "加入申请",
             children: (
               <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                <Card className="compact-card" title="申请加入项目">
+                {canApplyProjectJoin(actorRole) ? (
+                  <>
+                    <Card className="compact-card" title="申请加入项目">
+                      <Alert
+                        showIcon
+                        type="info"
+                        message="申请不会直接产生项目数据范围"
+                        description="候选目录开放本租户全部启用项目；审批通过后才会写入项目成员关系并获得访问权限。"
+                        style={{ marginBottom: 12 }}
+                      />
+                      <Form<ProjectJoinRequestApplyPayload> form={joinForm} layout="vertical" onFinish={submitJoinRequest}>
+                        <div className="grid grid-two-form">
+                          <Form.Item name="projectId" label="目标项目" rules={[{ required: true, message: "请选择目标项目" }]}>
+                            <Select
+                              showSearch
+                              filterOption={false}
+                              options={joinProjectOptions}
+                              loading={joinCandidateQuery.isLoading || joinCandidateQuery.isFetching}
+                              onSearch={setJoinProjectKeyword}
+                              placeholder="按项目名称或编码搜索"
+                              notFoundContent="本租户暂无可申请加入的启用项目"
+                            />
+                          </Form.Item>
+                          <Form.Item name="requestedProjectRole" label="申请角色" rules={[{ required: true, message: "请选择申请角色" }]}>
+                            <Select options={[
+                              { value: "READER", label: "READER 只读" },
+                              { value: "MANAGER", label: "MANAGER 管理" },
+                            ]} />
+                          </Form.Item>
+                        </div>
+                        <Form.Item name="requestReason" label="申请原因">
+                          <Input.TextArea rows={2} placeholder="说明为什么需要加入该项目，例如需要使用某条被授权的数据源创建同步任务" />
+                        </Form.Item>
+                        <Button type="primary" icon={<UserAddOutlined />} htmlType="submit" loading={applyJoinMutation.isPending}>
+                          提交加入申请
+                        </Button>
+                      </Form>
+                    </Card>
+                    <Card className="table-card" title="我的申请">
+                      <Table
+                        rowKey="id"
+                        columns={joinColumns}
+                        dataSource={sortByIdDesc(myRequests)}
+                        loading={myJoinQuery.isLoading}
+                        locale={{ emptyText: <RealEmpty meta={myJoinQuery.data?.meta} description="暂无项目加入申请" /> }}
+                        pagination={defaultTablePagination(10)}
+                      />
+                    </Card>
+                  </>
+                ) : (
                   <Alert
                     showIcon
-                    type="info"
-                    message="申请不会直接产生项目数据范围"
-                    description="只有管理员或项目 Owner 审批通过后，后端才会写入 permission_project_membership，gateway 随后才能把项目放入可信数据范围。"
-                    style={{ marginBottom: 12 }}
+                    type="success"
+                    message={normalizeRole(actorRole) === "PLATFORM_ADMINISTRATOR" ? "平台管理员天然拥有全平台项目权限" : "租户管理员天然拥有本租户全部项目权限"}
+                    description="管理员不需要通过项目成员申请扩权。请直接使用顶部项目切换器进入管理范围内的项目；加入申请仅面向普通项目成员。"
                   />
-                  <Form<ProjectJoinRequestApplyPayload> form={joinForm} layout="vertical" onFinish={submitJoinRequest}>
-                    <div className="grid grid-two-form">
-                      <Form.Item name="projectId" label="目标项目" rules={[{ required: true, message: "请选择目标项目" }]}>
-                        <Select
-                          showSearch
-                          filterOption={false}
-                          options={joinProjectOptions}
-                          loading={joinCandidateQuery.isLoading || joinCandidateQuery.isFetching}
-                          onSearch={setJoinProjectKeyword}
-                          placeholder="按项目名称或编码搜索"
-                          notFoundContent="本租户暂无可申请加入的启用项目"
-                        />
-                      </Form.Item>
-                      <Form.Item name="requestedProjectRole" label="申请角色" rules={[{ required: true, message: "请选择申请角色" }]}>
-                        <Select
-                          options={[
-                            { value: "READER", label: "READER 只读" },
-                            { value: "MANAGER", label: "MANAGER 管理" },
-                          ]}
-                        />
-                      </Form.Item>
-                    </div>
-                    <Form.Item name="requestReason" label="申请原因">
-                      <Input.TextArea rows={2} placeholder="说明为什么需要加入该项目，例如需要使用某条被授权的数据源创建同步任务" />
-                    </Form.Item>
-                    <Button type="primary" icon={<UserAddOutlined />} htmlType="submit" loading={applyJoinMutation.isPending}>
-                      提交加入申请
-                    </Button>
-                  </Form>
-                </Card>
-                <Card className="table-card" title="我的申请">
-                  <Table
-                    rowKey="id"
-                    columns={joinColumns}
-                    dataSource={sortByIdDesc(myRequests)}
-                    loading={myJoinQuery.isLoading}
-                    locale={{ emptyText: <RealEmpty meta={myJoinQuery.data?.meta} description="暂无项目加入申请" /> }}
-                    pagination={defaultTablePagination(10)}
-                  />
-                </Card>
+                )}
               </Space>
             ),
           },

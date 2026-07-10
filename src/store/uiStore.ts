@@ -7,8 +7,8 @@ interface UiState {
   setDataMode: (dataMode: "auto" | "mock") => void;
   selectedProjectId?: string;
   setSelectedProjectId: (selectedProjectId?: string) => void;
-  projectOptions: Array<{ value: string; label: string }>;
-  setProjectOptions: (projectOptions: Array<{ value: string; label: string }>) => void;
+  projectOptions: Array<{ value: string; label: string; tenantId?: number; tenantName?: string }>;
+  setProjectOptions: (projectOptions: Array<{ value: string; label: string; tenantId?: number; tenantName?: string }>) => void;
 }
 
 export const useUiStore = create<UiState>((set) => ({

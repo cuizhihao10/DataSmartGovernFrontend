@@ -290,6 +290,12 @@ export interface TenantOpenPayload {
   ownerActorId?: number;
   applicationCode?: string;
   applicationName?: string;
+  administratorUsername: string;
+  administratorEmail?: string;
+  administratorFirstName?: string;
+  administratorLastName?: string;
+  administratorInitialPassword: string;
+  administratorTemporaryPassword?: boolean;
   description?: string;
   reason?: string;
 }
@@ -1628,6 +1634,7 @@ function normalizeProject(value: unknown, index: number): ProjectRecord {
   return {
     projectId,
     tenantId: readOptionalNumber(record.tenantId),
+    tenantName: readOptionalString(record.tenantName),
     projectCode: readOptionalString(record.projectCode),
     projectName: readString(record.projectName ?? record.name, `未命名项目（ID ${projectId}）`),
     projectType: readOptionalString(record.projectType),
@@ -1668,6 +1675,7 @@ function normalizeProjectJoinCandidate(value: unknown, index: number): ProjectJo
   const projectId = readNumber(record.projectId ?? record.id, index + 1);
   return {
     projectId,
+    tenantId: readOptionalNumber(record.tenantId),
     projectCode: readOptionalString(record.projectCode),
     projectName: readString(record.projectName ?? record.name, `未命名项目（ID ${projectId}）`),
     projectType: readOptionalString(record.projectType),
@@ -1779,6 +1787,9 @@ function normalizePermissionTenant(value: unknown, index: number): PermissionTen
     applicationCode: readOptionalString(record.applicationCode),
     applicationName: readOptionalString(record.applicationName),
     applicationStatus: readOptionalString(record.applicationStatus),
+    administratorActorId: readOptionalNumber(record.administratorActorId),
+    administratorUsername: readOptionalString(record.administratorUsername),
+    administratorStatus: readOptionalString(record.administratorStatus),
     createTime: readOptionalString(record.createTime),
     updateTime: readOptionalString(record.updateTime),
   };

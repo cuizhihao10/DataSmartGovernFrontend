@@ -70,9 +70,10 @@ export function ConsoleLayout() {
   });
   const session = sessionQuery.data?.data;
   const actorRole = String(session?.actorRole ?? authUser?.actorRole ?? "").trim().toUpperCase();
+  const administratorScope = ["TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(actorRole);
   const projectQuery = useQuery({
-    queryKey: ["layout-permission-projects", session?.tenantId, session?.actorId],
-    queryFn: () => api.listProjects({ current: 1, size: 100, onlyMine: true }),
+    queryKey: ["layout-permission-projects", session?.tenantId, session?.actorId, actorRole],
+    queryFn: () => api.listProjects({ current: 1, size: 100, onlyMine: !administratorScope }),
     enabled: Boolean(session?.authenticated),
     retry: false,
   });
@@ -92,11 +93,15 @@ export function ConsoleLayout() {
     return navItems.filter((item) => menuCodes.has(item.menuCode));
   }, [actorRole, menuQuery.data?.data, menuQuery.data?.meta.source]);
   const projectOptions = useMemo(() => {
-    const optionMap = new Map<string, { value: string; label: string }>();
+    const optionMap = new Map<string, { value: string; label: string; tenantId?: number; tenantName?: string }>();
     (projectQuery.data?.data.records ?? []).forEach((project) => {
       optionMap.set(String(project.projectId), {
         value: String(project.projectId),
-        label: project.projectName,
+        label: actorRole === "PLATFORM_ADMINISTRATOR"
+          ? `${project.tenantName || `租户 ${project.tenantId ?? "未知"}`} / ${project.projectName}`
+          : project.projectName,
+        tenantId: project.tenantId,
+        tenantName: project.tenantName,
       });
     });
     session?.authorizedProjects?.forEach((project) => {
@@ -105,6 +110,7 @@ export function ConsoleLayout() {
         optionMap.set(String(id), {
           value: String(id),
           label: project.projectName ?? project.name ?? `未找到项目名称（ID ${id}）`,
+          tenantId: project.tenantId,
         });
       }
     });
@@ -117,7 +123,7 @@ export function ConsoleLayout() {
       }
     });
     return Array.from(optionMap.values());
-  }, [projectQuery.data?.data.records, session?.authorizedProjectIds, session?.authorizedProjects]);
+  }, [actorRole, projectQuery.data?.data.records, session?.authorizedProjectIds, session?.authorizedProjects]);
   const activeKey = visibleNavItems.find((item) => location.pathname.startsWith(item.path))?.key
     ?? visibleNavItems[0]?.key
     ?? "dashboard";

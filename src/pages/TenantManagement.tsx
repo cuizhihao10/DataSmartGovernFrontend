@@ -11,9 +11,9 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
-  InputNumber,
   Modal,
   Select,
   Space,
@@ -63,7 +63,7 @@ function normalizeRole(value?: string) {
 /**
  * 平台租户管理页。
  *
- * 开租只建立“公司租户 -> FlashSync 应用”两层控制面事实，不创建工作空间，也不创建默认项目。
+ * 开租建立“公司租户 -> FlashSync 应用”，并供应首个租户管理员，不创建工作空间或默认项目。
  * 项目仍由租户用户提交创建申请，并通过审批中心生成，避免开租和业务项目生命周期耦合。
  */
 export function TenantManagement() {
@@ -104,7 +104,7 @@ export function TenantManagement() {
   const openMutation = useMutation({
     mutationFn: api.openTenant,
     onSuccess: async (result) => {
-      message.success(`租户 ${result.data.tenantName} 和 FlashSync 应用已开通`);
+      message.success(`租户 ${result.data.tenantName}、FlashSync 应用和管理员 ${result.data.administratorUsername} 已开通`);
       setOpenVisible(false);
       openForm.resetFields();
       await tenantQuery.refetch();
@@ -145,7 +145,6 @@ export function TenantManagement() {
       tenantName: tenant.tenantName,
       tenantType: tenant.tenantType,
       planCode: tenant.planCode,
-      ownerActorId: tenant.ownerActorId,
       description: tenant.description,
       reason: "平台管理员维护租户资料",
     });
@@ -194,7 +193,18 @@ export function TenantManagement() {
       width: 100,
       render: (value) => <Tag color={statusColors[value] || "default"}>{statusLabels[value] || value}</Tag>,
     },
-    { title: "负责人 Actor", dataIndex: "ownerActorId", width: 130, render: (value) => value ?? "未指定" },
+    {
+      title: "管理账号",
+      width: 190,
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text>{record.administratorUsername || "尚未绑定管理账号"}</Typography.Text>
+          <Typography.Text type="secondary" className="mono">
+            {record.administratorActorId ? `Actor ${record.administratorActorId}` : "-"}
+          </Typography.Text>
+        </Space>
+      ),
+    },
     { title: "开租时间", dataIndex: "openedAt", width: 170, render: formatDateTime },
     {
       title: "操作",
@@ -248,7 +258,7 @@ export function TenantManagement() {
     <div className="page-stack">
       <PageHeader
         title="租户管理"
-        subtitle="平台超级管理员开通公司租户、自动初始化 FlashSync 应用，并管理租户生命周期"
+        subtitle="平台超级管理员开通公司租户、FlashSync 应用和首个租户管理员，并管理租户生命周期"
         actions={(
           <>
             <DataSourceIndicator meta={tenantQuery.data?.meta} />
@@ -260,8 +270,8 @@ export function TenantManagement() {
       <Alert
         showIcon
         type="info"
-        message="开租层级：租户 → FlashSync 应用"
-        description="开租不会创建工作空间，也不会创建默认项目。租户用户后续通过申请与审批中心创建项目。暂停或关闭会同步停用 FlashSync 应用，并在网关权限判定阶段阻断该租户业务访问。"
+        message="开租层级：租户 → FlashSync 应用 → 首个租户管理员"
+        description="管理员账号创建在 Keycloak/企业 IdP，DataSmart 只保存低敏影子身份；密码不会进入业务数据库。开租不创建工作空间或默认项目，管理员后续审批租户用户的项目创建申请。"
       />
 
       <Card className="compact-card">
@@ -304,7 +314,7 @@ export function TenantManagement() {
         <Form<TenantOpenPayload>
           form={openForm}
           layout="vertical"
-          initialValues={{ tenantType: "BUSINESS", planCode: "STANDARD", applicationCode: "FLASHSYNC", applicationName: "FlashSync", reason: "平台管理员开通新租户" }}
+          initialValues={{ tenantType: "BUSINESS", planCode: "STANDARD", applicationCode: "FLASHSYNC", applicationName: "FlashSync", administratorTemporaryPassword: true, reason: "平台管理员开通新租户" }}
           onFinish={(values) => openMutation.mutate(values)}
         >
           <div className="grid grid-two-form">
@@ -312,8 +322,13 @@ export function TenantManagement() {
             <Form.Item name="tenantName" label="租户名称" rules={[{ required: true, message: "请输入公司或组织名称" }]}><Input placeholder="例如 Acme 制造有限公司" /></Form.Item>
             <Form.Item name="tenantType" label="租户类型" rules={[{ required: true }]}><Select options={["BUSINESS", "INTERNAL", "PLATFORM"].map((value) => ({ value, label: value }))} /></Form.Item>
             <Form.Item name="planCode" label="套餐编码" rules={[{ required: true }]}><Input placeholder="STANDARD / PROFESSIONAL / ENTERPRISE" /></Form.Item>
-            <Form.Item name="ownerActorId" label="租户负责人 Actor ID"><InputNumber min={1} style={{ width: "100%" }} placeholder="可在身份账号创建后补充" /></Form.Item>
             <Form.Item name="applicationName" label="应用名称" rules={[{ required: true }]}><Input disabled /></Form.Item>
+            <Form.Item name="administratorUsername" label="首个租户管理员用户名" rules={[{ required: true, message: "请输入租户管理员用户名" }]}><Input autoComplete="off" placeholder="例如 acme-admin" /></Form.Item>
+            <Form.Item name="administratorEmail" label="租户管理员邮箱" rules={[{ type: "email", message: "请输入有效邮箱" }]}><Input placeholder="admin@example.com" /></Form.Item>
+            <Form.Item name="administratorFirstName" label="管理员名"><Input placeholder="可选" /></Form.Item>
+            <Form.Item name="administratorLastName" label="管理员姓"><Input placeholder="可选" /></Form.Item>
+            <Form.Item name="administratorInitialPassword" label="初始密码" rules={[{ required: true, min: 8, message: "初始密码至少 8 位" }]}><Input.Password autoComplete="new-password" /></Form.Item>
+            <Form.Item name="administratorTemporaryPassword" valuePropName="checked"><Checkbox>首次登录必须修改密码</Checkbox></Form.Item>
           </div>
           <Form.Item name="applicationCode" hidden><Input /></Form.Item>
           <Form.Item name="description" label="租户说明"><Input.TextArea rows={3} placeholder="客户行业、交付范围、数据区域或合同说明，不要填写密码和连接串" /></Form.Item>
@@ -339,7 +354,6 @@ export function TenantManagement() {
           <div className="grid grid-two-form">
             <Form.Item name="tenantType" label="租户类型"><Select options={["BUSINESS", "INTERNAL", "PLATFORM"].map((value) => ({ value, label: value }))} /></Form.Item>
             <Form.Item name="planCode" label="套餐编码"><Input /></Form.Item>
-            <Form.Item name="ownerActorId" label="租户负责人 Actor ID"><InputNumber min={1} style={{ width: "100%" }} /></Form.Item>
           </div>
           <Form.Item name="description" label="租户说明"><Input.TextArea rows={3} /></Form.Item>
           <Form.Item name="reason" label="修改原因" rules={[{ required: true }]}><Input.TextArea rows={2} /></Form.Item>

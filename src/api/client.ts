@@ -1,11 +1,18 @@
 import type { PlatformApiResponse, RequestMeta, WithMeta } from "@/types/domain";
 import { authMode } from "@/auth/config";
 import { ensureApiAccessToken, getApiAccessToken } from "@/store/authStore";
+import { useUiStore } from "@/store/uiStore";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
 const enableMockFallback = import.meta.env.VITE_ENABLE_MOCK_FALLBACK !== "false";
 const workspaceQueryKeys = ["workspaceId", "workspace_id", "workspaceKey", "workspace_key", "workspaceName", "workspace_name"];
 const workspaceBodyKeys = new Set(workspaceQueryKeys.map((key) => key.toLowerCase()));
+const projectContextHeader = "X-DataSmart-Project-Id";
+
+function isProjectScopedBusinessPath(path: string) {
+  return ["/datasource", "/sync", "/task", "/quality", "/agent"]
+    .some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+}
 
 function isAgentWorkspacePath(path: string) {
   return path.startsWith("/agent/") || path === "/agent" || path.startsWith("/internal/agent-runtime/");
@@ -165,6 +172,12 @@ async function buildHeaders(
     headers.set("Content-Type", contentType);
   }
   await applyAuthHeader(headers, forceRefresh);
+  const selectedProjectId = useUiStore.getState().selectedProjectId;
+  if (isProjectScopedBusinessPath(path) && /^\d+$/.test(selectedProjectId || "") && Number(selectedProjectId) > 0) {
+    headers.set(projectContextHeader, selectedProjectId as string);
+  } else {
+    headers.delete(projectContextHeader);
+  }
   if (!isAgentWorkspacePath(path)) {
     headers.delete("X-DataSmart-Workspace-Id");
     headers.delete("X-DataSmart-Workspace-Risk-Level");

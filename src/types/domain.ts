@@ -833,6 +833,9 @@ export interface PermissionTenantRecord {
   applicationCode?: string;
   applicationName?: string;
   applicationStatus?: string;
+  administratorActorId?: number;
+  administratorUsername?: string;
+  administratorStatus?: string;
   createTime?: string;
   updateTime?: string;
 }
@@ -840,6 +843,7 @@ export interface PermissionTenantRecord {
 export interface ProjectRecord {
   projectId: number;
   tenantId?: number;
+  tenantName?: string;
   projectCode?: string;
   projectName: string;
   projectType?: string;
@@ -873,6 +877,7 @@ export interface ProjectMembershipRecord {
 
 export interface ProjectJoinCandidateRecord {
   projectId: number;
+  tenantId?: number;
   projectCode?: string;
   projectName: string;
   projectType?: string;
@@ -1178,6 +1183,7 @@ export interface GatewaySession {
   authorizedProjects?: Array<{
     id?: number | string;
     projectId?: number | string;
+    tenantId?: number;
     name?: string;
     projectName?: string;
     role?: string;
