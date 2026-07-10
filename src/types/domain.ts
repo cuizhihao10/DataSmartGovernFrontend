@@ -816,6 +816,25 @@ export interface PermissionMenuRecord {
   description?: string;
 }
 
+export interface PermissionTenantRecord {
+  tenantId: number;
+  tenantCode: string;
+  tenantName: string;
+  tenantType: string;
+  planCode: string;
+  status: "ACTIVE" | "SUSPENDED" | "CLOSED" | string;
+  ownerActorId?: number;
+  openedBy?: number;
+  openedAt?: string;
+  description?: string;
+  applicationId?: number;
+  applicationCode?: string;
+  applicationName?: string;
+  applicationStatus?: string;
+  createTime?: string;
+  updateTime?: string;
+}
+
 export interface ProjectRecord {
   projectId: number;
   tenantId?: number;

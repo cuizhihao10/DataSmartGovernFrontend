@@ -35,6 +35,7 @@ const navItems: Array<NavItem & { menuCode: string }> = [
   { key: "agent", menuCode: "agent-runtime", path: "/agent", label: "智能体助手", icon: <ClusterOutlined /> },
   { key: "observability", menuCode: "observability", path: "/observability", label: "运行监控", icon: <ApiOutlined /> },
   { key: "approvals", menuCode: "approval-center", path: "/approvals", label: "申请与审批", icon: <AuditOutlined /> },
+  { key: "tenants", menuCode: "tenant-management", path: "/tenants", label: "租户管理", icon: <ApartmentOutlined /> },
   { key: "permissions", menuCode: "permission", path: "/permissions", label: "权限管理", icon: <SafetyCertificateOutlined /> },
   { key: "closure", menuCode: "closure", path: "/closure", label: "闭环验收", icon: <CheckCircleOutlined /> },
 ];
@@ -44,7 +45,9 @@ const fallbackMenuCodesByRole: Record<string, string[]> = {
   PROJECT_OWNER: ["dashboard", "datasource", "data-sync", "task", "quality", "agent-runtime", "approval-center"],
   OPERATOR: ["dashboard", "data-sync", "task", "observability", "approval-center"],
   AUDITOR: ["dashboard", "agent-runtime", "observability"],
-  TENANT_ADMINISTRATOR: navItems.map((item) => item.menuCode),
+  TENANT_ADMINISTRATOR: navItems
+    .filter((item) => item.menuCode !== "tenant-management")
+    .map((item) => item.menuCode),
   PLATFORM_ADMINISTRATOR: navItems.map((item) => item.menuCode),
 };
 

@@ -33,6 +33,7 @@ import type {
   LifecycleStatus,
   PermissionRole,
   PermissionMenuRecord,
+  PermissionTenantRecord,
   PlatformHealth,
   PlatformPageResponse,
   ProjectCreationRequestRecord,
@@ -242,6 +243,37 @@ export interface ApprovalCenterReviewPayload {
   ownerActorId?: number;
   description?: string;
   reviewComment?: string;
+}
+
+export interface TenantListParams {
+  tenantId?: number;
+  tenantCode?: string;
+  tenantName?: string;
+  tenantType?: string;
+  status?: string;
+  current?: number;
+  size?: number;
+}
+
+export interface TenantOpenPayload {
+  tenantCode: string;
+  tenantName: string;
+  tenantType?: "BUSINESS" | "INTERNAL" | "PLATFORM" | string;
+  planCode?: string;
+  ownerActorId?: number;
+  applicationCode?: string;
+  applicationName?: string;
+  description?: string;
+  reason?: string;
+}
+
+export interface TenantUpdatePayload {
+  tenantName?: string;
+  tenantType?: "BUSINESS" | "INTERNAL" | "PLATFORM" | string;
+  planCode?: string;
+  ownerActorId?: number;
+  description?: string;
+  reason?: string;
 }
 
 export interface MetadataDiscoveryPayload {
@@ -1665,6 +1697,28 @@ function normalizePermissionMenu(value: unknown, index: number): PermissionMenuR
   };
 }
 
+function normalizePermissionTenant(value: unknown, index: number): PermissionTenantRecord {
+  const record = readRecord(value);
+  return {
+    tenantId: readNumber(record.tenantId, index + 1),
+    tenantCode: readString(record.tenantCode),
+    tenantName: readString(record.tenantName),
+    tenantType: readString(record.tenantType, "BUSINESS"),
+    planCode: readString(record.planCode, "STANDARD"),
+    status: readString(record.status, "ACTIVE"),
+    ownerActorId: readOptionalNumber(record.ownerActorId),
+    openedBy: readOptionalNumber(record.openedBy),
+    openedAt: readOptionalString(record.openedAt),
+    description: readOptionalString(record.description),
+    applicationId: readOptionalNumber(record.applicationId),
+    applicationCode: readOptionalString(record.applicationCode),
+    applicationName: readOptionalString(record.applicationName),
+    applicationStatus: readOptionalString(record.applicationStatus),
+    createTime: readOptionalString(record.createTime),
+    updateTime: readOptionalString(record.updateTime),
+  };
+}
+
 function normalizeAgentExecutionMode(value: unknown) {
   const mode = readString(value, "SYNC").toUpperCase();
   const modeMap: Record<string, string> = {
@@ -2507,6 +2561,22 @@ export const api = {
     const query = compactQueryString({ tenantId, roleCode });
     return arrayEndpoint<PermissionMenuRecord>(`/permission/menus?${query}`, [], normalizePermissionMenu);
   },
+  listTenants: (params?: TenantListParams) => {
+    const query = compactQueryString({ current: 1, size: 20, ...params });
+    return pageEndpoint<PermissionTenantRecord>(`/permission/tenants?${query}`, [], normalizePermissionTenant);
+  },
+  getTenant: (tenantId: number) =>
+    request<PermissionTenantRecord>(`/permission/tenants/${tenantId}`),
+  openTenant: (payload: TenantOpenPayload) =>
+    postJson<PermissionTenantRecord>("/permission/tenants", payload),
+  updateTenant: (tenantId: number, payload: TenantUpdatePayload) =>
+    putJson<PermissionTenantRecord>(`/permission/tenants/${tenantId}`, payload),
+  activateTenant: (tenantId: number, reason: string) =>
+    postJson<PermissionTenantRecord>(`/permission/tenants/${tenantId}/activate`, { reason }),
+  suspendTenant: (tenantId: number, reason: string) =>
+    postJson<PermissionTenantRecord>(`/permission/tenants/${tenantId}/suspend`, { reason }),
+  closeTenant: (tenantId: number, reason: string) =>
+    postJson<PermissionTenantRecord>(`/permission/tenants/${tenantId}/close`, { reason }),
   listRoutePolicies: () =>
     arrayEndpoint<RoutePolicy>("/permission/route-policies", routePolicies, normalizeRoutePolicy),
   listProjects: (params?: ProjectListParams) => {

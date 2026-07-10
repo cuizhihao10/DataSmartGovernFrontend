@@ -36,7 +36,7 @@ import { DataSourceIndicator } from "@/components/DataSourceIndicator";
 import { PageHeader } from "@/components/PageHeader";
 import { RealEmpty } from "@/components/RealEmpty";
 import { useAuthStore } from "@/store/authStore";
-import type { ApprovalCenterRecord } from "@/types/domain";
+import type { ApprovalCenterRecord, GatewaySession } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import { controlledTablePagination } from "@/utils/table";
 
@@ -61,8 +61,13 @@ function normalizeRole(role?: string) {
   return String(role || "").trim().toUpperCase();
 }
 
-function canReviewApprovals(role?: string) {
+function isAdministratorReviewer(role?: string) {
   return ["TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(normalizeRole(role));
+}
+
+function ownsAnyProject(session?: GatewaySession) {
+  return Boolean(session?.authorizedProjects?.some((project) =>
+    normalizeRole(project.projectRole ?? project.role) === "OWNER"));
 }
 
 function canApplyForProjects(role?: string) {
@@ -91,7 +96,9 @@ export function ApprovalCenter() {
   });
   const session = sessionQuery.data?.data;
   const actorRole = session?.actorRole ?? authUser?.actorRole;
-  const reviewer = canReviewApprovals(actorRole);
+  const administratorReviewer = isAdministratorReviewer(actorRole);
+  const projectOwnerReviewer = ownsAnyProject(session);
+  const reviewer = administratorReviewer || projectOwnerReviewer;
   const applicant = canApplyForProjects(actorRole);
 
   const myQuery = useQuery({
@@ -108,7 +115,7 @@ export function ApprovalCenter() {
     queryFn: () => api.listPendingApprovalRequests({
       current: pendingPage.current,
       size: pendingPage.size,
-      requestType: pendingType,
+      requestType: administratorReviewer ? pendingType : "PROJECT_JOIN",
       status: "PENDING",
     }),
     enabled: reviewer,
@@ -292,6 +299,7 @@ export function ApprovalCenter() {
     setType: (value: string | undefined) => void,
     status?: string,
     setStatus?: (value: string | undefined) => void,
+    allowedTypes: string[] = Object.keys(requestTypeLabels),
   ) => (
     <Space wrap style={{ marginBottom: 12 }}>
       <Select
@@ -300,7 +308,7 @@ export function ApprovalCenter() {
         value={type}
         onChange={setType}
         style={{ width: 160 }}
-        options={Object.entries(requestTypeLabels).map(([value, label]) => ({ value, label }))}
+        options={allowedTypes.map((value) => ({ value, label: requestTypeLabels[value] || value }))}
       />
       {setStatus ? (
         <Select
@@ -319,7 +327,7 @@ export function ApprovalCenter() {
     <div className="page-stack">
       <PageHeader
         title="申请与审批"
-        subtitle="统一查看项目创建、项目加入等申请进度；管理员在同一页面处理待办审批"
+        subtitle="统一查看项目创建、项目加入申请；项目 OWNER 审批本项目加入，租户/平台管理员按管理范围处理待办"
         actions={<DataSourceIndicator meta={myQuery.data?.meta ?? pendingQuery.data?.meta} />}
       />
 
@@ -393,7 +401,13 @@ export function ApprovalCenter() {
             label: <Space>待办审批<Badge count={pendingQuery.data?.data.total ?? 0} /></Space>,
             children: (
               <Card className="table-card">
-                {filterBar(pendingType, (value) => { setPendingType(value); setPendingPage((page) => ({ ...page, current: 1 })); })}
+                {filterBar(
+                  administratorReviewer ? pendingType : "PROJECT_JOIN",
+                  (value) => { setPendingType(value); setPendingPage((page) => ({ ...page, current: 1 })); },
+                  undefined,
+                  undefined,
+                  administratorReviewer ? Object.keys(requestTypeLabels) : ["PROJECT_JOIN"],
+                )}
                 <Table
                   rowKey={(record: ApprovalCenterRecord) => `${record.requestType}:${record.requestId}`}
                   columns={pendingColumns}
@@ -418,7 +432,7 @@ export function ApprovalCenter() {
           showIcon
           type="info"
           message="当前账号仅显示本人申请进度"
-          description="租户管理员和平台管理员登录后会额外看到待办审批页；前端按钮状态由后端 availableActions 决定。"
+          description="拥有项目 OWNER 成员关系后可审批本人负责项目的加入申请；租户管理员处理本租户加入与创建申请，平台管理员处理全平台待办。"
         />
       ) : null}
 

@@ -13,6 +13,7 @@ import { Observability } from "@/pages/Observability";
 import { Permissions } from "@/pages/Permissions";
 import { Quality } from "@/pages/Quality";
 import { Tasks } from "@/pages/Tasks";
+import { TenantManagement } from "@/pages/TenantManagement";
 
 export const router = createBrowserRouter([
   { path: "/login", element: <Login /> },
@@ -35,6 +36,7 @@ export const router = createBrowserRouter([
       { path: "approvals", element: <ApprovalCenter /> },
       { path: "observability", element: <Observability /> },
       { path: "permissions", element: <Permissions /> },
+      { path: "tenants", element: <TenantManagement /> },
       { path: "closure", element: <Closure /> },
     ],
   },
