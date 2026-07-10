@@ -43,7 +43,7 @@ const navItems: Array<NavItem & { menuCode: string }> = [
 ];
 
 const fallbackMenuCodesByRole: Record<string, string[]> = {
-  ORDINARY_USER: ["dashboard", "datasource", "data-sync", "task", "approval-center", "project-members"],
+  ORDINARY_USER: ["dashboard", "datasource", "data-sync", "task", "agent-runtime", "approval-center", "project-members"],
   PROJECT_OWNER: ["dashboard", "datasource", "data-sync", "task", "quality", "agent-runtime", "approval-center", "project-members"],
   OPERATOR: ["dashboard", "data-sync", "task", "observability", "approval-center", "project-members"],
   AUDITOR: ["dashboard", "agent-runtime", "observability", "project-members"],

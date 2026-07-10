@@ -1142,6 +1142,22 @@ export interface AgentToolExecutionAudit {
   updateTime?: string;
 }
 
+export interface AgentRunConfirmedExecutionResponse {
+  sessionId: string;
+  runId: string;
+  runState: string;
+  plannedCount: number;
+  succeededCount: number;
+  failedCount: number;
+  toolResults: AgentToolExecutionResult[];
+  nextActions: string[];
+}
+
+export interface AgentToolExecutionResult {
+  audit: AgentToolExecutionAudit;
+  output: JsonObject;
+}
+
 export interface AgentRagCitation {
   title?: string;
   source?: string;

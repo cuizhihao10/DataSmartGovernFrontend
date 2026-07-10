@@ -1,7 +1,7 @@
 import { createBrowserRouter, Navigate } from "react-router-dom";
 import { ProtectedRoute } from "@/auth/ProtectedRoute";
 import { ConsoleLayout } from "@/components/ConsoleLayout";
-import { AgentConsole } from "@/pages/AgentConsole";
+import { AgentAssistant } from "@/pages/AgentAssistant";
 import { ApprovalCenter } from "@/pages/ApprovalCenter";
 import { AuthCallback } from "@/pages/AuthCallback";
 import { Closure } from "@/pages/Closure";
@@ -33,7 +33,7 @@ export const router = createBrowserRouter([
       { path: "sync", element: <DataSync /> },
       { path: "tasks", element: <Tasks /> },
       { path: "quality", element: <Quality /> },
-      { path: "agent", element: <AgentConsole /> },
+      { path: "agent", element: <AgentAssistant /> },
       { path: "approvals", element: <ApprovalCenter /> },
       { path: "project-members", element: <ProjectMembers /> },
       { path: "observability", element: <Observability /> },

@@ -16,6 +16,7 @@ import type {
   AgentPlanResponse,
   AgentRagQueryResult,
   AgentRun,
+  AgentRunConfirmedExecutionResponse,
   AgentSession,
   AgentTool,
   AgentToolBinding,
@@ -692,6 +693,11 @@ export interface AgentRagQueryPayload {
   generateAnswer?: boolean;
   traceId?: string;
   sessionId?: string;
+}
+
+export interface ConfirmAgentRunPayload {
+  confirmed: true;
+  comment?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2596,6 +2602,11 @@ export const api = {
     request<Record<string, unknown>>(`/agent/sessions/${sessionId}/runs/${runId}/tool-executions/dag-plan`),
   getAgentAsyncCommandPlans: (sessionId: string, runId: string) =>
     request<Record<string, unknown>>(`/agent/sessions/${sessionId}/runs/${runId}/tool-executions/async-command-plans`),
+  confirmAndExecuteAgentRun: (sessionId: string, runId: string, payload: ConfirmAgentRunPayload) =>
+    postJson<AgentRunConfirmedExecutionResponse>(
+      `/agent/sessions/${sessionId}/runs/${runId}/confirm-and-execute`,
+      payload,
+    ),
   createAgentPlan: async (payload: CreateAgentPlanPayload) => {
     const result = await postJson<unknown>("/agent/plans", payload);
     return {
