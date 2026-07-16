@@ -14,6 +14,9 @@ import type {
   AgentModelRoute,
   AgentPlanCore,
   AgentPlanResponse,
+  AgentConversation,
+  AgentClarificationQuestion,
+  AgentStructuredIntent,
   AgentRagQueryResult,
   AgentRun,
   AgentRunConfirmedExecutionResponse,
@@ -1968,6 +1971,58 @@ function normalizeAgentPlanCore(value: unknown): AgentPlanCore | undefined {
   };
 }
 
+function normalizeAgentClarificationQuestion(value: unknown): AgentClarificationQuestion {
+  const record = readRecord(value);
+  return {
+    parameterName: readString(record.parameterName),
+    fieldPath: readString(record.fieldPath),
+    label: readString(record.label),
+    question: readString(record.question),
+    inputType: readString(record.inputType, "TEXT"),
+    required: readBoolean(record.required, true),
+    sensitive: readBoolean(record.sensitive),
+  };
+}
+
+function normalizeAgentStructuredIntent(value: unknown): AgentStructuredIntent {
+  const record = readRecord(value);
+  return {
+    intentType: readString(record.intentType, "GENERAL_GOVERNANCE_REQUEST"),
+    domains: readStringArray(record.domains),
+    candidateTools: readStringArray(record.candidateTools),
+    riskTags: readStringArray(record.riskTags),
+    confidence: readNumber(record.confidence),
+    summary: readOptionalString(record.summary),
+    syncMode: readOptionalString(record.syncMode),
+    writeStrategy: readOptionalString(record.writeStrategy),
+    sourceDatasourceSelected: readBoolean(record.sourceDatasourceSelected),
+    targetDatasourceSelected: readBoolean(record.targetDatasourceSelected),
+    objectMappingCount: readNumber(record.objectMappingCount),
+  };
+}
+
+function normalizeAgentConversation(value: unknown): AgentConversation | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  return {
+    schemaVersion: readString(value.schemaVersion, "1.0"),
+    turnId: readOptionalString(value.turnId),
+    phase: readString(value.phase, "NO_EXECUTABLE_PLAN"),
+    assistantMessage: readString(value.assistantMessage),
+    structuredIntent: normalizeAgentStructuredIntent(value.structuredIntent),
+    missingParameters: readStringArray(value.missingParameters),
+    clarificationQuestions: Array.isArray(value.clarificationQuestions)
+      ? value.clarificationQuestions.map(normalizeAgentClarificationQuestion)
+      : [],
+    canExecute: readBoolean(value.canExecute),
+    controlPlaneIngested: readBoolean(value.controlPlaneIngested),
+    nextAction: readString(value.nextAction),
+    intentResolver: readRecord(value.intentResolver),
+    payloadPolicy: readOptionalString(value.payloadPolicy),
+  };
+}
+
 function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
   const record = readRecord(value);
   return {
@@ -1988,6 +2043,7 @@ function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
     agentExecutionSession: readRecord(record.agentExecutionSession),
     agentTurnRunner: readRecord(record.agentTurnRunner),
     agentMemoryRetrievalWorkflow: readRecord(record.agentMemoryRetrievalWorkflow),
+    agentConversation: normalizeAgentConversation(record.agentConversation),
     raw: record,
   };
 }

@@ -1085,6 +1085,45 @@ export interface AgentPlanCore {
   modelIntentSummary?: string;
 }
 
+export interface AgentClarificationQuestion {
+  parameterName: string;
+  fieldPath: string;
+  label: string;
+  question: string;
+  inputType: string;
+  required: boolean;
+  sensitive: boolean;
+}
+
+export interface AgentStructuredIntent {
+  intentType: string;
+  domains: string[];
+  candidateTools: string[];
+  riskTags: string[];
+  confidence: number;
+  summary?: string;
+  syncMode?: string;
+  writeStrategy?: string;
+  sourceDatasourceSelected: boolean;
+  targetDatasourceSelected: boolean;
+  objectMappingCount: number;
+}
+
+export interface AgentConversation {
+  schemaVersion: string;
+  turnId?: string;
+  phase: "WAITING_CLARIFICATION" | "READY_FOR_CONFIRMATION" | "NO_EXECUTABLE_PLAN" | string;
+  assistantMessage: string;
+  structuredIntent: AgentStructuredIntent;
+  missingParameters: string[];
+  clarificationQuestions: AgentClarificationQuestion[];
+  canExecute: boolean;
+  controlPlaneIngested: boolean;
+  nextAction: string;
+  intentResolver: JsonObject;
+  payloadPolicy?: string;
+}
+
 export interface AgentPlanResponse {
   plan?: AgentPlanCore;
   eventEnvelope?: JsonObject;
@@ -1103,6 +1142,7 @@ export interface AgentPlanResponse {
   agentExecutionSession?: JsonObject;
   agentTurnRunner?: JsonObject;
   agentMemoryRetrievalWorkflow?: JsonObject;
+  agentConversation?: AgentConversation;
   raw: JsonObject;
 }
 
@@ -1151,6 +1191,9 @@ export interface AgentRunConfirmedExecutionResponse {
   failedCount: number;
   toolResults: AgentToolExecutionResult[];
   nextActions: string[];
+  assistantReply: string;
+  answerMode: string;
+  modelProviderStatus: string;
 }
 
 export interface AgentToolExecutionResult {
