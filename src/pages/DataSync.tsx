@@ -2893,6 +2893,13 @@ export function DataSync() {
   const actorId = Number(currentSession?.actorId);
   const currentProjectRole = normalizeProjectRole(currentProject?.projectRole ?? currentProject?.role ?? currentSession?.actorRole);
   const canManageCurrentProject = currentProjectRole === "OWNER" || currentProjectRole === "MANAGER";
+  /*
+   * 创建“本人任务”不等同于管理整个项目。普通项目成员只要位于当前授权项目中，
+   * 就可以使用 owner 明确授予 USE/MANAGE 的数据源创建自己的同步任务；后端仍会分别校验
+   * 项目范围、源/目标数据源实例授权以及任务 ownerId，不会因此获得他人任务或项目管理权限。
+   */
+  const canCreateOwnTaskInCurrentProject = canManageCurrentProject
+    || currentSession?.authorizedProjectIds?.some((projectId) => String(projectId) === String(currentProjectId)) === true;
   const canManageExecutionPolicies = executionPolicyWriteRoles.has(
     String(currentSession?.actorRole || "").toUpperCase(),
   );
@@ -4438,7 +4445,7 @@ export function DataSync() {
             <Button aria-label="刷新同步数据" title="刷新同步数据" icon={<ReloadOutlined />} onClick={refetchAll} />
             <Button icon={<UploadOutlined />} disabled={!canManageCurrentProject} onClick={() => setImportOpen(true)}>导入任务定义</Button>
             <Button icon={<DownloadOutlined />} loading={exportMutation.isPending} onClick={() => exportMutation.mutate("CSV")}>导出任务定义</Button>
-            <Button type="primary" icon={<CloudSyncOutlined />} disabled={!canManageCurrentProject} onClick={openWizard}>新建同步任务</Button>
+            <Button type="primary" icon={<CloudSyncOutlined />} disabled={!canCreateOwnTaskInCurrentProject} onClick={openWizard}>新建同步任务</Button>
           </>
         }
       />
