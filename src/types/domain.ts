@@ -1124,6 +1124,25 @@ export interface AgentConversation {
   payloadPolicy?: string;
 }
 
+export interface AgentObservationTimelineItem {
+  id: string;
+  category: "MODEL" | "DECISION" | "GRAPH" | "TOOL" | "COMMAND" | string;
+  stage: string;
+  status: string;
+  title: string;
+  summary: string;
+  details: JsonObject;
+}
+
+export interface AgentObservationTimeline {
+  schemaVersion: string;
+  payloadPolicy?: string;
+  requestId?: string;
+  itemCount: number;
+  items: AgentObservationTimelineItem[];
+  hiddenByDesign: string[];
+}
+
 export interface AgentPlanResponse {
   plan?: AgentPlanCore;
   eventEnvelope?: JsonObject;
@@ -1143,6 +1162,7 @@ export interface AgentPlanResponse {
   agentTurnRunner?: JsonObject;
   agentMemoryRetrievalWorkflow?: JsonObject;
   agentConversation?: AgentConversation;
+  agentObservationTimeline?: AgentObservationTimeline;
   raw: JsonObject;
 }
 

@@ -1,23 +1,30 @@
 import {
   ArrowRightOutlined,
+  ApiOutlined,
+  BranchesOutlined,
   CheckCircleOutlined,
+  CodeOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   PlusOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
+  ToolOutlined,
 } from "@ant-design/icons";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Alert,
   Button,
   Card,
+  Collapse,
+  Descriptions,
   Form,
   Input,
   Select,
   Space,
   Steps,
   Tag,
+  Timeline,
   Tooltip,
   Typography,
   message,
@@ -31,6 +38,7 @@ import { useAuthStore } from "@/store/authStore";
 import { useUiStore } from "@/store/uiStore";
 import type {
   AgentPlanResponse,
+  AgentObservationTimelineItem,
   AgentToolExecutionAudit,
   AgentToolExecutionResult,
 } from "@/types/domain";
@@ -95,6 +103,15 @@ function textField(record: Record<string, unknown> | undefined, key: string) {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+function booleanField(record: Record<string, unknown> | undefined, key: string) {
+  return record?.[key] === true;
+}
+
+function numberField(record: Record<string, unknown> | undefined, key: string) {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "请求失败，请查看详细错误后重试";
 }
@@ -105,6 +122,40 @@ function statusColor(state?: string) {
   if (state === "WAITING_APPROVAL" || state === "WAITING_HUMAN") return "gold";
   if (state === "EXECUTING" || state === "TOOL_CALLING") return "blue";
   return "default";
+}
+
+function observationColor(status: string) {
+  if (status === "SUCCEEDED" || status === "READY") return "green";
+  if (status === "FAILED") return "red";
+  if (status === "FALLBACK" || status === "WAITING") return "orange";
+  if (status === "PLANNED") return "blue";
+  return "gray";
+}
+
+function observationIcon(category: string) {
+  if (category === "MODEL") return <RobotOutlined />;
+  if (category === "DECISION") return <ApiOutlined />;
+  if (category === "TOOL") return <ToolOutlined />;
+  if (category === "COMMAND") return <CodeOutlined />;
+  return <BranchesOutlined />;
+}
+
+function observationCategory(category: string) {
+  return {
+    MODEL: "模型",
+    DECISION: "决策",
+    GRAPH: "状态图",
+    TOOL: "工具",
+    COMMAND: "命令",
+  }[category] || category;
+}
+
+function formatObservationValue(value: unknown) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (Array.isArray(value)) return value.length ? value.join("、") : "无";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 function UserAgentAssistant() {
@@ -156,7 +207,7 @@ function UserAgentAssistant() {
     enabled: Boolean(controlPlane?.sessionId && controlPlane?.runId),
     refetchInterval: controlPlane && !executionAnswer ? 3000 : false,
   });
-  const audits = auditsQuery.data?.data ?? [];
+  const audits = useMemo(() => auditsQuery.data?.data ?? [], [auditsQuery.data?.data]);
 
   const planMutation = useMutation({
     mutationFn: async (submission: PlanSubmission) => {
@@ -166,6 +217,9 @@ function UserAgentAssistant() {
       const variables: Record<string, unknown> = {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
+        // 当前计划接口是同步 HTTP 响应，关闭 token streaming 后统一经过 ModelQueryEngine，
+        // 才能完整记录限流、重试、fallback、耗时和 token 用量；实时 token 流留给 WebSocket 会话入口。
+        streamModelIntent: false,
       };
       if (submission.clarification) {
         variables.dataSyncRequest = {
@@ -268,6 +322,34 @@ function UserAgentAssistant() {
   const hasDatasourceOptions = sourceOptions.length > 0 && targetOptions.length > 0;
   const syncMode = conversation?.structuredIntent.syncMode || "FULL";
   const resolverMode = textField(conversation?.intentResolver, "mode");
+  const modelProvider = textField(conversation?.intentResolver, "modelProvider");
+  const modelName = textField(conversation?.intentResolver, "modelName");
+  const modelInvoked = booleanField(conversation?.intentResolver, "providerInvokedForCurrentTurn");
+  const modelSucceeded = booleanField(conversation?.intentResolver, "providerSucceededForCurrentTurn");
+  const modelLatencyMs = numberField(conversation?.intentResolver, "latencyMs");
+  const modelTotalTokens = numberField(conversation?.intentResolver, "totalTokens");
+  const modelFallbackReason = textField(conversation?.intentResolver, "fallbackReasonCode");
+  const observationItems = useMemo<AgentObservationTimelineItem[]>(() => {
+    const planningItems = plan?.agentObservationTimeline?.items ?? [];
+    const executionItems = audits.map((audit, index) => ({
+      id: `execution-${audit.auditId}`,
+      category: "TOOL",
+      stage: "execute_java_tool",
+      status: audit.state,
+      title: audit.toolCode,
+      summary: audit.message || audit.planReason || "Java Agent Runtime 正在处理工具节点。",
+      details: {
+        sequence: index + 1,
+        auditId: audit.auditId,
+        targetService: audit.targetService,
+        executionMode: audit.executionMode,
+        riskLevel: audit.riskLevel,
+        readOnly: audit.readOnly,
+        idempotent: audit.idempotent,
+      },
+    } satisfies AgentObservationTimelineItem));
+    return [...planningItems, ...executionItems];
+  }, [audits, plan?.agentObservationTimeline?.items]);
   const projectUnavailableMessage = sessionQuery.isError
     ? "登录或项目上下文加载失败，请刷新页面后重试"
     : "请先在页面顶部选择一个项目";
@@ -339,11 +421,24 @@ function UserAgentAssistant() {
               {conversation.structuredIntent.syncMode ? (
                 <Tag color="cyan">{syncModeLabels[syncMode] || syncMode}</Tag>
               ) : null}
-              <Tag>置信度 {Math.round(conversation.structuredIntent.confidence * 100)}%</Tag>
-              <Tag color={resolverMode === "DETERMINISTIC_FALLBACK" ? "gold" : "green"}>
-                {resolverMode === "DETERMINISTIC_FALLBACK" ? "规则兜底解析" : resolverMode}
+              <Tag>规则置信度 {Math.round(conversation.structuredIntent.confidence * 100)}%</Tag>
+              <Tag color={modelSucceeded ? "green" : "gold"}>
+                {modelSucceeded ? "真实模型已参与" : modelInvoked ? "模型失败，规则降级" : "仅规则解析"}
               </Tag>
+              {modelProvider ? <Tag color="geekblue">{modelProvider}</Tag> : null}
+              {modelName ? <Tag color="blue">{modelName}</Tag> : null}
+              {modelLatencyMs !== undefined ? <Tag>{modelLatencyMs} ms</Tag> : null}
+              {modelTotalTokens !== undefined ? <Tag>{modelTotalTokens} tokens</Tag> : null}
             </Space>
+            {!modelSucceeded ? (
+              <Alert
+                showIcon
+                type="warning"
+                style={{ marginTop: 12 }}
+                message={modelInvoked ? "真实模型调用失败，本轮已安全降级" : "本轮没有调用真实模型"}
+                description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
+              />
+            ) : null}
           </Card>
 
           <Card title="结构化意图" className="compact-card">
@@ -361,6 +456,60 @@ function UserAgentAssistant() {
             </Space>
           </Card>
         </div>
+      ) : null}
+
+      {observationItems.length ? (
+        <Card
+          title="Agent 决策与执行时间线"
+          className="compact-card"
+          extra={<Tag color="cyan">不展示隐藏思维链</Tag>}
+        >
+          <Alert
+            showIcon
+            type="info"
+            message="这里展示可验证的执行事实"
+            description="包含模型是否真实调用、结构化决策、LangGraph 节点、工具计划、控制面命令和执行结果；系统提示词、隐藏推理、凭据与原始参数不会展示。"
+            style={{ marginBottom: 20 }}
+          />
+          <Timeline
+            items={observationItems.map((item) => ({
+              color: observationColor(item.status),
+              dot: observationIcon(item.category),
+              children: (
+                <div style={{ paddingBottom: 6 }}>
+                  <Space wrap>
+                    <Typography.Text strong>{item.title}</Typography.Text>
+                    <Tag color="blue">{observationCategory(item.category)}</Tag>
+                    <Tag color={observationColor(item.status)}>{item.status}</Tag>
+                    {item.stage ? <Typography.Text type="secondary">{item.stage}</Typography.Text> : null}
+                  </Space>
+                  <Typography.Paragraph style={{ margin: "8px 0" }}>{item.summary}</Typography.Paragraph>
+                  {Object.keys(item.details).length ? (
+                    <Collapse
+                      ghost
+                      size="small"
+                      items={[{
+                        key: `${item.id}-details`,
+                        label: "查看调用与治理详情",
+                        children: (
+                          <Descriptions
+                            size="small"
+                            column={{ xs: 1, sm: 2, lg: 3 }}
+                            items={Object.entries(item.details).map(([key, value]) => ({
+                              key,
+                              label: key,
+                              children: formatObservationValue(value),
+                            }))}
+                          />
+                        ),
+                      }]}
+                    />
+                  ) : null}
+                </div>
+              ),
+            }))}
+          />
+        </Card>
       ) : null}
 
       {conversation?.phase === "WAITING_CLARIFICATION" ? (

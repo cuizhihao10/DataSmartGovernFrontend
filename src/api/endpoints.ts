@@ -12,6 +12,7 @@ import {
 import type {
   ApprovalCenterRecord,
   AgentModelRoute,
+  AgentObservationTimeline,
   AgentPlanCore,
   AgentPlanResponse,
   AgentConversation,
@@ -2023,6 +2024,33 @@ function normalizeAgentConversation(value: unknown): AgentConversation | undefin
   };
 }
 
+function normalizeAgentObservationTimeline(value: unknown): AgentObservationTimeline | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const rawItems = Array.isArray(value.items) ? value.items : [];
+  const items = rawItems.map((item, index) => {
+    const record = readRecord(item);
+    return {
+      id: readString(record.id, `observation-${index + 1}`),
+      category: readString(record.category, "GRAPH"),
+      stage: readString(record.stage),
+      status: readString(record.status, "UNKNOWN"),
+      title: readString(record.title, `观察项 ${index + 1}`),
+      summary: readString(record.summary),
+      details: readRecord(record.details),
+    };
+  });
+  return {
+    schemaVersion: readString(value.schemaVersion, "datasmart.agent-observation-timeline.v1"),
+    payloadPolicy: readOptionalString(value.payloadPolicy),
+    requestId: readOptionalString(value.requestId),
+    itemCount: readNumber(value.itemCount, items.length),
+    items,
+    hiddenByDesign: readStringArray(value.hiddenByDesign),
+  };
+}
+
 function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
   const record = readRecord(value);
   return {
@@ -2044,6 +2072,7 @@ function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
     agentTurnRunner: readRecord(record.agentTurnRunner),
     agentMemoryRetrievalWorkflow: readRecord(record.agentMemoryRetrievalWorkflow),
     agentConversation: normalizeAgentConversation(record.agentConversation),
+    agentObservationTimeline: normalizeAgentObservationTimeline(record.agentObservationTimeline),
     raw: record,
   };
 }
