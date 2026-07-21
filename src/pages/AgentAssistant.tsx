@@ -129,7 +129,7 @@ function statusColor(state?: string) {
 }
 
 function observationColor(status: string) {
-  if (status === "SUCCEEDED" || status === "READY" || status === "LOADED") return "green";
+  if (["SUCCEEDED", "READY", "LOADED", "CACHED"].includes(status)) return "green";
   if (status === "FAILED" || status === "BLOCKED") return "red";
   if (["FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED"].includes(status)) return "orange";
   if (["PLANNED", "EXECUTING", "TOOL_CALLING", "RUNNING", "QUEUED", "PENDING"].includes(status)) return "blue";
@@ -179,6 +179,7 @@ function observationStatus(status: string) {
     BLOCKED: "已阻止",
     FAILED: "失败",
     FALLBACK: "已降级",
+    CACHED: "已命中缓存",
     SKIPPED: "未调用",
   }[status] || status;
 }
@@ -242,14 +243,18 @@ function observationDetailLabel(key: string) {
   return {
     provider: "模型 Provider",
     model: "模型",
-    latencyMs: "调用耗时",
+    latencyMs: "本次响应耗时",
+    providerLatencyMs: "原始 Provider 耗时",
+    responseSource: "本次响应来源",
+    responseAvailable: "公开回复可用",
     promptTokens: "输入 Token",
     completionTokens: "输出 Token",
     totalTokens: "总 Token",
     toolCallCount: "模型建议工具数",
     proposedToolNames: "模型建议工具",
     attemptCount: "调用尝试次数",
-    cacheHit: "命中缓存",
+    cacheHit: "DataSmart 完整响应缓存",
+    cachedPromptTokens: "Provider 缓存输入 Token",
     fallbackUsed: "是否降级",
     errorCode: "错误码",
     strategySummary: "策略摘要",
@@ -298,12 +303,28 @@ function observationDetailLabel(key: string) {
     outputSummary: "执行结果摘要",
     readOnly: "只读调用",
     idempotent: "支持幂等",
+    modelRequestObjective: "发送给模型的用户目标",
+    modelInstructionSummary: "发送给模型的公开指令摘要",
+    modelMessageShape: "模型消息组成",
+    modelStructuredBaseline: "发送给模型的权威结构化基线",
+    modelVisibleToolNames: "模型实际可见工具",
+    modelContextTitles: "模型可见上下文标题",
+    modelPublicResponse: "模型完整公开回复（已脱敏）",
+    modelSecondTurnResponse: "工具反馈后二轮公开回复（已脱敏）",
+    toolSelectionSource: "最终工具选择来源",
+    modelGeneratedToolCount: "模型原生建议工具数",
+    modelGeneratedToolNames: "模型原生建议工具",
+    ruleGeneratedToolCount: "系统规则补充工具数",
+    ruleGeneratedToolNames: "系统规则补充工具",
+    finalToolCount: "最终工具数",
+    finalToolNames: "最终采用工具",
+    planningSource: "该工具计划来源",
   }[key] || key;
 }
 
 function observationDetailsTitle(category: string) {
   return {
-    MODEL: "查看模型调用信息",
+    MODEL: "查看发送给模型的内容与模型公开回复",
     DECISION: "查看策略与安全约束",
     SKILL: "查看 Skill 加载详情",
     ORCHESTRATION: "查看编排摘要",
@@ -317,8 +338,24 @@ function observationDetailsTitle(category: string) {
 function formatObservationValue(value: unknown, key?: string) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "boolean") return value ? "是" : "否";
-  if (key === "latencyMs" && typeof value === "number") return `${value} ms`;
+  if ((key === "latencyMs" || key === "providerLatencyMs") && typeof value === "number") return `${value} ms`;
   if (key === "elapsedSeconds" && typeof value === "number") return `${value} 秒`;
+  if ((key === "toolSelectionSource" || key === "planningSource") && typeof value === "string") {
+    return {
+      MODEL_AND_SYSTEM_RULE_MERGED: "模型建议与系统安全基线合并",
+      MODEL_PROPOSED: "模型原生工具建议",
+      SYSTEM_RULE_FALLBACK: "系统确定性规则兜底",
+      MODEL_OVERRIDE_RULE_BASELINE: "模型建议覆盖同名规则基线",
+      NO_TOOL_SELECTED: "本轮未选择工具",
+      FINAL_PLAN: "最终受治理计划",
+    }[value] || value;
+  }
+  if (key === "responseSource" && typeof value === "string") {
+    return {
+      MODEL_PROVIDER: "真实模型 Provider",
+      DATASMART_RESULT_CACHE: "DataSmart 会话响应缓存",
+    }[value] || value;
+  }
   if (Array.isArray(value)) return value.length ? value.join("、") : "无";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
@@ -334,6 +371,9 @@ function UserAgentAssistant() {
   const [clarificationForm] = Form.useForm<ClarificationFormValues>();
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const [objective, setObjective] = useState(defaultObjective);
+  // 同一个助手页面生命周期内复用稳定会话 ID，使 SESSION_ONLY 模型响应缓存具备安全命中条件。
+  // 缓存 key 仍包含租户、项目、模型、工具集合和完整消息摘要，不会把不同问题误命中为同一响应。
+  const [agentConversationSessionId] = useState(() => crypto.randomUUID());
   const [controlPlane, setControlPlane] = useState<{ sessionId: string; runId: string }>();
   const [plan, setPlan] = useState<AgentPlanResponse>();
   const [liveObservationItems, setLiveObservationItems] = useState<AgentObservationTimelineItem[]>([]);
@@ -430,6 +470,8 @@ function UserAgentAssistant() {
       const variables: Record<string, unknown> = {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
+        sessionId: agentConversationSessionId,
+        cacheKeyScope: "session_only",
         // NDJSON 只流式传输可审计的阶段事实；模型 token 流保持关闭，以便查询引擎完整治理
         // 限流、重试、fallback 和用量，同时避免向用户暴露原始模型推理。
         streamModelIntent: false,
@@ -743,7 +785,9 @@ function UserAgentAssistant() {
                       <Tag color="blue">{observationCategory(item.category)}</Tag>
                       <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
                     </Space>
-                    <Typography.Paragraph style={{ margin: "8px 0" }}>{item.summary}</Typography.Paragraph>
+                    <Typography.Paragraph style={{ margin: "8px 0", whiteSpace: "pre-wrap" }}>
+                      {item.summary}
+                    </Typography.Paragraph>
                     {needsInput ? (
                       <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-clarification-card")}>
                         补充执行信息
