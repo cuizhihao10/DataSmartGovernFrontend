@@ -119,6 +119,21 @@ function fallbackHttpErrorMessage(payload: unknown, status: number) {
   if (status === 401) {
     return "登录状态已过期或无效，请重新登录后再继续操作。";
   }
+  /*
+   * Gateway 容器发布或短暂重启时，前置 Nginx 可能返回自己的 HTML 错误页。HTML 不是业务错误
+   * 详情，直接放进 Alert/Message 既无法帮助用户，也会把整段 `<html>...` 暴露到页面。
+   * 这里只对非平台信封的网关类状态做低敏归一化；Java/Python 返回的结构化 JSON 仍由上面的
+   * platformErrorMessage 展示真实原因、修复建议和 traceId。
+   */
+  if (status === 502) {
+    return "服务网关暂时无法连接后端，请稍后重试；系统可能正在发布或恢复服务。";
+  }
+  if (status === 503) {
+    return "服务暂时不可用，请稍后重试；如果持续出现，请联系管理员检查服务健康状态。";
+  }
+  if (status === 504) {
+    return "服务处理超时，请稍后重试；本次请求尚未获得后端确认。";
+  }
   if (isRecord(payload)) {
     const message = typeof payload.message === "string" ? payload.message : undefined;
     const error = typeof payload.error === "string" ? payload.error : undefined;
@@ -126,7 +141,10 @@ function fallbackHttpErrorMessage(payload: unknown, status: number) {
     return [message || error || `HTTP ${status}`, path ? `path: ${path}` : ""].filter(Boolean).join("；");
   }
   if (typeof payload === "string" && payload.trim()) {
-    return payload.trim();
+    const text = payload.trim();
+    return /<\/?(?:html|head|body|title|center|h1)\b/i.test(text)
+      ? `服务请求失败（HTTP ${status}），请稍后重试。`
+      : text;
   }
   return `HTTP ${status}`;
 }

@@ -18,6 +18,7 @@ import {
   Space,
   Steps,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from "antd";
@@ -267,6 +268,9 @@ function UserAgentAssistant() {
   const hasDatasourceOptions = sourceOptions.length > 0 && targetOptions.length > 0;
   const syncMode = conversation?.structuredIntent.syncMode || "FULL";
   const resolverMode = textField(conversation?.intentResolver, "mode");
+  const projectUnavailableMessage = sessionQuery.isError
+    ? "登录或项目上下文加载失败，请刷新页面后重试"
+    : "请先在页面顶部选择一个项目";
 
   const submitObjective = (values: ObjectiveFormValues) => {
     setObjective(values.objective);
@@ -306,15 +310,19 @@ function UserAgentAssistant() {
               placeholder="例如：把两张客户测试表从 MySQL 全量同步到 PostgreSQL public schema"
             />
           </Form.Item>
-          <Button
-            type="primary"
-            htmlType="submit"
-            icon={<RobotOutlined />}
-            loading={planMutation.isPending && !planMutation.variables?.clarification}
-            disabled={!projectId}
-          >
-            发送给 Agent
-          </Button>
+          <Tooltip title={!projectId ? projectUnavailableMessage : undefined}>
+            <span>
+              <Button
+                type="primary"
+                htmlType="submit"
+                icon={<RobotOutlined />}
+                loading={planMutation.isPending && !planMutation.variables?.clarification}
+                disabled={!projectId}
+              >
+                发送给 Agent
+              </Button>
+            </span>
+          </Tooltip>
         </Form>
       </Card>
 
