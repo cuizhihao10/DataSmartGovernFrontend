@@ -123,6 +123,23 @@ export interface DataSourceListParams {
   keyword?: string;
 }
 
+/**
+ * Convert the console-facing datasource lifecycle into the datasource service query vocabulary.
+ * Responses are normalized from ACTIVE/INACTIVE to ENABLED/DISABLED for UI consistency, so list filters must apply
+ * the inverse conversion before crossing the API boundary. Keeping it here prevents Agent and task selectors from
+ * implementing subtly different datasource visibility rules.
+ */
+function toDatasourceQueryStatus(status: string | undefined) {
+  const normalized = status?.trim().toUpperCase();
+  if (normalized === "ENABLED") {
+    return "ACTIVE";
+  }
+  if (normalized === "DISABLED") {
+    return "INACTIVE";
+  }
+  return normalized || undefined;
+}
+
 export interface GovernanceTaskListParams {
   current?: number;
   size?: number;
@@ -2354,7 +2371,12 @@ export const api = {
   discoverDataSourceMetadata: (id: number, payload: MetadataDiscoveryPayload) =>
     postJson<DataSourceMetadataDiscoveryResult>(`/datasource/datasources/${id}/metadata/discover`, payload),
   listDataSources: (params?: DataSourceListParams) => {
-    const query = compactQueryString({ current: 1, size: 50, ...params });
+    const query = compactQueryString({
+      current: 1,
+      size: 50,
+      ...params,
+      status: toDatasourceQueryStatus(params?.status),
+    });
     return pageEndpoint<DataSourceRecord>(`/datasource/datasources?${query}`, dataSources, normalizeDataSource);
   },
   listDataSourceAuthorizations: (datasourceId: number, params?: { current?: number; size?: number; subjectType?: string; status?: string }) => {
