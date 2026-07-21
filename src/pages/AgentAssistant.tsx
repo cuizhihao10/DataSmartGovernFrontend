@@ -35,6 +35,7 @@ import {
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "@/api/endpoints";
+import type { AgentPlanStreamFrame, AgentPlanStreamProgressEvent } from "@/api/endpoints";
 import { PageHeader } from "@/components/PageHeader";
 import { AgentConsole } from "@/pages/AgentConsole";
 import { useAuthStore } from "@/store/authStore";
@@ -131,7 +132,7 @@ function observationColor(status: string) {
   if (status === "SUCCEEDED" || status === "READY" || status === "LOADED") return "green";
   if (status === "FAILED" || status === "BLOCKED") return "red";
   if (["FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED"].includes(status)) return "orange";
-  if (status === "PLANNED" || status === "EXECUTING" || status === "TOOL_CALLING") return "blue";
+  if (["PLANNED", "EXECUTING", "TOOL_CALLING", "RUNNING", "QUEUED", "PENDING"].includes(status)) return "blue";
   return "gray";
 }
 
@@ -167,6 +168,9 @@ function observationStatus(status: string) {
     PLANNED: "已规划",
     EXECUTING: "执行中",
     TOOL_CALLING: "调用中",
+    RUNNING: "进行中",
+    QUEUED: "排队中",
+    PENDING: "等待执行",
     WAITING: "等待中",
     WAITING_INPUT: "等待补充信息",
     WAITING_APPROVAL: "等待确认",
@@ -177,6 +181,61 @@ function observationStatus(status: string) {
     FALLBACK: "已降级",
     SKIPPED: "未调用",
   }[status] || status;
+}
+
+function streamEventPresentation(event: AgentPlanStreamProgressEvent) {
+  const presentations: Record<string, { category: string; title: string; status?: string }> = {
+    agent_plan_started: { category: "ORCHESTRATION", title: "接收目标并启动 LangGraph", status: "RUNNING" },
+    context_collected: { category: "ORCHESTRATION", title: "收集项目上下文" },
+    context_filtered: { category: "ORCHESTRATION", title: "过滤无权或无关上下文" },
+    context_deduplicated: { category: "ORCHESTRATION", title: "合并重复上下文" },
+    context_truncated: { category: "ORCHESTRATION", title: "压缩上下文" },
+    context_micro_compacted: { category: "ORCHESTRATION", title: "执行微压缩" },
+    context_selected: { category: "ORCHESTRATION", title: "完成受控上下文构建" },
+    model_gateway_routed: { category: "MODEL", title: "选择模型路由与治理策略" },
+    intent_analyzed: { category: "DECISION", title: "形成规则安全基线" },
+    skill_admission_evaluated: { category: "SKILL", title: "加载并校验 Skill" },
+    model_query_started: { category: "MODEL", title: "调用真实模型", status: "RUNNING" },
+    model_query_executed: { category: "MODEL", title: "真实模型调用完成" },
+    model_tool_call_proposed: { category: "TOOL", title: "模型提出工具调用" },
+    model_tool_call_accepted: { category: "TOOL", title: "工具建议通过治理" },
+    model_tool_call_rejected: { category: "PERMISSION", title: "工具建议被安全门禁拒绝", status: "BLOCKED" },
+    model_tool_call_approval_required: { category: "PERMISSION", title: "工具调用等待用户确认", status: "WAITING_APPROVAL" },
+    model_tool_call_budget_guarded: { category: "PERMISSION", title: "执行工具预算门禁" },
+    tool_planned: { category: "TOOL", title: "生成工具执行计划" },
+    tool_parameter_validated: { category: "USER_ACTION", title: "校验工具执行参数", status: "WAITING_INPUT" },
+    memory_retrieved: { category: "ORCHESTRATION", title: "检索受控记忆" },
+    approval_waiting: { category: "PERMISSION", title: "等待用户确认", status: "WAITING_APPROVAL" },
+    agent_plan_completed: { category: "ORCHESTRATION", title: "完成本轮受控规划" },
+  };
+  return presentations[event.eventType] || {
+    category: "ORCHESTRATION",
+    title: event.stage || event.eventType,
+  };
+}
+
+function streamEventToObservation(event: AgentPlanStreamProgressEvent): AgentObservationTimelineItem {
+  const presentation = streamEventPresentation(event);
+  const eventFailed = event.severity?.toLowerCase() === "error";
+  const eventWarning = event.severity?.toLowerCase() === "warning";
+  const isModelStage = event.stage === "invoke_model_intent";
+  // 规则分析器的 confidence 是内部启发式匹配分，不是模型校准置信度，也不适合驱动用户决策。
+  // 工作过程只展示可验证的领域、候选工具、风险和缺参事实，避免把固定分值误读成 AI 自信程度。
+  const publicAttributes = Object.fromEntries(
+    Object.entries(event.attributes || {}).filter(([key]) => !["confidence", "ruleConfidence"].includes(key)),
+  );
+  return {
+    id: isModelStage ? "live-model-invocation" : `live-${event.eventType}-${event.sequence ?? event.stage}`,
+    category: presentation.category,
+    stage: event.stage,
+    status: eventFailed ? "FAILED" : presentation.status || (eventWarning ? "FALLBACK" : "SUCCEEDED"),
+    title: presentation.title,
+    summary: event.message,
+    details: {
+      ...publicAttributes,
+      occurredAt: event.createdAt,
+    },
+  };
 }
 
 function observationDetailLabel(key: string) {
@@ -194,7 +253,11 @@ function observationDetailLabel(key: string) {
     fallbackUsed: "是否降级",
     errorCode: "错误码",
     strategySummary: "策略摘要",
-    ruleConfidence: "规则解析置信度",
+    selectedProviderName: "模型 Provider",
+    selectedModelName: "模型",
+    visibleToolCount: "可见工具数",
+    occurredAt: "发生时间",
+    elapsedSeconds: "已等待时长",
     domains: "业务域",
     candidateTools: "候选工具",
     riskTags: "风险标签",
@@ -255,7 +318,7 @@ function formatObservationValue(value: unknown, key?: string) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "boolean") return value ? "是" : "否";
   if (key === "latencyMs" && typeof value === "number") return `${value} ms`;
-  if (key === "ruleConfidence" && typeof value === "number") return `${Math.round(value * 100)}%`;
+  if (key === "elapsedSeconds" && typeof value === "number") return `${value} 秒`;
   if (Array.isArray(value)) return value.length ? value.join("、") : "无";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
@@ -273,6 +336,9 @@ function UserAgentAssistant() {
   const [objective, setObjective] = useState(defaultObjective);
   const [controlPlane, setControlPlane] = useState<{ sessionId: string; runId: string }>();
   const [plan, setPlan] = useState<AgentPlanResponse>();
+  const [liveObservationItems, setLiveObservationItems] = useState<AgentObservationTimelineItem[]>([]);
+  const [liveRequestId, setLiveRequestId] = useState<string>();
+  const [executionInProgress, setExecutionInProgress] = useState(false);
   const [executionResults, setExecutionResults] = useState<AgentToolExecutionResult[]>([]);
   const [executionAnswer, setExecutionAnswer] = useState<ExecutionAnswer>();
 
@@ -312,9 +378,49 @@ function UserAgentAssistant() {
     queryKey: ["agent-assistant-audits", controlPlane?.sessionId, controlPlane?.runId],
     queryFn: () => api.listAgentToolExecutions(controlPlane!.sessionId, controlPlane!.runId),
     enabled: Boolean(controlPlane?.sessionId && controlPlane?.runId),
-    refetchInterval: controlPlane && !executionAnswer ? 3000 : false,
+    // 用户确认执行后按 1 秒刷新真实工具审计，让正在执行和刚完成的节点及时进入时间线。
+    // 未开始执行时保留较低频率，避免等待确认阶段产生无意义的控制面压力。
+    refetchInterval: controlPlane && !executionAnswer ? (executionInProgress ? 1000 : 3000) : false,
   });
   const audits = useMemo(() => auditsQuery.data?.data ?? [], [auditsQuery.data?.data]);
+
+  const consumePlanStreamFrame = (frame: AgentPlanStreamFrame) => {
+    if (frame.requestId) setLiveRequestId(frame.requestId);
+    if (frame.type === "heartbeat") {
+      const elapsedSeconds = Math.max(1, Math.round((frame.elapsedMs ?? 0) / 1000));
+      setLiveObservationItems((current) => {
+        let runningIndex = -1;
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          if (current[index].status === "RUNNING") {
+            runningIndex = index;
+            break;
+          }
+        }
+        if (runningIndex < 0) return current;
+        const next = [...current];
+        const runningItem = current[runningIndex];
+        next[runningIndex] = {
+          ...runningItem,
+          summary: `当前步骤仍在进行，已等待 ${elapsedSeconds} 秒；连接正常，完成后会立即展示下一步。`,
+          details: {
+            ...runningItem.details,
+            elapsedSeconds,
+          },
+        };
+        return next;
+      });
+      return;
+    }
+    if (frame.type !== "progress" || !frame.event) return;
+    const item = streamEventToObservation(frame.event);
+    setLiveObservationItems((current) => {
+      const existingIndex = current.findIndex((candidate) => candidate.id === item.id);
+      if (existingIndex < 0) return [...current, item];
+      const next = [...current];
+      next[existingIndex] = item;
+      return next;
+    });
+  };
 
   const planMutation = useMutation({
     mutationFn: async (submission: PlanSubmission) => {
@@ -324,8 +430,8 @@ function UserAgentAssistant() {
       const variables: Record<string, unknown> = {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
-        // 当前计划接口是同步 HTTP 响应，关闭 token streaming 后统一经过 ModelQueryEngine，
-        // 才能完整记录限流、重试、fallback、耗时和 token 用量；实时 token 流留给 WebSocket 会话入口。
+        // NDJSON 只流式传输可审计的阶段事实；模型 token 流保持关闭，以便查询引擎完整治理
+        // 限流、重试、fallback 和用量，同时避免向用户暴露原始模型推理。
         streamModelIntent: false,
       };
       if (submission.clarification) {
@@ -346,15 +452,21 @@ function UserAgentAssistant() {
           })),
         };
       }
-      return api.createAgentPlan({
+      const requestId = crypto.randomUUID();
+      return api.createAgentPlanStream({
         tenant_id: String(session.tenantId),
         project_id: String(projectId),
         actor_id: String(session.actorId),
+        request_id: requestId,
         objective: submission.objective,
         preferred_workload: "agent_reasoning",
         locale: "zh-CN",
         variables,
-      });
+      }, consumePlanStreamFrame);
+    },
+    onMutate: () => {
+      setLiveObservationItems([]);
+      setLiveRequestId(undefined);
     },
     onSuccess: (result, submission) => {
       const nextPlan = result.data;
@@ -396,7 +508,22 @@ function UserAgentAssistant() {
       setControlPlane({ sessionId, runId });
       message.success("Agent 已生成可审计执行计划，请确认后执行");
     },
-    onError: (error) => message.error(errorMessage(error)),
+    onError: (error) => {
+      const summary = errorMessage(error);
+      setLiveObservationItems((current) => [
+        ...current.filter((item) => item.status !== "RUNNING"),
+        {
+          id: "live-plan-error",
+          category: "ORCHESTRATION",
+          stage: "agent_plan_failed",
+          status: "FAILED",
+          title: "Agent 规划失败",
+          summary,
+          details: { requestId: liveRequestId },
+        },
+      ]);
+      message.error(summary);
+    },
   });
 
   const executeMutation = useMutation({
@@ -407,6 +534,7 @@ function UserAgentAssistant() {
         comment: "用户在智能助手页面确认执行数据同步计划",
       });
     },
+    onMutate: () => setExecutionInProgress(true),
     onSuccess: async (result) => {
       setExecutionResults(result.data.toolResults);
       setExecutionAnswer({
@@ -422,6 +550,7 @@ function UserAgentAssistant() {
       await auditsQuery.refetch();
     },
     onError: (error) => message.error(errorMessage(error)),
+    onSettled: () => setExecutionInProgress(false),
   });
 
   const conversation = plan?.agentConversation;
@@ -438,6 +567,11 @@ function UserAgentAssistant() {
   const modelFallbackReason = textField(conversation?.intentResolver, "fallbackReasonCode");
   const observationItems = useMemo<AgentObservationTimelineItem[]>(() => {
     const planningItems = plan?.agentObservationTimeline?.items ?? [];
+    const finalizedStages = new Set(planningItems.map((item) => item.stage));
+    // 最终响应中的产品化摘要替换同阶段的临时事件；上下文等未被聚合覆盖的节点继续保留，便于完整回放。
+    const retainedLiveItems = liveObservationItems.filter((item) => (
+      item.status === "RUNNING" || !finalizedStages.has(item.stage)
+    ));
     const executionItems = audits.map((audit) => ({
       id: `execution-${audit.auditId}`,
       category: "TOOL",
@@ -457,8 +591,8 @@ function UserAgentAssistant() {
         errorCode: audit.errorCode,
       },
     } satisfies AgentObservationTimelineItem));
-    return [...planningItems, ...executionItems];
-  }, [audits, plan?.agentObservationTimeline?.items]);
+    return [...retainedLiveItems, ...planningItems, ...executionItems];
+  }, [audits, liveObservationItems, plan?.agentObservationTimeline?.items]);
   const projectUnavailableMessage = sessionQuery.isError
     ? "登录或项目上下文加载失败，请刷新页面后重试"
     : "请先在页面顶部选择一个项目";
@@ -466,6 +600,8 @@ function UserAgentAssistant() {
   const submitObjective = (values: ObjectiveFormValues) => {
     setObjective(values.objective);
     setPlan(undefined);
+    setLiveObservationItems([]);
+    setLiveRequestId(undefined);
     setControlPlane(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
@@ -517,7 +653,7 @@ function UserAgentAssistant() {
         </Form>
       </Card>
 
-      {planMutation.isPending && !planMutation.variables?.clarification ? (
+      {planMutation.isPending && !planMutation.variables?.clarification && liveObservationItems.length === 0 ? (
         <Card title="Agent 工作过程" className="compact-card">
           <Timeline
             items={[{
@@ -530,7 +666,7 @@ function UserAgentAssistant() {
                     <Tag color="blue">处理中</Tag>
                   </Space>
                   <Typography.Paragraph type="secondary" style={{ margin: "8px 0 0" }}>
-                    正在调用模型并结合当前项目权限、可用 Skill 和工具目录形成计划；响应完成后会展示真实过程事实。
+                    正在建立带认证的实时规划流；连接建立后，每个真实阶段会立即追加到下方工作过程。
                   </Typography.Paragraph>
                 </div>
               ),
@@ -575,13 +711,19 @@ function UserAgentAssistant() {
         <Card
           title="Agent 工作过程"
           className="compact-card"
-          extra={<Tag color="cyan">公开摘要，不展示隐藏思维链</Tag>}
+          extra={(
+            <Space wrap>
+              {planMutation.isPending ? <Tag color="processing" icon={<Spin size="small" />}>实时规划中</Tag> : null}
+              {liveRequestId ? <Tag>请求 {liveRequestId.slice(0, 8)}</Tag> : null}
+              <Tag color="cyan">公开摘要，不展示隐藏思维链</Tag>
+            </Space>
+          )}
         >
           <Alert
             showIcon
             type="info"
             message="这里展示真实、可操作、可审计的 Agent 工作过程"
-            description="包含模型公开决策摘要、Skill 加载、LangGraph 编排摘要、工具与命令调用、权限门禁、待补信息和执行结果；内部调试节点、系统提示词、隐藏推理、凭据与原始参数不会展示。"
+            description="节点完成后会立即出现，当前节点会保持“进行中”；包含模型公开决策摘要、Skill 加载、LangGraph 编排、工具与命令调用、权限门禁、待补信息和执行结果。系统提示词、隐藏推理、凭据与原始参数不会展示。"
             style={{ marginBottom: 20 }}
           />
           <Timeline
@@ -593,7 +735,7 @@ function UserAgentAssistant() {
               const needsConfirmation = item.category === "PERMISSION" && item.status === "WAITING_APPROVAL";
               return {
                 color: observationColor(item.status),
-                dot: observationIcon(item.category),
+                dot: item.status === "RUNNING" ? <Spin size="small" /> : observationIcon(item.category),
                 children: (
                   <div style={{ paddingBottom: 8 }}>
                     <Space wrap>

@@ -1,4 +1,4 @@
-import { ApiError, request, requestFile, requestForm, requestWithFallback } from "@/api/client";
+import { ApiError, request, requestFile, requestForm, requestWithFallback, streamJsonLines } from "@/api/client";
 import {
   dataSources,
   governanceTasks,
@@ -700,6 +700,29 @@ export interface CreateAgentPlanPayload {
   preferred_workload?: string;
   preferredWorkload?: string;
   locale?: string;
+  request_id?: string;
+}
+
+export interface AgentPlanStreamProgressEvent {
+  eventType: string;
+  stage: string;
+  message: string;
+  severity: string;
+  requestId?: string;
+  runId?: string;
+  sessionId?: string;
+  sequence?: number;
+  attributes?: Record<string, unknown>;
+  createdAt?: string;
+}
+
+export interface AgentPlanStreamFrame {
+  type: "accepted" | "progress" | "heartbeat" | "result" | "error" | string;
+  requestId?: string;
+  elapsedMs?: number;
+  event?: AgentPlanStreamProgressEvent;
+  data?: unknown;
+  error?: { code?: string; message?: string; errorType?: string };
 }
 
 export interface AgentRagQueryPayload {
@@ -2719,6 +2742,33 @@ export const api = {
     return {
       ...result,
       data: normalizeAgentPlanResponse(result.data),
+    };
+  },
+  createAgentPlanStream: async (
+    payload: CreateAgentPlanPayload,
+    onFrame: (frame: AgentPlanStreamFrame) => void,
+  ) => {
+    let finalResponse: AgentPlanResponse | undefined;
+    await streamJsonLines<AgentPlanStreamFrame>("/agent/plans/stream", payload, (frame) => {
+      onFrame(frame);
+      if (frame.type === "error") {
+        throw new ApiError(
+          frame.error?.message || "Agent 规划未能完成，请查看最后一个进度节点后重试。",
+          { reason: frame.error?.code },
+        );
+      }
+      if (frame.type === "result") {
+        finalResponse = normalizeAgentPlanResponse(frame.data);
+      }
+    });
+    if (!finalResponse) {
+      throw new ApiError("Agent 实时规划已结束，但没有返回最终计划快照。", {
+        reason: "AGENT_PLAN_STREAM_RESULT_MISSING",
+      });
+    }
+    return {
+      data: finalResponse,
+      meta: { source: "api" as const },
     };
   },
   queryAgentRag: async (payload: AgentRagQueryPayload) => {

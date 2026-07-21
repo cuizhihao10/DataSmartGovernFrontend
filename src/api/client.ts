@@ -293,6 +293,67 @@ export async function request<T>(path: string, init?: RequestInit): Promise<With
   };
 }
 
+/**
+ * Read an authenticated NDJSON response incrementally.
+ *
+ * Agent planning can spend tens of seconds inside a model provider. A normal JSON request hides every completed
+ * stage until the final body arrives, while EventSource cannot issue an authenticated POST. NDJSON over fetch keeps
+ * the same OIDC/project headers as every other API request and exposes each complete line as soon as the gateway
+ * forwards it. The parser keeps partial UTF-8 chunks buffered, because a JSON line may be split across TCP frames.
+ */
+export async function streamJsonLines<TFrame>(
+  path: string,
+  payload: unknown,
+  onFrame: (frame: TFrame) => void,
+): Promise<void> {
+  const sanitizedPath = sanitizeBusinessPath(path);
+  const response = await fetchWithAuthRetry(
+    sanitizedPath,
+    { method: "POST", body: JSON.stringify(payload) },
+    "application/x-ndjson, application/json",
+    "application/json",
+  );
+
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type") ?? "";
+    const errorPayload = contentType.includes("application/json") ? await response.json() : await response.text();
+    throwApiErrorFromPayload(errorPayload, response.status);
+  }
+  if (!response.body) {
+    throw new ApiError("Agent 实时响应未返回可读取的数据流，请稍后重试。", { status: response.status });
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffered = "";
+  const consumeLine = (line: string) => {
+    const normalized = line.trim();
+    if (!normalized) return;
+    try {
+      onFrame(JSON.parse(normalized) as TFrame);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new ApiError("Agent 实时响应格式异常，无法解析当前进度帧。", { status: response.status });
+      }
+      throw error;
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffered += decoder.decode(value, { stream: !done });
+      const lines = buffered.split(/\r?\n/);
+      buffered = lines.pop() ?? "";
+      lines.forEach(consumeLine);
+      if (done) break;
+    }
+    consumeLine(buffered);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export async function requestForm<T>(path: string, formData: FormData, init?: RequestInit): Promise<WithMeta<T>> {
   const sanitizedPath = sanitizeBusinessPath(path);
   const response = await fetchWithAuthRetry(sanitizedPath, {
