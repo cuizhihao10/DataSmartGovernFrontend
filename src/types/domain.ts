@@ -1126,7 +1126,16 @@ export interface AgentConversation {
 
 export interface AgentObservationTimelineItem {
   id: string;
-  category: "MODEL" | "DECISION" | "GRAPH" | "TOOL" | "COMMAND" | string;
+  category:
+    | "MODEL"
+    | "DECISION"
+    | "SKILL"
+    | "ORCHESTRATION"
+    | "TOOL"
+    | "COMMAND"
+    | "PERMISSION"
+    | "USER_ACTION"
+    | string;
   stage: string;
   status: string;
   title: string;

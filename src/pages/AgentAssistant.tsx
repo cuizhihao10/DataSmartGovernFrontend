@@ -7,6 +7,8 @@ import {
   DatabaseOutlined,
   DeleteOutlined,
   PlusOutlined,
+  QuestionCircleOutlined,
+  ReadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
   ToolOutlined,
@@ -22,6 +24,7 @@ import {
   Input,
   Select,
   Space,
+  Spin,
   Steps,
   Tag,
   Timeline,
@@ -125,37 +128,141 @@ function statusColor(state?: string) {
 }
 
 function observationColor(status: string) {
-  if (status === "SUCCEEDED" || status === "READY") return "green";
-  if (status === "FAILED") return "red";
-  if (status === "FALLBACK" || status === "WAITING") return "orange";
-  if (status === "PLANNED") return "blue";
+  if (status === "SUCCEEDED" || status === "READY" || status === "LOADED") return "green";
+  if (status === "FAILED" || status === "BLOCKED") return "red";
+  if (["FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED"].includes(status)) return "orange";
+  if (status === "PLANNED" || status === "EXECUTING" || status === "TOOL_CALLING") return "blue";
   return "gray";
 }
 
 function observationIcon(category: string) {
   if (category === "MODEL") return <RobotOutlined />;
   if (category === "DECISION") return <ApiOutlined />;
+  if (category === "SKILL") return <ReadOutlined />;
+  if (category === "ORCHESTRATION") return <BranchesOutlined />;
   if (category === "TOOL") return <ToolOutlined />;
   if (category === "COMMAND") return <CodeOutlined />;
-  return <BranchesOutlined />;
+  if (category === "PERMISSION") return <SafetyCertificateOutlined />;
+  return <QuestionCircleOutlined />;
 }
 
 function observationCategory(category: string) {
   return {
-    MODEL: "模型",
-    DECISION: "决策",
-    GRAPH: "状态图",
-    TOOL: "工具",
-    COMMAND: "命令",
+    MODEL: "模型决策",
+    DECISION: "执行策略",
+    SKILL: "Skill",
+    ORCHESTRATION: "编排",
+    TOOL: "工具调用",
+    COMMAND: "命令 / API",
+    PERMISSION: "权限与确认",
+    USER_ACTION: "需要你操作",
   }[category] || category;
 }
 
-function formatObservationValue(value: unknown) {
+function observationStatus(status: string) {
+  return {
+    SUCCEEDED: "已完成",
+    READY: "已就绪",
+    LOADED: "已加载",
+    PLANNED: "已规划",
+    EXECUTING: "执行中",
+    TOOL_CALLING: "调用中",
+    WAITING: "等待中",
+    WAITING_INPUT: "等待补充信息",
+    WAITING_APPROVAL: "等待确认",
+    WAITING_HUMAN: "等待人工处理",
+    PAUSED: "已安全暂停",
+    BLOCKED: "已阻止",
+    FAILED: "失败",
+    FALLBACK: "已降级",
+    SKIPPED: "未调用",
+  }[status] || status;
+}
+
+function observationDetailLabel(key: string) {
+  return {
+    provider: "模型 Provider",
+    model: "模型",
+    latencyMs: "调用耗时",
+    promptTokens: "输入 Token",
+    completionTokens: "输出 Token",
+    totalTokens: "总 Token",
+    toolCallCount: "模型建议工具数",
+    proposedToolNames: "模型建议工具",
+    attemptCount: "调用尝试次数",
+    cacheHit: "命中缓存",
+    fallbackUsed: "是否降级",
+    errorCode: "错误码",
+    strategySummary: "策略摘要",
+    ruleConfidence: "规则解析置信度",
+    domains: "业务域",
+    candidateTools: "候选工具",
+    riskTags: "风险标签",
+    missingInformation: "缺失信息",
+    skillCode: "Skill 编码",
+    domain: "所属业务域",
+    matchScore: "匹配分数",
+    requiredTools: "依赖工具",
+    requiredPermissions: "所需权限",
+    memoryDependencies: "记忆依赖",
+    riskLevel: "风险等级",
+    approvalPolicy: "确认策略",
+    admissionStatus: "准入状态",
+    completedStepCount: "已完成步骤数",
+    completedSteps: "已完成步骤",
+    currentPhase: "当前阶段",
+    nextAction: "下一步",
+    resumeSupported: "支持恢复",
+    executionMode: "执行方式",
+    requiresHumanApproval: "需要人工确认",
+    parameterValidationPassed: "参数校验通过",
+    missingFields: "待补字段",
+    requiredAction: "所需操作",
+    protectedToolCount: "受保护工具数",
+    automaticExecutionBlocked: "已阻止自动执行",
+    inputType: "输入类型",
+    required: "是否必填",
+    sensitive: "是否敏感",
+    templateId: "命令模板 ID",
+    decision: "准入决策",
+    proposalState: "命令状态",
+    missingEvidenceCodes: "缺失证据",
+    sessionId: "会话 ID",
+    runId: "运行 ID",
+    toolAuditCount: "工具审计数",
+    auditId: "审计 ID",
+    targetService: "目标服务",
+    outputSummary: "执行结果摘要",
+    readOnly: "只读调用",
+    idempotent: "支持幂等",
+  }[key] || key;
+}
+
+function observationDetailsTitle(category: string) {
+  return {
+    MODEL: "查看模型调用信息",
+    DECISION: "查看策略与安全约束",
+    SKILL: "查看 Skill 加载详情",
+    ORCHESTRATION: "查看编排摘要",
+    TOOL: "查看工具调用详情",
+    COMMAND: "查看命令与 API 详情",
+    PERMISSION: "查看所需权限与确认",
+    USER_ACTION: "查看需要补充的信息",
+  }[category] || "查看详情";
+}
+
+function formatObservationValue(value: unknown, key?: string) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "boolean") return value ? "是" : "否";
+  if (key === "latencyMs" && typeof value === "number") return `${value} ms`;
+  if (key === "ruleConfidence" && typeof value === "number") return `${Math.round(value * 100)}%`;
   if (Array.isArray(value)) return value.length ? value.join("、") : "无";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+function scrollToAgentSection(sectionId: string) {
+  document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function UserAgentAssistant() {
@@ -331,21 +438,23 @@ function UserAgentAssistant() {
   const modelFallbackReason = textField(conversation?.intentResolver, "fallbackReasonCode");
   const observationItems = useMemo<AgentObservationTimelineItem[]>(() => {
     const planningItems = plan?.agentObservationTimeline?.items ?? [];
-    const executionItems = audits.map((audit, index) => ({
+    const executionItems = audits.map((audit) => ({
       id: `execution-${audit.auditId}`,
       category: "TOOL",
       stage: "execute_java_tool",
       status: audit.state,
-      title: audit.toolCode,
+      title: `调用工具：${audit.toolCode}`,
       summary: audit.message || audit.planReason || "Java Agent Runtime 正在处理工具节点。",
       details: {
-        sequence: index + 1,
         auditId: audit.auditId,
         targetService: audit.targetService,
         executionMode: audit.executionMode,
         riskLevel: audit.riskLevel,
+        requiresHumanApproval: audit.requiresApproval,
         readOnly: audit.readOnly,
         idempotent: audit.idempotent,
+        outputSummary: audit.outputSummary,
+        errorCode: audit.errorCode,
       },
     } satisfies AgentObservationTimelineItem));
     return [...planningItems, ...executionItems];
@@ -408,112 +517,132 @@ function UserAgentAssistant() {
         </Form>
       </Card>
 
+      {planMutation.isPending && !planMutation.variables?.clarification ? (
+        <Card title="Agent 工作过程" className="compact-card">
+          <Timeline
+            items={[{
+              color: "blue",
+              dot: <Spin size="small" />,
+              children: (
+                <div>
+                  <Space wrap>
+                    <Typography.Text strong>模型正在理解目标并生成受控计划</Typography.Text>
+                    <Tag color="blue">处理中</Tag>
+                  </Space>
+                  <Typography.Paragraph type="secondary" style={{ margin: "8px 0 0" }}>
+                    正在调用模型并结合当前项目权限、可用 Skill 和工具目录形成计划；响应完成后会展示真实过程事实。
+                  </Typography.Paragraph>
+                </div>
+              ),
+            }]}
+          />
+        </Card>
+      ) : null}
+
       {conversation ? (
-        <div className="grid grid-two">
-          <Card title="Agent 回复" className="compact-card">
+        <Card title="Agent 回复" className="compact-card">
+          <Alert
+            showIcon
+            type={conversation.phase === "NO_EXECUTABLE_PLAN" ? "warning" : "success"}
+            message={conversation.assistantMessage}
+          />
+          <Space wrap style={{ marginTop: 16 }}>
+            <Tag color="blue">{conversation.structuredIntent.intentType}</Tag>
+            {conversation.structuredIntent.syncMode ? (
+              <Tag color="cyan">{syncModeLabels[syncMode] || syncMode}</Tag>
+            ) : null}
+            <Tag color={modelSucceeded ? "green" : "gold"}>
+              {modelSucceeded ? "真实模型已参与" : modelInvoked ? "模型失败，规则降级" : "仅规则解析"}
+            </Tag>
+            {modelProvider ? <Tag color="geekblue">{modelProvider}</Tag> : null}
+            {modelName ? <Tag color="blue">{modelName}</Tag> : null}
+            {modelLatencyMs !== undefined ? <Tag>{modelLatencyMs} ms</Tag> : null}
+            {modelTotalTokens !== undefined ? <Tag>{modelTotalTokens} tokens</Tag> : null}
+          </Space>
+          {!modelSucceeded ? (
             <Alert
               showIcon
-              type={conversation.phase === "NO_EXECUTABLE_PLAN" ? "warning" : "success"}
-              message={conversation.assistantMessage}
+              type="warning"
+              style={{ marginTop: 12 }}
+              message={modelInvoked ? "真实模型调用失败，本轮已安全降级" : "本轮没有调用真实模型"}
+              description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
             />
-            <Space wrap style={{ marginTop: 16 }}>
-              <Tag color="blue">{conversation.structuredIntent.intentType}</Tag>
-              {conversation.structuredIntent.syncMode ? (
-                <Tag color="cyan">{syncModeLabels[syncMode] || syncMode}</Tag>
-              ) : null}
-              <Tag>规则置信度 {Math.round(conversation.structuredIntent.confidence * 100)}%</Tag>
-              <Tag color={modelSucceeded ? "green" : "gold"}>
-                {modelSucceeded ? "真实模型已参与" : modelInvoked ? "模型失败，规则降级" : "仅规则解析"}
-              </Tag>
-              {modelProvider ? <Tag color="geekblue">{modelProvider}</Tag> : null}
-              {modelName ? <Tag color="blue">{modelName}</Tag> : null}
-              {modelLatencyMs !== undefined ? <Tag>{modelLatencyMs} ms</Tag> : null}
-              {modelTotalTokens !== undefined ? <Tag>{modelTotalTokens} tokens</Tag> : null}
-            </Space>
-            {!modelSucceeded ? (
-              <Alert
-                showIcon
-                type="warning"
-                style={{ marginTop: 12 }}
-                message={modelInvoked ? "真实模型调用失败，本轮已安全降级" : "本轮没有调用真实模型"}
-                description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
-              />
-            ) : null}
-          </Card>
-
-          <Card title="结构化意图" className="compact-card">
-            <Space direction="vertical" style={{ width: "100%" }}>
-              <Typography.Text>{conversation.structuredIntent.summary}</Typography.Text>
-              <Typography.Text type="secondary">
-                业务域：{conversation.structuredIntent.domains.join("、") || "未识别"}
-              </Typography.Text>
-              <Typography.Text type="secondary">
-                候选工具：{conversation.structuredIntent.candidateTools.join("、") || "暂无"}
-              </Typography.Text>
-              <Typography.Text type="secondary">
-                下一步：{conversation.nextAction}
-              </Typography.Text>
-            </Space>
-          </Card>
-        </div>
+          ) : null}
+        </Card>
       ) : null}
 
       {observationItems.length ? (
         <Card
-          title="Agent 决策与执行时间线"
+          title="Agent 工作过程"
           className="compact-card"
-          extra={<Tag color="cyan">不展示隐藏思维链</Tag>}
+          extra={<Tag color="cyan">公开摘要，不展示隐藏思维链</Tag>}
         >
           <Alert
             showIcon
             type="info"
-            message="这里展示可验证的执行事实"
-            description="包含模型是否真实调用、结构化决策、LangGraph 节点、工具计划、控制面命令和执行结果；系统提示词、隐藏推理、凭据与原始参数不会展示。"
+            message="这里展示真实、可操作、可审计的 Agent 工作过程"
+            description="包含模型公开决策摘要、Skill 加载、LangGraph 编排摘要、工具与命令调用、权限门禁、待补信息和执行结果；内部调试节点、系统提示词、隐藏推理、凭据与原始参数不会展示。"
             style={{ marginBottom: 20 }}
           />
           <Timeline
-            items={observationItems.map((item) => ({
-              color: observationColor(item.status),
-              dot: observationIcon(item.category),
-              children: (
-                <div style={{ paddingBottom: 6 }}>
-                  <Space wrap>
-                    <Typography.Text strong>{item.title}</Typography.Text>
-                    <Tag color="blue">{observationCategory(item.category)}</Tag>
-                    <Tag color={observationColor(item.status)}>{item.status}</Tag>
-                    {item.stage ? <Typography.Text type="secondary">{item.stage}</Typography.Text> : null}
-                  </Space>
-                  <Typography.Paragraph style={{ margin: "8px 0" }}>{item.summary}</Typography.Paragraph>
-                  {Object.keys(item.details).length ? (
-                    <Collapse
-                      ghost
-                      size="small"
-                      items={[{
-                        key: `${item.id}-details`,
-                        label: "查看调用与治理详情",
-                        children: (
-                          <Descriptions
-                            size="small"
-                            column={{ xs: 1, sm: 2, lg: 3 }}
-                            items={Object.entries(item.details).map(([key, value]) => ({
-                              key,
-                              label: key,
-                              children: formatObservationValue(value),
-                            }))}
-                          />
-                        ),
-                      }]}
-                    />
-                  ) : null}
-                </div>
-              ),
-            }))}
+            items={observationItems.map((item) => {
+              // v1 返回过纯排序字段 sequence；即使滚动升级期间命中旧缓存，也不再把它伪装成治理详情。
+              const detailEntries = Object.entries(item.details).filter(([key]) => key !== "sequence");
+              const needsInput = item.category === "USER_ACTION"
+                || (item.category === "PERMISSION" && item.status === "WAITING_INPUT");
+              const needsConfirmation = item.category === "PERMISSION" && item.status === "WAITING_APPROVAL";
+              return {
+                color: observationColor(item.status),
+                dot: observationIcon(item.category),
+                children: (
+                  <div style={{ paddingBottom: 8 }}>
+                    <Space wrap>
+                      <Typography.Text strong>{item.title}</Typography.Text>
+                      <Tag color="blue">{observationCategory(item.category)}</Tag>
+                      <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
+                    </Space>
+                    <Typography.Paragraph style={{ margin: "8px 0" }}>{item.summary}</Typography.Paragraph>
+                    {needsInput ? (
+                      <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-clarification-card")}>
+                        补充执行信息
+                      </Button>
+                    ) : null}
+                    {needsConfirmation ? (
+                      <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-execution-plan-card")}>
+                        查看并确认执行
+                      </Button>
+                    ) : null}
+                    {detailEntries.length ? (
+                      <Collapse
+                        ghost
+                        size="small"
+                        items={[{
+                          key: `${item.id}-details`,
+                          label: observationDetailsTitle(item.category),
+                          children: (
+                            <Descriptions
+                              size="small"
+                              column={{ xs: 1, sm: 2, lg: 3 }}
+                              items={detailEntries.map(([key, value]) => ({
+                                key,
+                                label: observationDetailLabel(key),
+                                children: formatObservationValue(value, key),
+                              }))}
+                            />
+                          ),
+                        }]}
+                      />
+                    ) : null}
+                  </div>
+                ),
+              };
+            })}
           />
         </Card>
       ) : null}
 
       {conversation?.phase === "WAITING_CLARIFICATION" ? (
-        <Card title="补充 Agent 执行所需信息" className="compact-card">
+        <Card id="agent-clarification-card" title="补充 Agent 执行所需信息" className="compact-card">
           <Space wrap style={{ marginBottom: 16 }}>
             {conversation.clarificationQuestions.map((question) => (
               <Tag key={question.parameterName} color="gold">{question.question}</Tag>
@@ -602,7 +731,7 @@ function UserAgentAssistant() {
       ) : null}
 
       {controlPlane && planItems.length ? (
-        <Card title="可观测执行计划" className="compact-card">
+        <Card id="agent-execution-plan-card" title="可观测执行计划" className="compact-card">
           <Steps
             direction="vertical"
             size="small"
