@@ -6,18 +6,21 @@ import {
   CodeOutlined,
   DatabaseOutlined,
   DeleteOutlined,
+  FileExcelOutlined,
   PlusOutlined,
   QuestionCircleOutlined,
   ReadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
   ToolOutlined,
+  UploadOutlined,
 } from "@ant-design/icons";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Collapse,
   Descriptions,
   Form,
@@ -30,6 +33,7 @@ import {
   Timeline,
   Tooltip,
   Typography,
+  Upload,
   message,
 } from "antd";
 import { useMemo, useState } from "react";
@@ -45,6 +49,7 @@ import type {
   AgentObservationTimelineItem,
   AgentToolExecutionAudit,
   AgentToolExecutionResult,
+  SyncTaskImportArtifact,
 } from "@/types/domain";
 
 interface ObjectMappingInput {
@@ -71,6 +76,8 @@ interface PlanSubmission {
   objective: string;
   clarification?: ClarificationFormValues;
   syncMode?: string;
+  taskImportArtifactRef?: string;
+  taskImportRunImmediately?: boolean;
 }
 
 interface ExecutionAnswer {
@@ -80,6 +87,7 @@ interface ExecutionAnswer {
 }
 
 const defaultObjective = "将 MySQL 中的 fs_test_customer_source 和 fs_test_customer_target 全量同步到 PostgreSQL public schema 的同名表。";
+const taskImportObjective = "检查这个任务文件，先试运行；若失败则检索产品文档和历史案例，提出可执行修复方案，经我确认后修复、重新校验并导入。";
 
 const defaultMappings: ObjectMappingInput[] = [
   {
@@ -204,6 +212,13 @@ function streamEventPresentation(event: AgentPlanStreamProgressEvent) {
     model_tool_call_approval_required: { category: "PERMISSION", title: "工具调用等待用户确认", status: "WAITING_APPROVAL" },
     model_tool_call_budget_guarded: { category: "PERMISSION", title: "执行工具预算门禁" },
     tool_planned: { category: "TOOL", title: "生成工具执行计划" },
+    "agent.tool_execution.state_changed": { category: "TOOL", title: "收到真实工具执行结果" },
+    tool_auto_execution_sync_completed: { category: "TOOL", title: "完成本轮受控工具执行" },
+    tool_result_feedback_built: { category: "ORCHESTRATION", title: "构建模型可见的工具结果" },
+    agent_loop_control_decided: { category: "PERMISSION", title: "评估是否允许 Agent 继续推进" },
+    model_second_turn_completed: { category: "MODEL", title: "模型根据工具结果完成下一轮决策" },
+    model_second_turn_skipped: { category: "MODEL", title: "本轮模型调用已安全停止" },
+    model_follow_up_tool_batch_governed: { category: "TOOL", title: "治理模型选择的下一批工具" },
     tool_parameter_validated: { category: "USER_ACTION", title: "校验工具执行参数", status: "WAITING_INPUT" },
     memory_retrieved: { category: "ORCHESTRATION", title: "检索受控记忆" },
     approval_waiting: { category: "PERMISSION", title: "等待用户确认", status: "WAITING_APPROVAL" },
@@ -319,6 +334,24 @@ function observationDetailLabel(key: string) {
     finalToolCount: "最终工具数",
     finalToolNames: "最终采用工具",
     planningSource: "该工具计划来源",
+    turnIndex: "Agent 循环轮次",
+    toolNames: "本轮提交工具",
+    toolCount: "本轮工具数",
+    feedbackCount: "工具反馈数",
+    messageCount: "模型反馈消息数",
+    expectedToolCallCount: "预期工具调用数",
+    missingToolCallIds: "缺失工具反馈",
+    extraFeedbackCallIds: "额外工具反馈",
+    statusCounts: "工具状态统计",
+    allowed: "允许自动继续",
+    action: "循环控制动作",
+    acceptedCount: "通过治理的工具数",
+    rejectedCount: "被治理拒绝的工具数",
+    repeatedCount: "重复工具数",
+    executedCount: "已执行工具数",
+    failedCount: "失败工具数",
+    skippedCount: "跳过工具数",
+    complete: "反馈是否完整",
   }[key] || key;
 }
 
@@ -365,6 +398,28 @@ function scrollToAgentSection(sectionId: string) {
   document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+function findArtifactRef(value: unknown, depth = 0): string | undefined {
+  if (depth > 4 || !value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.artifactRef === "string" && record.artifactRef.trim()) {
+    return record.artifactRef;
+  }
+  for (const key of ["artifact", "data", "result", "output"]) {
+    const nested = findArtifactRef(record[key], depth + 1);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function humanReadableToolName(toolName: string) {
+  return {
+    "sync.task.import.dry-run": "任务文件试运行",
+    "sync.task.import.rag.lookup": "检索修复案例与产品文档",
+    "sync.task.import.repair.apply": "应用模型提出的修复补丁",
+    "sync.task.import.commit": "正式导入任务文件",
+  }[toolName] || toolName;
+}
+
 function UserAgentAssistant() {
   const navigate = useNavigate();
   const [objectiveForm] = Form.useForm<ObjectiveFormValues>();
@@ -381,6 +436,8 @@ function UserAgentAssistant() {
   const [executionInProgress, setExecutionInProgress] = useState(false);
   const [executionResults, setExecutionResults] = useState<AgentToolExecutionResult[]>([]);
   const [executionAnswer, setExecutionAnswer] = useState<ExecutionAnswer>();
+  const [taskImportArtifact, setTaskImportArtifact] = useState<SyncTaskImportArtifact>();
+  const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -494,6 +551,10 @@ function UserAgentAssistant() {
           })),
         };
       }
+      if (submission.taskImportArtifactRef) {
+        variables.taskImportArtifactRef = submission.taskImportArtifactRef;
+        variables.taskImportRunImmediately = Boolean(submission.taskImportRunImmediately);
+      }
       const requestId = crypto.randomUUID();
       return api.createAgentPlanStream({
         tenant_id: String(session.tenantId),
@@ -539,16 +600,21 @@ function UserAgentAssistant() {
         return;
       }
 
+      const durableTurn = [...(nextPlan.agentDurableModelToolLoop?.turns ?? [])]
+        .reverse()
+        .find((turn) => turn.sessionId && turn.runId);
       const ingestion = nextPlan.controlPlaneIngestion;
-      const sessionId = textField(ingestion, "sessionId");
-      const runId = textField(ingestion, "runId");
+      const sessionId = durableTurn?.sessionId || textField(ingestion, "sessionId");
+      const runId = durableTurn?.runId || textField(ingestion, "runId");
       if (!sessionId || !runId) {
         setControlPlane(undefined);
         message.error("参数已补齐，但 Java 控制面未返回 sessionId/runId，请检查计划接入状态");
         return;
       }
       setControlPlane({ sessionId, runId });
-      message.success("Agent 已生成可审计执行计划，请确认后执行");
+      message.success(durableTurn
+        ? "Agent 已推进到下一批 Durable 工具，请查看过程并确认需要授权的动作"
+        : "Agent 已生成可审计执行计划，请确认后执行");
     },
     onError: (error) => {
       const summary = errorMessage(error);
@@ -566,6 +632,15 @@ function UserAgentAssistant() {
       ]);
       message.error(summary);
     },
+  });
+
+  const artifactUploadMutation = useMutation({
+    mutationFn: (file: File) => api.uploadSyncTaskImportArtifact(file),
+    onSuccess: (result) => {
+      setTaskImportArtifact(result.data);
+      message.success("任务文件已上传为项目内受控制品，模型不会读取原始文件正文");
+    },
+    onError: (error) => message.error(errorMessage(error)),
   });
 
   const executeMutation = useMutation({
@@ -590,6 +665,25 @@ function UserAgentAssistant() {
         message.success("Agent 控制面节点已执行完成，同步任务已进入真实业务执行链路");
       }
       await auditsQuery.refetch();
+      const repairedArtifactRef = result.data.toolResults
+        .filter((item) => item.audit.toolCode === "sync.task.import.repair.apply" && item.audit.state === "SUCCEEDED")
+        .map((item) => findArtifactRef(item.output))
+        .find(Boolean);
+      if (repairedArtifactRef) {
+        setTaskImportArtifact((current) => current ? {
+          ...current,
+          artifactRef: repairedArtifactRef,
+          parentArtifactRef: current.artifactRef,
+          versionNumber: current.versionNumber + 1,
+          artifactState: "REPAIRED",
+        } : current);
+        message.info("修复制品已生成，Agent 正在自动对新版本重新试运行");
+        planMutation.mutate({
+          objective: taskImportObjective,
+          taskImportArtifactRef: repairedArtifactRef,
+          taskImportRunImmediately,
+        });
+      }
     },
     onError: (error) => message.error(errorMessage(error)),
     onSettled: () => setExecutionInProgress(false),
@@ -597,6 +691,22 @@ function UserAgentAssistant() {
 
   const conversation = plan?.agentConversation;
   const planItems = plan?.plan?.toolPlans ?? [];
+  const latestDurableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
+    .reverse()
+    .find((turn) => turn.sessionId && turn.runId);
+  const activeToolNames = latestDurableTurn?.submittedToolNames?.length
+    ? latestDurableTurn.submittedToolNames
+    : planItems.map((item) => item.toolName);
+  const activeRequiresConfirmation = latestDurableTurn
+    ? ["WAITING_APPROVAL", "HUMAN_TAKEOVER_REQUIRED"].includes(
+        plan?.agentDurableModelToolLoop?.stoppedReason ?? "",
+      )
+    : planItems.some((item) => item.requiresHumanApproval);
+  const confirmationButtonLabel = activeToolNames.includes("sync.task.import.repair.apply")
+    ? "确认并应用模型修复"
+    : activeToolNames.includes("sync.task.import.commit")
+      ? "确认正式导入任务"
+      : "确认并执行本次计划";
   const hasDatasourceOptions = sourceOptions.length > 0 && targetOptions.length > 0;
   const syncMode = conversation?.structuredIntent.syncMode || "FULL";
   const resolverMode = textField(conversation?.intentResolver, "mode");
@@ -650,6 +760,23 @@ function UserAgentAssistant() {
     planMutation.mutate({ objective: values.objective });
   };
 
+  const submitTaskImportArtifact = () => {
+    if (!taskImportArtifact) {
+      message.warning("请先上传 CSV 或 XLSX 任务文件");
+      return;
+    }
+    setObjective(taskImportObjective);
+    setPlan(undefined);
+    setControlPlane(undefined);
+    setExecutionResults([]);
+    setExecutionAnswer(undefined);
+    planMutation.mutate({
+      objective: taskImportObjective,
+      taskImportArtifactRef: taskImportArtifact.artifactRef,
+      taskImportRunImmediately,
+    });
+  };
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -665,6 +792,60 @@ function UserAgentAssistant() {
         message="数据库密码不会进入 Agent"
         description="Agent 只使用当前项目内已授权的数据源 ID。连接凭据不会进入自然语言、LangGraph 状态、模型接口、计划、事件或日志。"
       />
+
+      <Card title="任务文件智能导入" className="compact-card">
+        <Alert
+          showIcon
+          type="info"
+          message="上传制品后由 Agent 试运行、诊断、检索案例并提出修复"
+          description="原始 CSV/XLSX 只保存在当前租户与项目的数据同步服务中；模型仅接收制品引用、结构化错误码、低敏诊断和 RAG 证据。任何单元格修改与正式导入都必须由你明确确认。"
+          style={{ marginBottom: 16 }}
+        />
+        <Space wrap>
+          <Upload
+            accept=".csv,.xlsx"
+            maxCount={1}
+            showUploadList={false}
+            beforeUpload={(file) => {
+              artifactUploadMutation.mutate(file as File);
+              return false;
+            }}
+          >
+            <Button icon={<UploadOutlined />} loading={artifactUploadMutation.isPending} disabled={!projectId}>
+              上传 CSV / XLSX
+            </Button>
+          </Upload>
+          <Checkbox
+            checked={taskImportRunImmediately}
+            onChange={(event) => setTaskImportRunImmediately(event.target.checked)}
+          >
+            导入成功后立即运行
+          </Checkbox>
+          <Button
+            type="primary"
+            icon={<FileExcelOutlined />}
+            disabled={!taskImportArtifact || planMutation.isPending}
+            onClick={submitTaskImportArtifact}
+          >
+            交给 Agent 检查并处理
+          </Button>
+        </Space>
+        {taskImportArtifact ? (
+          <Descriptions
+            size="small"
+            column={{ xs: 1, md: 3 }}
+            style={{ marginTop: 16 }}
+            items={[
+              { key: "file", label: "文件", children: taskImportArtifact.fileName },
+              { key: "version", label: "制品版本", children: `v${taskImportArtifact.versionNumber}` },
+              { key: "state", label: "状态", children: <Tag color="blue">{taskImportArtifact.artifactState}</Tag> },
+              { key: "ref", label: "制品引用", children: taskImportArtifact.artifactRef },
+              { key: "size", label: "大小", children: `${Math.max(1, Math.ceil(taskImportArtifact.contentSizeBytes / 1024))} KiB` },
+              { key: "scope", label: "项目", children: `#${taskImportArtifact.projectId}` },
+            ]}
+          />
+        ) : null}
+      </Card>
 
       <Card title="告诉 Agent 你想完成什么" className="compact-card">
         <Form<ObjectiveFormValues>
@@ -916,17 +1097,51 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
-      {controlPlane && planItems.length ? (
+      {controlPlane && activeToolNames.length && activeRequiresConfirmation ? (
         <Card id="agent-execution-plan-card" title="可观测执行计划" className="compact-card">
           <Steps
             direction="vertical"
             size="small"
-            items={planItems.map((item) => ({
-              title: item.toolName,
-              description: item.reason,
+            items={activeToolNames.map((toolName) => ({
+              title: humanReadableToolName(toolName),
+              description: planItems.find((item) => item.toolName === toolName)?.reason
+                || "模型基于真实工具结果提出该动作，已通过平台工具与状态治理，等待你的明确授权。",
               status: "wait",
             }))}
           />
+          {audits.filter((audit) => audit.state === "WAITING_APPROVAL" || audit.requiresApproval).map((audit) => {
+            const patches = Array.isArray(audit.planArguments.patches) ? audit.planArguments.patches : [];
+            return (
+              <Card key={audit.auditId} size="small" title={humanReadableToolName(audit.toolCode)} style={{ marginTop: 12 }}>
+                <Descriptions
+                  size="small"
+                  column={{ xs: 1, md: 2 }}
+                  items={[
+                    { key: "risk", label: "风险等级", children: audit.riskLevel },
+                    { key: "permission", label: "授权要求", children: audit.requiresApproval ? "必须由当前用户确认" : "无需确认" },
+                    { key: "patchCount", label: "建议修改数", children: patches.length },
+                    { key: "run", label: "Durable Run", children: audit.runId },
+                  ]}
+                />
+                {patches.length ? (
+                  <Space direction="vertical" style={{ width: "100%", marginTop: 12 }}>
+                    {patches.map((patch, index) => {
+                      const item = patch && typeof patch === "object" ? patch as Record<string, unknown> : {};
+                      return (
+                        <Alert
+                          key={`${audit.auditId}-patch-${index}`}
+                          type="warning"
+                          showIcon
+                          message={`第 ${String(item.rowNumber ?? "-")} 行 · ${String(item.columnName ?? "未知列")}`}
+                          description={`建议改为：${String(item.replacementValue ?? "空值")}`}
+                        />
+                      );
+                    })}
+                  </Space>
+                ) : null}
+              </Card>
+            );
+          })}
           <Alert
             showIcon
             type="warning"
@@ -942,7 +1157,7 @@ function UserAgentAssistant() {
             disabled={Boolean(executionAnswer)}
             onClick={() => executeMutation.mutate()}
           >
-            确认并执行本次计划
+            {confirmationButtonLabel}
           </Button>
         </Card>
       ) : null}

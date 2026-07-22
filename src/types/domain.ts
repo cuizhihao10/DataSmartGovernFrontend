@@ -426,6 +426,10 @@ export interface SyncTaskImportRowResult {
   status: string;
   currentState?: string;
   message?: string;
+  errorCode?: string;
+  fieldName?: string;
+  repairable?: boolean;
+  suggestedAction?: string;
 }
 
 export interface SyncTaskImportResult {
@@ -441,6 +445,55 @@ export interface SyncTaskImportResult {
   status: string;
   message?: string;
   rows: SyncTaskImportRowResult[];
+}
+
+export interface SyncTaskImportArtifact {
+  artifactRef: string;
+  tenantId: number;
+  projectId: number;
+  ownerId: number;
+  parentArtifactRef?: string;
+  versionNumber: number;
+  fileName: string;
+  fileFormat: string;
+  contentHash: string;
+  contentSizeBytes: number;
+  artifactState: string;
+  dryRunStatus?: string;
+  dryRunDigest?: string;
+  repairPatchDigest?: string;
+  createTime?: string;
+  updateTime?: string;
+}
+
+export interface SyncTaskImportArtifactDryRunResult {
+  artifact: SyncTaskImportArtifact;
+  importResult: SyncTaskImportResult;
+  confirmationDigest: string;
+  ragQuery?: string;
+  repairRequired: boolean;
+}
+
+export interface AgentDurableModelToolLoopTurn {
+  turnIndex: number;
+  requestId: string;
+  sessionId?: string;
+  runId?: string;
+  submittedToolNames: string[];
+  ingestionSucceeded: boolean;
+  feedbackStatusCounts: Record<string, number>;
+  loopAction?: string;
+  modelExecuted: boolean;
+  nextToolNames: string[];
+  stopReason?: string;
+}
+
+export interface AgentDurableModelToolLoop {
+  turnCount: number;
+  turns: AgentDurableModelToolLoopTurn[];
+  stoppedReason: string;
+  continuesAfterResponse: boolean;
+  payloadPolicy?: string;
 }
 
 export interface SyncTaskMetadataField {
@@ -1172,6 +1225,7 @@ export interface AgentPlanResponse {
   agentMemoryRetrievalWorkflow?: JsonObject;
   agentConversation?: AgentConversation;
   agentObservationTimeline?: AgentObservationTimeline;
+  agentDurableModelToolLoop?: AgentDurableModelToolLoop;
   raw: JsonObject;
 }
 

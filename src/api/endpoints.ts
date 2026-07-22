@@ -68,6 +68,7 @@ import type {
   SyncTaskGroupSummary,
   SyncTaskGroupTreeNode,
   SyncTaskImportResult,
+  SyncTaskImportArtifact,
   SyncTaskMetadataDiscoveryResult,
   SyncTaskOperationResult,
   SyncTask,
@@ -1256,6 +1257,10 @@ function normalizeSyncTaskImportResult(value: unknown): SyncTaskImportResult {
           status: readString(item.status, "UNKNOWN"),
           currentState: readOptionalString(item.currentState),
           message: readOptionalString(item.message),
+          errorCode: readOptionalString(item.errorCode),
+          fieldName: readOptionalString(item.fieldName),
+          repairable: typeof item.repairable === "boolean" ? item.repairable : undefined,
+          suggestedAction: readOptionalString(item.suggestedAction),
         };
       })
     : [];
@@ -2093,6 +2098,27 @@ function normalizeAgentObservationTimeline(value: unknown): AgentObservationTime
 
 function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
   const record = readRecord(value);
+  const durableLoop = readRecord(record.agentDurableModelToolLoop);
+  const durableTurns = Array.isArray(durableLoop.turns)
+    ? durableLoop.turns.map((item) => {
+        const turn = readRecord(item);
+        return {
+          turnIndex: readNumber(turn.turnIndex),
+          requestId: readString(turn.requestId),
+          sessionId: readOptionalString(turn.sessionId),
+          runId: readOptionalString(turn.runId),
+          submittedToolNames: readStringArray(turn.submittedToolNames),
+          ingestionSucceeded: readBoolean(turn.ingestionSucceeded),
+          feedbackStatusCounts: Object.fromEntries(
+            Object.entries(readRecord(turn.feedbackStatusCounts)).map(([key, count]) => [key, readNumber(count)]),
+          ),
+          loopAction: readOptionalString(turn.loopAction),
+          modelExecuted: readBoolean(turn.modelExecuted),
+          nextToolNames: readStringArray(turn.nextToolNames),
+          stopReason: readOptionalString(turn.stopReason),
+        };
+      })
+    : [];
   return {
     plan: normalizeAgentPlanCore(record.plan),
     eventEnvelope: readRecord(record.eventEnvelope),
@@ -2113,6 +2139,13 @@ function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
     agentMemoryRetrievalWorkflow: readRecord(record.agentMemoryRetrievalWorkflow),
     agentConversation: normalizeAgentConversation(record.agentConversation),
     agentObservationTimeline: normalizeAgentObservationTimeline(record.agentObservationTimeline),
+    agentDurableModelToolLoop: Object.keys(durableLoop).length ? {
+      turnCount: readNumber(durableLoop.turnCount, durableTurns.length),
+      turns: durableTurns,
+      stoppedReason: readString(durableLoop.stoppedReason),
+      continuesAfterResponse: readBoolean(durableLoop.continuesAfterResponse),
+      payloadPolicy: readOptionalString(durableLoop.payloadPolicy),
+    } : undefined,
     raw: record,
   };
 }
@@ -2562,6 +2595,12 @@ export const api = {
       ...result,
       data: normalizeSyncTaskImportResult(result.data),
     };
+  },
+  uploadSyncTaskImportArtifact: async (file: File, format?: string) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    if (format) formData.append("format", format);
+    return requestForm<SyncTaskImportArtifact>("/sync/sync-task-import-artifacts/upload", formData);
   },
   batchManualDispatchSyncTasks: async (payload: SyncTaskBatchOperationPayload) => {
     const result = await postJson<unknown>("/sync/sync-tasks/batch/manual-dispatch", payload);
