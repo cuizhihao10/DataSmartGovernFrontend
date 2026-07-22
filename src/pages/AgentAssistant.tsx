@@ -49,6 +49,7 @@ import type {
   AgentObservationTimelineItem,
   AgentToolExecutionAudit,
   AgentToolExecutionResult,
+  SyncExecution,
   SyncTaskImportArtifact,
 } from "@/types/domain";
 
@@ -78,6 +79,9 @@ interface PlanSubmission {
   syncMode?: string;
   taskImportArtifactRef?: string;
   taskImportRunImmediately?: boolean;
+  recoveryTaskId?: number;
+  recoveryExecutionId?: number;
+  preserveTimeline?: boolean;
 }
 
 interface ExecutionAnswer {
@@ -240,8 +244,11 @@ function streamEventToObservation(event: AgentPlanStreamProgressEvent): AgentObs
   const publicAttributes = Object.fromEntries(
     Object.entries(event.attributes || {}).filter(([key]) => !["confidence", "ruleConfidence"].includes(key)),
   );
+  const requestScope = event.requestId?.slice(0, 12) || "current";
   return {
-    id: isModelStage ? "live-model-invocation" : `live-${event.eventType}-${event.sequence ?? event.stage}`,
+    id: isModelStage
+      ? `live-${requestScope}-model-invocation`
+      : `live-${requestScope}-${event.eventType}-${event.sequence ?? event.stage}`,
     category: presentation.category,
     stage: event.stage,
     status: eventFailed ? "FAILED" : presentation.status || (eventWarning ? "FALLBACK" : "SUCCEEDED"),
@@ -411,12 +418,56 @@ function findArtifactRef(value: unknown, depth = 0): string | undefined {
   return undefined;
 }
 
+function findNumericField(value: unknown, keys: string[], depth = 0): number | undefined {
+  if (depth > 5 || !value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) return candidate;
+    if (typeof candidate === "string" && /^\d+$/.test(candidate) && Number(candidate) > 0) return Number(candidate);
+  }
+  for (const nested of Object.values(record)) {
+    const found = findNumericField(nested, keys, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function wait(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+const terminalSyncExecutionStates = new Set([
+  "SUCCEEDED",
+  "PARTIALLY_SUCCEEDED",
+  "FAILED",
+  "CANCELLED",
+  "MANUALLY_TERMINATED",
+  "SKIPPED",
+]);
+
+function syncExecutionSummary(execution: SyncExecution) {
+  return `同步 execution #${execution.id}：${execution.executionState}；`
+    + `已读 ${execution.recordsRead ?? 0} 行，已写 ${execution.recordsWritten ?? 0} 行，`
+    + `失败 ${execution.failedRecordCount ?? 0} 行。`;
+}
+
 function humanReadableToolName(toolName: string) {
   return {
     "sync.task.import.dry-run": "任务文件试运行",
     "sync.task.import.rag.lookup": "检索修复案例与产品文档",
     "sync.task.import.repair.apply": "应用模型提出的修复补丁",
     "sync.task.import.commit": "正式导入任务文件",
+    "sync.execution.status": "验证同步执行结果",
+    "sync.execution.diagnose": "读取真实执行账本并诊断根因",
+    "sync.execution.rag.lookup": "检索历史恢复案例与 Runbook",
+    "sync.execution.failed-objects.retry": "选择性重试失败对象",
+    "sync.dirty-record.quarantine.preview": "预览坏行隔离范围",
+    "sync.dirty-record.quarantine.apply": "应用确认后的坏行隔离",
+    "sync.dirty-record.replay": "重放已修复的坏行",
+    "datasource.schema.repair.preview": "预览目标表白名单结构修复",
+    "datasource.schema.repair.apply": "应用确认后的目标表结构修复",
+    "sync.recovery.case.publish": "发布已验证恢复案例",
   }[toolName] || toolName;
 }
 
@@ -480,6 +531,93 @@ function UserAgentAssistant() {
     refetchInterval: controlPlane && !executionAnswer ? (executionInProgress ? 1000 : 3000) : false,
   });
   const audits = useMemo(() => auditsQuery.data?.data ?? [], [auditsQuery.data?.data]);
+
+  /**
+   * 重试与脏数据重放只表示“进入业务执行队列”，并不等于迁移已经成功。
+   * 这里持续读取 data-sync 的真实 execution 账本，把业务进度追加到 Agent 时间线；
+   * 只有 execution 到达终态后，才允许模型进入下一轮验证与恢复决策。
+   */
+  const waitForRecoveryExecution = async (taskId: number, expectedExecutionId?: number) => {
+    const timelineId = `recovery-execution-${taskId}-${expectedExecutionId || Date.now()}`;
+    const updateTimeline = (item: AgentObservationTimelineItem) => {
+      setLiveObservationItems((current) => {
+        const existingIndex = current.findIndex((candidate) => candidate.id === timelineId);
+        if (existingIndex < 0) return [...current, item];
+        const next = [...current];
+        next[existingIndex] = item;
+        return next;
+      });
+    };
+
+    for (let attempt = 1; attempt <= 300; attempt += 1) {
+      try {
+        const response = await api.listSyncExecutions(taskId);
+        const executions = [...response.data.records].sort((left, right) => Number(right.id) - Number(left.id));
+        const execution = expectedExecutionId
+          ? executions.find((item) => Number(item.id) === expectedExecutionId)
+          : executions[0];
+        if (!execution) {
+          updateTimeline({
+            id: timelineId,
+            category: "COMMAND",
+            stage: "wait_recovery_execution",
+            status: "RUNNING",
+            title: "等待 data-sync 创建恢复 execution",
+            summary: `任务 #${taskId} 已进入恢复链路，正在等待 worker 接收执行。`,
+            details: { taskId, expectedExecutionId, pollAttempt: attempt },
+          });
+          await wait(1000);
+          continue;
+        }
+
+        const state = String(execution.executionState || "QUEUED").toUpperCase();
+        updateTimeline({
+          id: timelineId,
+          category: "COMMAND",
+          stage: "wait_recovery_execution",
+          status: terminalSyncExecutionStates.has(state)
+            ? (state === "SUCCEEDED" ? "SUCCEEDED" : state)
+            : "RUNNING",
+          title: `跟踪同步恢复执行 #${execution.id}`,
+          summary: syncExecutionSummary(execution),
+          details: {
+            taskId,
+            executionId: execution.id,
+            executionState: state,
+            recordsRead: execution.recordsRead ?? 0,
+            recordsWritten: execution.recordsWritten ?? 0,
+            failedRecordCount: execution.failedRecordCount ?? 0,
+            executorId: execution.executorId,
+            heartbeatTime: execution.heartbeatTime,
+            pollAttempt: attempt,
+          },
+        });
+        if (terminalSyncExecutionStates.has(state)) return execution;
+      } catch (error) {
+        updateTimeline({
+          id: timelineId,
+          category: "COMMAND",
+          stage: "wait_recovery_execution",
+          status: "RUNNING",
+          title: "恢复执行状态暂时不可用",
+          summary: `${errorMessage(error)}；Agent 会继续重试读取真实执行账本。`,
+          details: { taskId, expectedExecutionId, pollAttempt: attempt },
+        });
+      }
+      await wait(1000);
+    }
+
+    updateTimeline({
+      id: timelineId,
+      category: "USER_ACTION",
+      stage: "wait_recovery_execution",
+      status: "WAITING",
+      title: "同步恢复执行仍在运行",
+      summary: `任务 #${taskId} 在 5 分钟观察窗口内尚未结束；当前不会基于未完成结果继续模型决策。`,
+      details: { taskId, expectedExecutionId, timeoutSeconds: 300 },
+    });
+    return undefined;
+  };
 
   const consumePlanStreamFrame = (frame: AgentPlanStreamFrame) => {
     if (frame.requestId) setLiveRequestId(frame.requestId);
@@ -555,6 +693,14 @@ function UserAgentAssistant() {
         variables.taskImportArtifactRef = submission.taskImportArtifactRef;
         variables.taskImportRunImmediately = Boolean(submission.taskImportRunImmediately);
       }
+      if (submission.recoveryTaskId) {
+        variables.taskId = submission.recoveryTaskId;
+        variables.diagnoseSyncExecution = true;
+      }
+      if (submission.recoveryExecutionId) {
+        variables.executionId = submission.recoveryExecutionId;
+        variables.recoveryExecutionId = submission.recoveryExecutionId;
+      }
       const requestId = crypto.randomUUID();
       return api.createAgentPlanStream({
         tenant_id: String(session.tenantId),
@@ -567,13 +713,56 @@ function UserAgentAssistant() {
         variables,
       }, consumePlanStreamFrame);
     },
-    onMutate: () => {
-      setLiveObservationItems([]);
-      setLiveRequestId(undefined);
+    onMutate: (submission) => {
+      if (!submission.preserveTimeline) {
+        setLiveObservationItems([]);
+        setLiveRequestId(undefined);
+      }
     },
     onSuccess: (result, submission) => {
       const nextPlan = result.data;
       const conversation = nextPlan.agentConversation;
+      if (submission.preserveTimeline) {
+        const historyScope = plan?.agentObservationTimeline?.requestId || plan?.plan?.requestId || "previous";
+        const planningHistory = (plan?.agentObservationTimeline?.items ?? []).map((item) => ({
+          ...item,
+          id: `history-${historyScope}-${item.id}`,
+        }));
+        const auditHistory = audits.map((audit) => ({
+          id: `history-audit-${audit.auditId}`,
+          category: "TOOL",
+          stage: "execute_java_tool",
+          status: audit.state,
+          title: `调用工具：${humanReadableToolName(audit.toolCode)}`,
+          summary: audit.message || audit.planReason || "Java Agent Runtime 已处理该工具节点。",
+          details: {
+            auditId: audit.auditId,
+            toolCode: audit.toolCode,
+            targetService: audit.targetService,
+            riskLevel: audit.riskLevel,
+            requiresHumanApproval: audit.requiresApproval,
+            outputSummary: audit.outputSummary,
+            errorCode: audit.errorCode,
+          },
+        } satisfies AgentObservationTimelineItem));
+        const resultHistory = executionResults.map((item) => ({
+          id: `history-result-${item.audit.auditId}`,
+          category: "TOOL",
+          stage: "tool_result_received",
+          status: item.audit.state,
+          title: `工具结果：${humanReadableToolName(item.audit.toolCode)}`,
+          summary: item.audit.message || item.audit.outputSummary || "工具已返回受治理结果。",
+          details: {
+            toolCode: item.audit.toolCode,
+            result: item.output,
+          },
+        } satisfies AgentObservationTimelineItem));
+        setLiveObservationItems((current) => {
+          const merged = new Map(current.map((item) => [item.id, item]));
+          [...planningHistory, ...auditHistory, ...resultHistory].forEach((item) => merged.set(item.id, item));
+          return [...merged.values()];
+        });
+      }
       setPlan(nextPlan);
       setExecutionResults([]);
       setExecutionAnswer(undefined);
@@ -654,6 +843,22 @@ function UserAgentAssistant() {
     onMutate: () => setExecutionInProgress(true),
     onSuccess: async (result) => {
       setExecutionResults(result.data.toolResults);
+      setLiveObservationItems((current) => {
+        const merged = new Map(current.map((item) => [item.id, item]));
+        result.data.toolResults.forEach((item) => merged.set(`history-result-${item.audit.auditId}`, {
+          id: `history-result-${item.audit.auditId}`,
+          category: "TOOL",
+          stage: "tool_result_received",
+          status: item.audit.state,
+          title: `工具结果：${humanReadableToolName(item.audit.toolCode)}`,
+          summary: item.audit.message || item.audit.outputSummary || "工具已返回受治理结果。",
+          details: {
+            toolCode: item.audit.toolCode,
+            result: item.output,
+          },
+        }));
+        return [...merged.values()];
+      });
       setExecutionAnswer({
         content: result.data.assistantReply || "工具执行已经结束，请查看节点状态。",
         mode: result.data.answerMode || "DETERMINISTIC_FALLBACK",
@@ -682,8 +887,52 @@ function UserAgentAssistant() {
           objective: taskImportObjective,
           taskImportArtifactRef: repairedArtifactRef,
           taskImportRunImmediately,
+          preserveTimeline: true,
         });
+        return;
       }
+
+      const recoveryToolNames = new Set([
+        "datasource.schema.repair.apply",
+        "sync.dirty-record.quarantine.apply",
+        "sync.execution.failed-objects.retry",
+        "sync.dirty-record.replay",
+      ]);
+      const recoveryResult = [...result.data.toolResults]
+        .reverse()
+        .find((item) => item.audit.state === "SUCCEEDED" && recoveryToolNames.has(item.audit.toolCode));
+      if (!recoveryResult) return;
+
+      const taskId = findNumericField(recoveryResult.output, ["taskId", "syncTaskId"])
+        ?? planMutation.variables?.recoveryTaskId;
+      const diagnosisExecutionId = findNumericField(
+        recoveryResult.output,
+        ["diagnosisExecutionId", "sourceExecutionId", "executionId"],
+      ) ?? planMutation.variables?.recoveryExecutionId;
+      if (!taskId || !diagnosisExecutionId) {
+        message.warning("恢复动作已完成，但结果缺少任务或原失败 execution 标识；为避免基于猜测继续，Agent 已安全暂停。");
+        return;
+      }
+
+      if (["sync.execution.failed-objects.retry", "sync.dirty-record.replay"].includes(recoveryResult.audit.toolCode)) {
+        const expectedExecutionId = recoveryResult.audit.toolCode === "sync.dirty-record.replay"
+          ? findNumericField(recoveryResult.output, ["replayExecutionId"])
+          : findNumericField(recoveryResult.output, ["executionId"]);
+        message.info("恢复执行已进入 data-sync 队列，Agent 正在实时跟踪 worker 结果");
+        const terminalExecution = await waitForRecoveryExecution(taskId, expectedExecutionId);
+        if (!terminalExecution) {
+          message.warning("恢复执行仍未结束，Agent 已保留现场，不会提前宣告成功或继续修改数据。");
+          return;
+        }
+      }
+
+      message.info("恢复动作已取得真实结果，Agent 正在进入下一轮验证与决策");
+      planMutation.mutate({
+        objective: `继续排查并闭环同步任务 ${taskId}。读取原失败执行 ${diagnosisExecutionId}，验证最新执行结果；若已经成功且失败行数为 0，则沉淀恢复案例，否则仅提出下一项有证据、可预览、需确认的修复动作。`,
+        recoveryTaskId: taskId,
+        recoveryExecutionId: diagnosisExecutionId,
+        preserveTimeline: true,
+      });
     },
     onError: (error) => message.error(errorMessage(error)),
     onSettled: () => setExecutionInProgress(false),
@@ -702,11 +951,25 @@ function UserAgentAssistant() {
         plan?.agentDurableModelToolLoop?.stoppedReason ?? "",
       )
     : planItems.some((item) => item.requiresHumanApproval);
-  const confirmationButtonLabel = activeToolNames.includes("sync.task.import.repair.apply")
-    ? "确认并应用模型修复"
-    : activeToolNames.includes("sync.task.import.commit")
-      ? "确认正式导入任务"
-      : "确认并执行本次计划";
+  const confirmationButtonLabel = activeToolNames.includes("datasource.schema.repair.apply")
+    ? "确认并应用目标表结构修复"
+    : activeToolNames.includes("sync.dirty-record.quarantine.apply")
+      ? "确认并隔离所选坏行"
+      : activeToolNames.includes("sync.execution.failed-objects.retry")
+        ? "确认并重试失败对象"
+        : activeToolNames.includes("sync.dirty-record.replay")
+          ? "确认并重放已修复坏行"
+          : activeToolNames.includes("sync.task.import.repair.apply")
+            ? "确认并应用模型修复"
+            : activeToolNames.includes("sync.task.import.commit")
+              ? "确认正式导入任务"
+              : "确认并执行本次计划";
+  const isRecoveryConfirmation = activeToolNames.some((toolName) => [
+    "datasource.schema.repair.apply",
+    "sync.dirty-record.quarantine.apply",
+    "sync.execution.failed-objects.retry",
+    "sync.dirty-record.replay",
+  ].includes(toolName));
   const hasDatasourceOptions = sourceOptions.length > 0 && targetOptions.length > 0;
   const syncMode = conversation?.structuredIntent.syncMode || "FULL";
   const resolverMode = textField(conversation?.intentResolver, "mode");
@@ -722,7 +985,7 @@ function UserAgentAssistant() {
     const finalizedStages = new Set(planningItems.map((item) => item.stage));
     // 最终响应中的产品化摘要替换同阶段的临时事件；上下文等未被聚合覆盖的节点继续保留，便于完整回放。
     const retainedLiveItems = liveObservationItems.filter((item) => (
-      item.status === "RUNNING" || !finalizedStages.has(item.stage)
+      item.id.startsWith("history-") || item.status === "RUNNING" || !finalizedStages.has(item.stage)
     ));
     const executionItems = audits.map((audit) => ({
       id: `execution-${audit.auditId}`,
@@ -1145,8 +1408,10 @@ function UserAgentAssistant() {
           <Alert
             showIcon
             type="warning"
-            message="确认后才会执行写节点"
-            description="连接测试和元数据读取为只读节点；草稿保存、预检查、发布和运行会改变业务状态，只在本次确认后执行。"
+            message={isRecoveryConfirmation ? "确认后才会执行受控恢复动作" : "确认后才会执行写节点"}
+            description={isRecoveryConfirmation
+              ? "诊断、RAG 检索和修复预览均为只读；结构修改、坏行隔离、失败对象重试或修复重放只在本次授权后执行。坏行隔离不会删除源端数据，执行完成后 Agent 会继续验证真实同步结果。"
+              : "连接测试和元数据读取为只读节点；草稿保存、预检查、发布和运行会改变业务状态，只在本次确认后执行。"}
             style={{ marginTop: 16, marginBottom: 16 }}
           />
           <Button
@@ -1184,7 +1449,7 @@ function UserAgentAssistant() {
                 <div className="split-row">
                   <Space>
                     {audit.state === "SUCCEEDED" ? <CheckCircleOutlined style={{ color: "#16a34a" }} /> : <RobotOutlined />}
-                    <Typography.Text strong>{audit.toolCode}</Typography.Text>
+                    <Typography.Text strong>{humanReadableToolName(audit.toolCode)}</Typography.Text>
                     <Tag color={statusColor(audit.state)}>{audit.state}</Tag>
                   </Space>
                   <Typography.Text type="secondary">{audit.message || audit.planReason || "等待执行"}</Typography.Text>
@@ -1195,21 +1460,45 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
-      {executionResults.some((item) => item.audit.state === "FAILED") ? (
-        <Card title="失败节点详情与建议" className="compact-card">
+      {executionResults.length ? (
+        <Card title="Agent 工具结果与恢复证据" className="compact-card">
+          <Alert
+            showIcon
+            type="info"
+            message="这里展示工具实际返回的低敏事实，而不是模型猜测"
+            description="可展开查看执行 ID、根因编码、RAG 引用、修复预览摘要、重试/重放结果和验证状态。数据库凭据、原始坏行、隐藏推理和未经治理的内部参数不会展示。"
+            style={{ marginBottom: 16 }}
+          />
           <Space direction="vertical" style={{ width: "100%" }}>
-            {executionResults.filter((item) => item.audit.state === "FAILED").map((item) => (
-              <Alert
+            {executionResults.map((item) => (
+              <Card
                 key={item.audit.auditId}
-                showIcon
-                type="error"
-                message={`${item.audit.toolCode}：${item.audit.message || "节点执行失败"}`}
-                description={(
-                  <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                    {JSON.stringify(item.output, null, 2)}
-                  </pre>
+                size="small"
+                title={(
+                  <Space wrap>
+                    <Typography.Text strong>{humanReadableToolName(item.audit.toolCode)}</Typography.Text>
+                    <Tag color={statusColor(item.audit.state)}>{item.audit.state}</Tag>
+                    <Tag>{item.audit.targetService || "Agent Runtime"}</Tag>
+                  </Space>
                 )}
-              />
+              >
+                <Typography.Paragraph style={{ marginBottom: 8 }}>
+                  {item.audit.message || item.audit.outputSummary || "工具已返回受治理结果。"}
+                </Typography.Paragraph>
+                <Collapse
+                  ghost
+                  size="small"
+                  items={[{
+                    key: `${item.audit.auditId}-result`,
+                    label: "查看结构化结果与证据",
+                    children: (
+                      <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                        {JSON.stringify(item.output, null, 2)}
+                      </pre>
+                    ),
+                  }]}
+                />
+              </Card>
             ))}
           </Space>
         </Card>
