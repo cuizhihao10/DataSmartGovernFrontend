@@ -281,7 +281,9 @@ function observationDetailLabel(key: string) {
     errorCode: "错误码",
     strategySummary: "策略摘要",
     selectedProviderName: "模型 Provider",
-    selectedModelName: "模型",
+    selectedModelName: "实际响应模型",
+    actualModelName: "实际响应模型",
+    requestedModelName: "请求模型",
     visibleToolCount: "可见工具数",
     occurredAt: "发生时间",
     elapsedSeconds: "已等待时长",
@@ -394,6 +396,7 @@ function formatObservationValue(value: unknown, key?: string) {
     return {
       MODEL_PROVIDER: "真实模型 Provider",
       DATASMART_RESULT_CACHE: "DataSmart 会话响应缓存",
+      DRY_RUN: "本地诊断模拟（未调用真实模型）",
     }[value] || value;
   }
   if (Array.isArray(value)) return value.length ? value.join("、") : "无";
@@ -975,6 +978,7 @@ function UserAgentAssistant() {
   const resolverMode = textField(conversation?.intentResolver, "mode");
   const modelProvider = textField(conversation?.intentResolver, "modelProvider");
   const modelName = textField(conversation?.intentResolver, "modelName");
+  const requestedModelName = textField(conversation?.intentResolver, "requestedModelName");
   const modelInvoked = booleanField(conversation?.intentResolver, "providerInvokedForCurrentTurn");
   const modelSucceeded = booleanField(conversation?.intentResolver, "providerSucceededForCurrentTurn");
   const modelLatencyMs = numberField(conversation?.intentResolver, "latencyMs");
@@ -1178,6 +1182,9 @@ function UserAgentAssistant() {
             </Tag>
             {modelProvider ? <Tag color="geekblue">{modelProvider}</Tag> : null}
             {modelName ? <Tag color="blue">{modelName}</Tag> : null}
+            {requestedModelName && requestedModelName !== modelName ? (
+              <Tag>{`请求模型：${requestedModelName}`}</Tag>
+            ) : null}
             {modelLatencyMs !== undefined ? <Tag>{modelLatencyMs} ms</Tag> : null}
             {modelTotalTokens !== undefined ? <Tag>{modelTotalTokens} tokens</Tag> : null}
           </Space>
