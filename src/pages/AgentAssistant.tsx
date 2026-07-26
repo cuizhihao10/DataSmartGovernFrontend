@@ -18,6 +18,7 @@ import {
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Alert,
+  AutoComplete,
   Button,
   Card,
   Checkbox,
@@ -41,6 +42,22 @@ import { useNavigate } from "react-router-dom";
 import { api } from "@/api/endpoints";
 import type { AgentPlanStreamFrame, AgentPlanStreamProgressEvent } from "@/api/endpoints";
 import { PageHeader } from "@/components/PageHeader";
+import {
+  findMetadataTableByKey,
+  findSameNameTargetTable,
+  isMysqlLikeConnector,
+  isRealtimeSyncMode,
+  isScheduledSyncMode,
+  isSqlSyncMode,
+  makeFieldMappings,
+  metadataTableOptions,
+  normalizeUserSyncMode,
+  sortedColumns,
+  tableObjectKey,
+  userSyncModeOptions,
+  type SyncFieldMappingRow,
+  type UserSyncMode,
+} from "@/features/dataSync/syncTaskMapping";
 import { AgentConsole } from "@/pages/AgentConsole";
 import { useAuthStore } from "@/store/authStore";
 import { useUiStore } from "@/store/uiStore";
@@ -54,11 +71,15 @@ import type {
 } from "@/types/domain";
 
 interface ObjectMappingInput {
+  objectKey?: string;
+  sourceTableKey?: string;
+  targetTableKey?: string;
   sourceSchemaName?: string;
-  sourceObjectName: string;
+  sourceObjectName?: string;
   targetSchemaName?: string;
   targetObjectName: string;
   whereCondition?: string;
+  fieldMappings: SyncFieldMappingRow[];
 }
 
 interface ObjectiveFormValues {
@@ -67,16 +88,18 @@ interface ObjectiveFormValues {
 
 interface ClarificationFormValues {
   taskName: string;
+  syncMode: UserSyncMode;
   sourceDatasourceId: number;
   targetDatasourceId: number;
   writeStrategy: "INSERT" | "UPDATE";
+  scheduleConfig?: string;
+  customSqlText?: string;
   objectMappings: ObjectMappingInput[];
 }
 
 interface PlanSubmission {
   objective: string;
   clarification?: ClarificationFormValues;
-  syncMode?: string;
   taskImportArtifactRef?: string;
   taskImportRunImmediately?: boolean;
   recoveryTaskId?: number;
@@ -93,24 +116,12 @@ interface ExecutionAnswer {
 const defaultObjective = "将 MySQL 中的 fs_test_customer_source 和 fs_test_customer_target 全量同步到 PostgreSQL public schema 的同名表。";
 const taskImportObjective = "检查这个任务文件，先试运行；若失败则检索产品文档和历史案例，提出可执行修复方案，经我确认后修复、重新校验并导入。";
 
-const defaultMappings: ObjectMappingInput[] = [
-  {
-    sourceObjectName: "fs_test_customer_source",
-    targetSchemaName: "public",
-    targetObjectName: "fs_test_customer_source",
-  },
-  {
-    sourceObjectName: "fs_test_customer_target",
-    targetSchemaName: "public",
-    targetObjectName: "fs_test_customer_target",
-  },
-];
-
 const syncModeLabels: Record<string, string> = {
   FULL: "全量传输",
   SCHEDULED_BATCH: "定期批量",
   SCHEDULED_FULL: "定期全量",
   CUSTOM_SQL_QUERY: "SQL 语句",
+  CDC_STREAMING: "实时同步",
   REAL_TIME: "实时同步",
 };
 
@@ -500,6 +511,10 @@ function UserAgentAssistant() {
   });
   const session = sessionQuery.data?.data;
   const projectId = selectedProjectId ? Number(selectedProjectId) : undefined;
+  const clarificationSourceDatasourceId = Form.useWatch("sourceDatasourceId", clarificationForm);
+  const clarificationTargetDatasourceId = Form.useWatch("targetDatasourceId", clarificationForm);
+  const clarificationSyncMode = Form.useWatch("syncMode", clarificationForm);
+  const clarificationMappings = Form.useWatch("objectMappings", clarificationForm) ?? [];
   const sourceQuery = useQuery({
     queryKey: ["agent-assistant-source-datasources", projectId],
     queryFn: () => api.listDataSources({ current: 1, size: 100, projectId, usagePurpose: "SOURCE", status: "ENABLED" }),
@@ -510,20 +525,154 @@ function UserAgentAssistant() {
     queryFn: () => api.listDataSources({ current: 1, size: 100, projectId, usagePurpose: "TARGET", status: "ENABLED" }),
     enabled: Boolean(projectId),
   });
-  const sourceOptions = useMemo(
-    () => (sourceQuery.data?.data.records ?? []).map((item) => ({
-      value: item.id,
-      label: `#${item.id} ${item.name}（${item.type}）`,
-    })),
+  const sourceDatasources = useMemo(
+    () => sourceQuery.data?.data.records ?? [],
     [sourceQuery.data?.data.records],
   );
-  const targetOptions = useMemo(
-    () => (targetQuery.data?.data.records ?? []).map((item) => ({
+  const targetDatasources = useMemo(
+    () => targetQuery.data?.data.records ?? [],
+    [targetQuery.data?.data.records],
+  );
+  const sourceOptions = useMemo(
+    () => sourceDatasources.map((item) => ({
       value: item.id,
       label: `#${item.id} ${item.name}（${item.type}）`,
     })),
-    [targetQuery.data?.data.records],
+    [sourceDatasources],
   );
+  const targetOptions = useMemo(
+    () => targetDatasources.map((item) => ({
+      value: item.id,
+      label: `#${item.id} ${item.name}（${item.type}）`,
+    })),
+    [targetDatasources],
+  );
+  const selectedSourceDatasource = sourceDatasources.find(
+    (item) => Number(item.id) === Number(clarificationSourceDatasourceId),
+  );
+  const selectedTargetDatasource = targetDatasources.find(
+    (item) => Number(item.id) === Number(clarificationTargetDatasourceId),
+  );
+  const sourceMetadataQuery = useQuery({
+    queryKey: ["agent-assistant-source-metadata", projectId, clarificationSourceDatasourceId],
+    queryFn: () => api.discoverSyncTaskMetadata({
+      datasourceId: Number(clarificationSourceDatasourceId),
+      side: "SOURCE",
+      connectorType: selectedSourceDatasource?.type,
+      filterMode: "ALL",
+      includeColumns: true,
+      includeViews: true,
+      maxTables: 500,
+      maxColumnsPerTable: 160,
+    }),
+    enabled: Boolean(projectId && clarificationSourceDatasourceId),
+    staleTime: 30_000,
+  });
+  const targetMetadataQuery = useQuery({
+    queryKey: ["agent-assistant-target-metadata", projectId, clarificationTargetDatasourceId],
+    queryFn: () => api.discoverSyncTaskMetadata({
+      datasourceId: Number(clarificationTargetDatasourceId),
+      side: "TARGET",
+      connectorType: selectedTargetDatasource?.type,
+      filterMode: "ALL",
+      includeColumns: true,
+      includeViews: true,
+      maxTables: 500,
+      maxColumnsPerTable: 160,
+    }),
+    enabled: Boolean(projectId && clarificationTargetDatasourceId),
+    staleTime: 30_000,
+  });
+  const sourceMetadata = sourceMetadataQuery.data?.data;
+  const targetMetadata = targetMetadataQuery.data?.data;
+  const sourceTableOptions = useMemo(() => metadataTableOptions(sourceMetadata), [sourceMetadata]);
+  const targetTableOptions = useMemo(() => metadataTableOptions(targetMetadata), [targetMetadata]);
+
+  const updateClarificationMapping = (index: number, patch: Partial<ObjectMappingInput>) => {
+    const mappings = [...(clarificationForm.getFieldValue("objectMappings") ?? [])];
+    mappings[index] = {
+      fieldMappings: [],
+      ...mappings[index],
+      ...patch,
+    };
+    clarificationForm.setFieldValue("objectMappings", mappings);
+  };
+
+  const selectSourceMappingTable = (index: number, sourceTableKey: string) => {
+    const sourceTable = findMetadataTableByKey(sourceMetadata, sourceTableKey);
+    if (!sourceTable) return;
+    const sameNameTarget = findSameNameTargetTable(sourceTable, targetMetadata);
+    const sameNameTargetIndex = sameNameTarget
+      ? (targetMetadata?.tables ?? []).indexOf(sameNameTarget)
+      : -1;
+    const targetTableKey = sameNameTarget && sameNameTargetIndex >= 0
+      ? tableObjectKey(sameNameTarget, sameNameTargetIndex)
+      : undefined;
+    updateClarificationMapping(index, {
+      objectKey: `agent-${sourceTableKey}`,
+      sourceTableKey,
+      sourceSchemaName: sourceTable.schemaName,
+      sourceObjectName: sourceTable.tableName,
+      // Only an actual same-name table may be filled automatically. Never use
+      // "the first target table" as a fallback because that creates false pairs.
+      targetTableKey,
+      targetSchemaName: sameNameTarget?.schemaName,
+      targetObjectName: sameNameTarget?.tableName ?? "",
+      fieldMappings: makeFieldMappings(
+        sortedColumns(sourceTable),
+        sortedColumns(sameNameTarget),
+      ),
+    });
+  };
+
+  const selectTargetMappingTable = (index: number, targetTableKey: string) => {
+    const mapping = (clarificationForm.getFieldValue("objectMappings") ?? [])[index];
+    const sourceTable = findMetadataTableByKey(sourceMetadata, mapping?.sourceTableKey);
+    const targetTable = findMetadataTableByKey(targetMetadata, targetTableKey);
+    if (!targetTable) return;
+    updateClarificationMapping(index, {
+      targetTableKey,
+      targetSchemaName: targetTable.schemaName,
+      targetObjectName: targetTable.tableName,
+      fieldMappings: isSqlSyncMode(clarificationSyncMode)
+        ? mapping?.fieldMappings ?? []
+        : makeFieldMappings(sortedColumns(sourceTable), sortedColumns(targetTable)),
+    });
+  };
+
+  const clearTargetMappingTable = (index: number) => {
+    const mapping = (clarificationForm.getFieldValue("objectMappings") ?? [])[index];
+    const sourceTable = findMetadataTableByKey(sourceMetadata, mapping?.sourceTableKey);
+    updateClarificationMapping(index, {
+      targetTableKey: undefined,
+      targetSchemaName: undefined,
+      targetObjectName: "",
+      fieldMappings: isSqlSyncMode(clarificationSyncMode)
+        ? []
+        : makeFieldMappings(sortedColumns(sourceTable), []),
+    });
+  };
+
+  const changeClarificationSyncMode = (mode: UserSyncMode) => {
+    const realtime = isRealtimeSyncMode(mode);
+    const sql = isSqlSyncMode(mode);
+    clarificationForm.setFieldsValue({
+      syncMode: mode,
+      writeStrategy: realtime ? "UPDATE" : clarificationForm.getFieldValue("writeStrategy") || "INSERT",
+      scheduleConfig: isScheduledSyncMode(mode)
+        ? clarificationForm.getFieldValue("scheduleConfig")
+          || '{"cron":"0 0 2 * * ?","timezone":"Asia/Shanghai"}'
+        : undefined,
+      customSqlText: sql ? clarificationForm.getFieldValue("customSqlText") : undefined,
+      objectMappings: sql
+        ? [{
+            objectKey: "agent-sql-result",
+            targetObjectName: "",
+            fieldMappings: [],
+          }]
+        : [],
+    });
+  };
 
   const auditsQuery = useQuery({
     queryKey: ["agent-assistant-audits", controlPlane?.sessionId, controlPlane?.runId],
@@ -675,20 +824,44 @@ function UserAgentAssistant() {
         streamModelIntent: false,
       };
       if (submission.clarification) {
+        const selectedMode = normalizeUserSyncMode(submission.clarification.syncMode);
         variables.dataSyncRequest = {
           taskName: submission.clarification.taskName,
           taskDescription: submission.objective,
           sourceDatasourceId: submission.clarification.sourceDatasourceId,
           targetDatasourceId: submission.clarification.targetDatasourceId,
-          syncMode: submission.syncMode || "FULL",
-          writeStrategy: submission.syncMode === "REAL_TIME"
+          syncMode: selectedMode,
+          writeStrategy: isRealtimeSyncMode(selectedMode)
             ? "UPDATE"
             : submission.clarification.writeStrategy,
+          scheduleConfig: isScheduledSyncMode(selectedMode)
+            ? submission.clarification.scheduleConfig
+            : undefined,
+          customSqlText: isSqlSyncMode(selectedMode)
+            ? submission.clarification.customSqlText
+            : undefined,
           groupCode: "DEFAULT",
           groupName: "默认分组",
           objectMappings: submission.clarification.objectMappings.map((item, index) => ({
-            objectKey: `agent-mapping-${index + 1}`,
-            ...item,
+            objectKey: item.objectKey || `agent-mapping-${index + 1}`,
+            sourceSchemaName: isSqlSyncMode(selectedMode) ? undefined : item.sourceSchemaName,
+            sourceObjectName: isSqlSyncMode(selectedMode) ? undefined : item.sourceObjectName,
+            targetSchemaName: item.targetSchemaName,
+            targetObjectName: item.targetObjectName,
+            whereCondition: isSqlSyncMode(selectedMode) ? undefined : item.whereCondition,
+            fieldMappings: item.fieldMappings
+              .filter((field) => field.syncEnabled !== false && field.sourceField && field.targetField)
+              .map((field) => ({
+                sourceField: field.sourceField,
+                sourceType: field.sourceType,
+                targetField: field.targetField,
+                targetType: field.targetType,
+                nullable: field.nullable,
+                primaryKey: field.primaryKey,
+                syncEnabled: true,
+                typeCompatible: field.typeCompatible,
+                transform: field.transform,
+              })),
           })),
         };
       }
@@ -773,13 +946,20 @@ function UserAgentAssistant() {
       if (conversation?.phase === "WAITING_CLARIFICATION") {
         setControlPlane(undefined);
         if (!submission.clarification) {
+          const inferredMode = normalizeUserSyncMode(conversation.structuredIntent.syncMode);
           clarificationForm.resetFields();
           clarificationForm.setFieldsValue({
             taskName: "Agent 创建的数据同步任务",
-            writeStrategy: conversation.structuredIntent.syncMode === "REAL_TIME" ? "UPDATE" : "INSERT",
-            objectMappings: submission.objective === defaultObjective
-              ? defaultMappings.map((item) => ({ ...item }))
-              : [{ sourceObjectName: "", targetSchemaName: "public", targetObjectName: "" }],
+            syncMode: inferredMode,
+            writeStrategy: isRealtimeSyncMode(inferredMode) ? "UPDATE" : "INSERT",
+            scheduleConfig: isScheduledSyncMode(inferredMode)
+              ? '{"cron":"0 0 2 * * ?","timezone":"Asia/Shanghai"}'
+              : undefined,
+            objectMappings: [{
+              objectKey: isSqlSyncMode(inferredMode) ? "agent-sql-result" : "agent-mapping-1",
+              targetObjectName: "",
+              fieldMappings: [],
+            }],
           });
         }
         message.info("Agent 已理解目标，请补充执行所需参数");
@@ -974,7 +1154,13 @@ function UserAgentAssistant() {
     "sync.dirty-record.replay",
   ].includes(toolName));
   const hasDatasourceOptions = sourceOptions.length > 0 && targetOptions.length > 0;
-  const syncMode = conversation?.structuredIntent.syncMode || "FULL";
+  const syncMode = normalizeUserSyncMode(conversation?.structuredIntent.syncMode);
+  const activeClarificationMode = normalizeUserSyncMode(clarificationSyncMode || syncMode);
+  const sqlClarificationMode = isSqlSyncMode(activeClarificationMode);
+  const scheduledClarificationMode = isScheduledSyncMode(activeClarificationMode);
+  const realtimeClarificationMode = isRealtimeSyncMode(activeClarificationMode);
+  const sourceSchemaOptional = isMysqlLikeConnector(selectedSourceDatasource?.type);
+  const targetSchemaOptional = isMysqlLikeConnector(selectedTargetDatasource?.type);
   const resolverMode = textField(conversation?.intentResolver, "mode");
   const modelProvider = textField(conversation?.intentResolver, "modelProvider");
   const modelName = textField(conversation?.intentResolver, "modelName");
@@ -1288,17 +1474,44 @@ function UserAgentAssistant() {
           <Form<ClarificationFormValues>
             form={clarificationForm}
             layout="vertical"
-            onFinish={(values) => planMutation.mutate({ objective, clarification: values, syncMode })}
+            onFinish={(values) => planMutation.mutate({ objective, clarification: values })}
           >
-            <Form.Item name="taskName" label="任务名称" rules={[{ required: true, message: "请输入任务名称" }]}>
-              <Input maxLength={128} />
-            </Form.Item>
+            <div className="grid grid-two-form">
+              <Form.Item name="taskName" label="任务名称" rules={[{ required: true, message: "请输入任务名称" }]}>
+                <Input maxLength={128} />
+              </Form.Item>
+              <Form.Item name="syncMode" label="传输模式" rules={[{ required: true, message: "请选择传输模式" }]}>
+                <Select options={userSyncModeOptions} onChange={changeClarificationSyncMode} />
+              </Form.Item>
+            </div>
             <div className="grid grid-two-form">
               <Form.Item name="sourceDatasourceId" label="源端数据源" rules={[{ required: true, message: "请选择源端数据源" }]}>
-                <Select showSearch optionFilterProp="label" options={sourceOptions} loading={sourceQuery.isLoading} placeholder="仅展示 SOURCE 数据源" />
+                <Select
+                  showSearch
+                  optionFilterProp="label"
+                  options={sourceOptions}
+                  loading={sourceQuery.isLoading}
+                  placeholder="仅展示 SOURCE 数据源"
+                  onChange={() => clarificationForm.setFieldValue("objectMappings", [{
+                    objectKey: sqlClarificationMode ? "agent-sql-result" : "agent-mapping-1",
+                    targetObjectName: "",
+                    fieldMappings: [],
+                  }])}
+                />
               </Form.Item>
               <Form.Item name="targetDatasourceId" label="目标端数据源" rules={[{ required: true, message: "请选择目标端数据源" }]}>
-                <Select showSearch optionFilterProp="label" options={targetOptions} loading={targetQuery.isLoading} placeholder="仅展示 TARGET 数据源" />
+                <Select
+                  showSearch
+                  optionFilterProp="label"
+                  options={targetOptions}
+                  loading={targetQuery.isLoading}
+                  placeholder="仅展示 TARGET 数据源"
+                  onChange={() => clarificationForm.setFieldValue("objectMappings", [{
+                    objectKey: sqlClarificationMode ? "agent-sql-result" : "agent-mapping-1",
+                    targetObjectName: "",
+                    fieldMappings: [],
+                  }])}
+                />
               </Form.Item>
             </div>
             {!hasDatasourceOptions ? (
@@ -1310,9 +1523,51 @@ function UserAgentAssistant() {
                 style={{ marginBottom: 16 }}
               />
             ) : null}
+            {sourceMetadataQuery.isError || targetMetadataQuery.isError ? (
+              <Alert
+                showIcon
+                type="error"
+                message="元数据加载失败，暂时不能形成可靠的源表到目标表映射"
+                description="请确认数据源连接及授权后重试。Agent 不会在缺少真实元数据时猜测表名或字段映射。"
+                style={{ marginBottom: 16 }}
+              />
+            ) : null}
+            {scheduledClarificationMode ? (
+              <Form.Item
+                name="scheduleConfig"
+                label="定时配置"
+                rules={[{ required: true, message: "定期全量/定期批量必须配置调度规则" }]}
+              >
+                <Input.TextArea rows={2} placeholder='{"cron":"0 0 2 * * ?","timezone":"Asia/Shanghai"}' />
+              </Form.Item>
+            ) : null}
+            {sqlClarificationMode ? (
+              <Form.Item
+                name="customSqlText"
+                label="只读 SQL"
+                rules={[
+                  { required: true, message: "SQL 语句模式必须填写查询 SQL" },
+                  {
+                    validator: async (_, value?: string) => {
+                      const sql = value?.trim() || "";
+                      if (!sql) return;
+                      if (!/^(select|with)\b/i.test(sql)
+                        || /\b(insert|update|delete|drop|truncate|alter|create|merge|call)\b/i.test(sql)) {
+                        throw new Error("只允许单条 SELECT/WITH 只读查询，禁止 DDL/DML 和存储过程");
+                      }
+                    },
+                  },
+                ]}
+              >
+                <Input.TextArea
+                  rows={5}
+                  placeholder="SELECT id, name AS customer_name FROM customer WHERE status = 'ACTIVE'"
+                />
+              </Form.Item>
+            ) : null}
             <Form.Item name="writeStrategy" label="写入策略" rules={[{ required: true }]}>
               <Select
-                disabled={syncMode === "REAL_TIME"}
+                disabled={realtimeClarificationMode}
                 options={[
                   { value: "INSERT", label: "INSERT（目标表需满足插入准入）" },
                   { value: "UPDATE", label: "UPDATE / MERGE（目标表需具备主键或唯一键）" },
@@ -1320,36 +1575,197 @@ function UserAgentAssistant() {
               />
             </Form.Item>
 
-            <Typography.Title level={5}>对象映射</Typography.Title>
-            <Form.List name="objectMappings">
-              {(fields, { add, remove }) => (
+            <Alert
+              showIcon
+              type="info"
+              message={sqlClarificationMode ? "SQL 结果集 → 目标表" : "每一行都必须是明确的“源表 → 目标表”映射"}
+              description={sqlClarificationMode
+                ? "源表和输出字段由 SQL 决定；这里只选择目标表，并把 SQL 输出字段或别名映射到目标字段。"
+                : "源表只能从源端真实元数据中选择；目标端仅在存在同名表时自动匹配，否则保持为空，由你选择或编辑。字段映射与 WHERE 条件都绑定到当前这一对对象。"}
+              style={{ marginBottom: 16 }}
+            />
+            <Typography.Title level={5}>{sqlClarificationMode ? "目标对象与字段映射" : "源表 → 目标表对象映射"}</Typography.Title>
+            <Form.List
+              name="objectMappings"
+              rules={[{
+                validator: async (_, mappings?: ObjectMappingInput[]) => {
+                  if (!mappings?.length) throw new Error("请至少配置一条对象映射");
+                  for (const [index, mapping] of mappings.entries()) {
+                    if (!sqlClarificationMode && !mapping.sourceObjectName) {
+                      throw new Error(`映射 ${index + 1} 尚未选择源表`);
+                    }
+                    if (!mapping.targetObjectName) {
+                      throw new Error(`映射 ${index + 1} 尚未选择或填写目标表`);
+                    }
+                    if (!targetSchemaOptional && !mapping.targetSchemaName) {
+                      throw new Error(`映射 ${index + 1} 的目标数据源需要填写 schema`);
+                    }
+                    const executableFields = (mapping.fieldMappings ?? [])
+                      .filter((item) => item.syncEnabled !== false && item.sourceField && item.targetField);
+                    if (!executableFields.length) {
+                      throw new Error(`映射 ${index + 1} 尚未形成可执行字段映射`);
+                    }
+                  }
+                },
+              }]}
+            >
+              {(fields, { add, remove }, { errors }) => (
                 <Space direction="vertical" style={{ width: "100%" }}>
-                  {fields.map((field, index) => (
-                    <Card key={field.key} size="small" title={`映射 ${index + 1}`} extra={fields.length > 1 ? (
-                      <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(field.name)} />
-                    ) : null}>
-                      <div className="grid grid-two-form">
-                        <Form.Item name={[field.name, "sourceSchemaName"]} label="源 schema（MySQL 可留空）">
-                          <Input placeholder="MySQL 可留空" />
+                  {fields.map((field, index) => {
+                    const mapping = clarificationMappings[index];
+                    const selectedTargetTable = findMetadataTableByKey(targetMetadata, mapping?.targetTableKey);
+                    const targetFieldOptions = sortedColumns(selectedTargetTable)
+                      .map((item) => ({ value: item.fieldName, label: `${item.fieldName}（${item.dataTypeName || "未知类型"}）` }));
+                    const sourceLabel = mapping?.sourceSchemaName
+                      ? `${mapping.sourceSchemaName}.${mapping.sourceObjectName || "未选择"}`
+                      : mapping?.sourceObjectName || "未选择源表";
+                    const targetLabel = mapping?.targetSchemaName
+                      ? `${mapping.targetSchemaName}.${mapping.targetObjectName || "未选择"}`
+                      : mapping?.targetObjectName || "未选择目标表";
+                    return (
+                      <Card
+                        key={field.key}
+                        size="small"
+                        title={sqlClarificationMode
+                          ? `SQL 结果集 → ${targetLabel}`
+                          : `映射 ${index + 1}：${sourceLabel} → ${targetLabel}`}
+                        extra={!sqlClarificationMode && fields.length > 1 ? (
+                          <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(field.name)} />
+                        ) : null}
+                      >
+                        <Form.Item name={[field.name, "objectKey"]} hidden><Input /></Form.Item>
+                        <Form.Item name={[field.name, "sourceSchemaName"]} hidden><Input /></Form.Item>
+                        <Form.Item name={[field.name, "sourceObjectName"]} hidden><Input /></Form.Item>
+                        {!sqlClarificationMode ? (
+                          <Form.Item
+                            name={[field.name, "sourceTableKey"]}
+                            label={`源端表${sourceSchemaOptional ? "（MySQL 无需 schema）" : ""}`}
+                            rules={[{ required: true, message: "请选择真实源表" }]}
+                          >
+                            <Select
+                              showSearch
+                              optionFilterProp="label"
+                              options={sourceTableOptions}
+                              loading={sourceMetadataQuery.isLoading}
+                              placeholder="从源端真实元数据中选择"
+                              onChange={(value) => selectSourceMappingTable(index, value)}
+                            />
+                          </Form.Item>
+                        ) : null}
+                        <Form.Item name={[field.name, "targetTableKey"]} label="从目标端元数据选择表（可选）">
+                          <Select
+                            allowClear
+                            showSearch
+                            optionFilterProp="label"
+                            options={targetTableOptions}
+                            loading={targetMetadataQuery.isLoading}
+                            placeholder="选择后自动填写目标 schema、表名和同名字段"
+                            onChange={(value) => value && selectTargetMappingTable(index, value)}
+                            onClear={() => clearTargetMappingTable(index)}
+                          />
                         </Form.Item>
-                        <Form.Item name={[field.name, "sourceObjectName"]} label="源表" rules={[{ required: true, message: "请输入源表" }]}>
-                          <Input />
-                        </Form.Item>
-                        <Form.Item name={[field.name, "targetSchemaName"]} label="目标 schema" rules={[{ required: true, message: "请输入目标 schema" }]}>
-                          <Input />
-                        </Form.Item>
-                        <Form.Item name={[field.name, "targetObjectName"]} label="目标表" rules={[{ required: true, message: "请输入目标表" }]}>
-                          <Input />
-                        </Form.Item>
-                      </div>
-                      <Form.Item name={[field.name, "whereCondition"]} label="可选 WHERE 条件">
-                        <Input placeholder="例如 status = 'ACTIVE'，仍由 data-sync 安全解析与预检查" />
-                      </Form.Item>
-                    </Card>
-                  ))}
-                  <Button type="dashed" icon={<PlusOutlined />} onClick={() => add({ targetSchemaName: "public" })} block>
-                    添加对象映射
-                  </Button>
+                        <div className="grid grid-two-form">
+                          <Form.Item
+                            name={[field.name, "targetSchemaName"]}
+                            label={`目标 schema${targetSchemaOptional ? "（MySQL 可留空）" : ""}`}
+                            rules={targetSchemaOptional ? undefined : [{ required: true, message: "请输入目标 schema" }]}
+                          >
+                            <Input placeholder={targetSchemaOptional ? "MySQL/MariaDB 可留空" : "例如 public"} />
+                          </Form.Item>
+                          <Form.Item
+                            name={[field.name, "targetObjectName"]}
+                            label="目标表"
+                            rules={[{ required: true, message: "请选择或填写目标表" }]}
+                          >
+                            <Input placeholder="可以修改为目标端实际表名" />
+                          </Form.Item>
+                        </div>
+                        {!sqlClarificationMode ? (
+                          <Form.Item name={[field.name, "whereCondition"]} label="当前源表的可选 WHERE 条件">
+                            <Input placeholder="例如 status = 'ACTIVE'，由 data-sync 安全解析与预检查" />
+                          </Form.Item>
+                        ) : null}
+                        <Collapse
+                          size="small"
+                          items={[{
+                            key: `fields-${field.key}`,
+                            label: `字段映射（${mapping?.fieldMappings?.length ?? 0} 个源字段）`,
+                            children: (
+                              <Form.List name={[field.name, "fieldMappings"]}>
+                                {(fieldRows, { add: addField, remove: removeField }) => (
+                                  <Space direction="vertical" style={{ width: "100%" }}>
+                                    {fieldRows.map((fieldRow) => (
+                                      <Card key={fieldRow.key} size="small">
+                                        <Form.Item name={[fieldRow.name, "key"]} hidden><Input /></Form.Item>
+                                        <Form.Item name={[fieldRow.name, "sourceType"]} hidden><Input /></Form.Item>
+                                        <Form.Item name={[fieldRow.name, "targetType"]} hidden><Input /></Form.Item>
+                                        <div className="grid grid-two-form">
+                                          <Form.Item
+                                            name={[fieldRow.name, "sourceField"]}
+                                            label={sqlClarificationMode ? "SQL 输出字段/别名" : "源字段"}
+                                            rules={[{ required: true, message: "请输入源字段或 SQL 别名" }]}
+                                          >
+                                            <Input disabled={!sqlClarificationMode} />
+                                          </Form.Item>
+                                          <Form.Item name={[fieldRow.name, "targetField"]} label="目标字段">
+                                            <AutoComplete
+                                              options={targetFieldOptions}
+                                              placeholder="选择或填写目标字段"
+                                              filterOption={(input, option) => String(option?.value || "").toLowerCase().includes(input.toLowerCase())}
+                                            />
+                                          </Form.Item>
+                                        </div>
+                                        <Space>
+                                          <Form.Item name={[fieldRow.name, "syncEnabled"]} valuePropName="checked" noStyle>
+                                            <Checkbox>同步该字段</Checkbox>
+                                          </Form.Item>
+                                          {sqlClarificationMode ? (
+                                            <Button type="text" danger icon={<DeleteOutlined />} onClick={() => removeField(fieldRow.name)}>
+                                              删除
+                                            </Button>
+                                          ) : null}
+                                        </Space>
+                                      </Card>
+                                    ))}
+                                    {sqlClarificationMode ? (
+                                      <Button
+                                        type="dashed"
+                                        icon={<PlusOutlined />}
+                                        onClick={() => addField({
+                                          key: `sql-field-${Date.now()}`,
+                                          sourceField: "",
+                                          targetField: "",
+                                          syncEnabled: true,
+                                        })}
+                                        block
+                                      >
+                                        添加 SQL 输出字段映射
+                                      </Button>
+                                    ) : null}
+                                  </Space>
+                                )}
+                              </Form.List>
+                            ),
+                          }]}
+                        />
+                      </Card>
+                    );
+                  })}
+                  {!sqlClarificationMode ? (
+                    <Button
+                      type="dashed"
+                      icon={<PlusOutlined />}
+                      onClick={() => add({
+                        objectKey: `agent-mapping-${fields.length + 1}`,
+                        targetObjectName: "",
+                        fieldMappings: [],
+                      })}
+                      block
+                    >
+                      添加“源表 → 目标表”映射
+                    </Button>
+                  ) : null}
+                  <Form.ErrorList errors={errors} />
                 </Space>
               )}
             </Form.List>

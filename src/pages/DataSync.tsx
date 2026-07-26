@@ -70,6 +70,14 @@ import { DataSourceIndicator } from "@/components/DataSourceIndicator";
 import { RealEmpty } from "@/components/RealEmpty";
 import { BooleanTag } from "@/components/StatusTag";
 import { PageHeader } from "@/components/PageHeader";
+import {
+  findMetadataTableByName,
+  isMysqlLikeConnector,
+  makeFieldMappings,
+  sortedColumns,
+  tableObjectKey,
+  type SyncFieldMappingRow as FieldMappingRow,
+} from "@/features/dataSync/syncTaskMapping";
 import { useUiStore } from "@/store/uiStore";
 import type {
   SyncConnectorCapability,
@@ -91,7 +99,6 @@ import type {
   SyncTaskImportResult,
   SyncTaskImportRowResult,
   SyncTaskMetadataDiscoveryResult,
-  SyncTaskMetadataField,
   SyncTaskMetadataTable,
   SyncTemplate,
   SyncTemplateExecutionPrecheckResponse,
@@ -412,20 +419,6 @@ const offlineAllowedStates = new Set([
   "ARCHIVED",
 ]);
 
-interface FieldMappingRow {
-  key: string;
-  sourceField: string;
-  sourceType?: string;
-  targetField: string;
-  targetType?: string;
-  nullable?: boolean;
-  primaryKey?: boolean;
-  syncEnabled?: boolean;
-  typeCompatible?: boolean;
-  compatibilityNote?: string;
-  transform?: string;
-}
-
 interface ObjectMappingRow {
   key: string;
   sourceTableIndex?: string;
@@ -723,15 +716,6 @@ function codeFromDataSourceType(type?: string) {
   return map[normalized] ?? normalized;
 }
 
-function tableObjectKey(table: SyncTaskMetadataTable, index: number) {
-  return `${table.schemaName || "默认Schema"}.${table.tableName}#${index}`;
-}
-
-function isMysqlLikeConnector(connectorType?: string) {
-  const normalized = (connectorType || "").toUpperCase();
-  return normalized.includes("MYSQL") || normalized.includes("MARIADB");
-}
-
 function filterMetadataTables(
   discovery: SyncTaskMetadataDiscoveryResult | null,
   keyword: string,
@@ -764,58 +748,11 @@ function findTable(discovery: SyncTaskMetadataDiscoveryResult | null, index?: st
   return discovery.tables[Number(index)];
 }
 
-function findMetadataTableByName(
-  discovery: SyncTaskMetadataDiscoveryResult | null,
-  schemaName?: string,
-  objectName?: string,
-) {
-  if (!objectName) {
-    return undefined;
-  }
-  const normalizedObjectName = objectName.toLowerCase();
-  const normalizedSchemaName = schemaName?.toLowerCase();
-  return (discovery?.tables ?? []).find((table) => {
-    const sameObject = table.tableName.toLowerCase() === normalizedObjectName;
-    const sameSchema = !normalizedSchemaName || !table.schemaName || table.schemaName.toLowerCase() === normalizedSchemaName;
-    return sameObject && sameSchema;
-  });
-}
-
 function hasPrimaryKey(table?: SyncTaskMetadataTable) {
   return Boolean(
     table?.primaryKeys?.length
       || table?.fields?.some((field) => field.primaryKey),
   );
-}
-
-function sortedColumns(table?: SyncTaskMetadataTable) {
-  return [...(table?.fields ?? [])].sort((left, right) => (left.ordinalPosition ?? 0) - (right.ordinalPosition ?? 0));
-}
-
-function makeFieldMappings(sourceColumns: SyncTaskMetadataField[], targetColumns: SyncTaskMetadataField[]): FieldMappingRow[] {
-  /*
-   * 字段映射以“源端字段”为主视角。
-   * 数据同步的真实数据流是 source -> target，源端不存在的字段不会产生任何待写入值；
-   * 因此目标表独有字段不应该出现在映射表里让用户困惑，它们是否允许为空、是否有默认值、是否由触发器生成，
-   * 应交给第四步服务端预检查和目标库结构约束判断。这里仅对同名目标字段做自动预填，源端字段没有匹配目标时
-   * 默认不勾选，用户可以手工填写目标字段后再让预检查判断是否成立。
-   */
-  const targetByName = new Map(targetColumns.map((column) => [column.fieldName.toLowerCase(), column]));
-  return sourceColumns.map((column) => {
-    const target = targetByName.get(column.fieldName.toLowerCase());
-    return {
-      key: `source-${column.fieldName}-${column.ordinalPosition ?? sourceColumns.indexOf(column)}`,
-      sourceField: column.fieldName,
-      sourceType: column.dataTypeName,
-      targetField: target?.fieldName ?? "",
-      targetType: target?.dataTypeName,
-      nullable: column.nullable,
-      primaryKey: column.primaryKey,
-      syncEnabled: Boolean(target) && (column.syncEnabled ?? true),
-      typeCompatible: target ? true : undefined,
-      compatibilityNote: target ? undefined : "目标端未发现同名字段；该源字段默认不传输，可手工选择目标字段后再同步",
-    } satisfies FieldMappingRow;
-  });
 }
 
 function serializeFieldRows(rows: FieldMappingRow[]) {
