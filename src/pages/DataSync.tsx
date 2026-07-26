@@ -89,7 +89,6 @@ import type {
   SyncExecution,
   SyncExecutionLog,
   SyncExecutionPolicy,
-  SyncExecutionPolicySnapshot,
   SyncIncident,
   SyncObjectExecution,
   SyncTask,
@@ -499,7 +498,6 @@ type UiSyncTaskGroupTreeNode = Omit<SyncTaskGroupTreeNode, "children"> & {
   children?: UiSyncTaskGroupTreeNode[];
 };
 
-const DEFAULT_SYNC_GROUP_CODE = "DEFAULT";
 const SYNC_TASK_TABLE_PAGE_SIZE = 8;
 const UNNAMED_SYNC_GROUP = "未命名分组";
 const METADATA_DISCOVERY_MAX_TABLES = 500;
@@ -899,13 +897,6 @@ function compactObjectName(schemaName?: string, objectName?: string) {
   return [schemaName, objectName].filter(Boolean).join(".") || objectName || "-";
 }
 
-function displayValue(value: unknown) {
-  if (value == null) return "-";
-  if (typeof value === "string") return value.trim() || "-";
-  if (typeof value === "boolean") return value ? "是" : "否";
-  return String(value);
-}
-
 function formatJsonConfig(text?: string) {
   if (!text?.trim()) {
     return "未配置";
@@ -997,7 +988,7 @@ export function DataSync() {
   const [batchWhereCondition, setBatchWhereCondition] = useState("");
   const [sourceDiscovery, setSourceDiscovery] = useState<SyncTaskMetadataDiscoveryResult | null>(null);
   const [targetDiscovery, setTargetDiscovery] = useState<SyncTaskMetadataDiscoveryResult | null>(null);
-  const [compatibility, setCompatibility] = useState<SyncConnectorCompatibility | null>(null);
+  const [compatibility] = useState<SyncConnectorCompatibility | null>(null);
   const [previewPayload, setPreviewPayload] = useState<unknown | null>(null);
   const [batchResult, setBatchResult] = useState<SyncTaskBatchOperationResult | null>(null);
   const [selectedTaskRowKeys, setSelectedTaskRowKeys] = useState<number[]>([]);
@@ -3073,7 +3064,6 @@ export function DataSync() {
     const scheduledMode = syncMode === "SCHEDULED_FULL" || syncMode === "SCHEDULED_BATCH";
     const fullLikeMode = syncMode === "FULL" || syncMode === "SCHEDULED_FULL";
     const backendIssueCodes = wizardPrecheckResult?.issueCodes ?? [];
-    const backendIssueSet = new Set(backendIssueCodes);
     const backendSuggestions = wizardPrecheckResult?.recommendedActions ?? [];
     const backendSafetyNotes = wizardPrecheckResult?.safetyNotes ?? [];
     const backendPerformanceNotes = wizardPrecheckResult?.performanceNotes ?? [];
