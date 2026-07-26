@@ -2019,6 +2019,17 @@ function normalizeAgentPlanCore(value: unknown): AgentPlanCore | undefined {
 
 function normalizeAgentClarificationQuestion(value: unknown): AgentClarificationQuestion {
   const record = readRecord(value);
+  const candidates = Array.isArray(record.candidates)
+    ? record.candidates.map((item) => {
+        const candidate = readRecord(item);
+        return {
+          datasourceId: readNumber(candidate.datasourceId),
+          name: readString(candidate.name),
+          type: readString(candidate.type),
+          usagePurpose: readOptionalString(candidate.usagePurpose),
+        };
+      }).filter((item) => item.datasourceId > 0 && item.name)
+    : [];
   return {
     parameterName: readString(record.parameterName),
     fieldPath: readString(record.fieldPath),
@@ -2027,6 +2038,7 @@ function normalizeAgentClarificationQuestion(value: unknown): AgentClarification
     inputType: readString(record.inputType, "TEXT"),
     required: readBoolean(record.required, true),
     sensitive: readBoolean(record.sensitive),
+    candidates: candidates.length ? candidates : undefined,
   };
 }
 

@@ -1146,6 +1146,12 @@ export interface AgentClarificationQuestion {
   inputType: string;
   required: boolean;
   sensitive: boolean;
+  candidates?: Array<{
+    datasourceId: number;
+    name: string;
+    type: string;
+    usagePurpose?: string;
+  }>;
 }
 
 export interface AgentStructuredIntent {
@@ -1165,7 +1171,12 @@ export interface AgentStructuredIntent {
 export interface AgentConversation {
   schemaVersion: string;
   turnId?: string;
-  phase: "WAITING_CLARIFICATION" | "READY_FOR_CONFIRMATION" | "NO_EXECUTABLE_PLAN" | string;
+  phase:
+    | "WAITING_CLARIFICATION"
+    | "RESOLVING_AUTONOMOUSLY"
+    | "READY_FOR_CONFIRMATION"
+    | "NO_EXECUTABLE_PLAN"
+    | string;
   assistantMessage: string;
   structuredIntent: AgentStructuredIntent;
   missingParameters: string[];

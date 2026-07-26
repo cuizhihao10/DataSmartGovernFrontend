@@ -97,9 +97,14 @@ interface ClarificationFormValues {
   objectMappings: ObjectMappingInput[];
 }
 
+interface QuickClarificationValues {
+  sourceDatasourceId?: number;
+  targetDatasourceId?: number;
+}
+
 interface PlanSubmission {
   objective: string;
-  clarification?: ClarificationFormValues;
+  clarification?: Partial<ClarificationFormValues>;
   taskImportArtifactRef?: string;
   taskImportRunImmediately?: boolean;
   recoveryTaskId?: number;
@@ -489,6 +494,7 @@ function UserAgentAssistant() {
   const navigate = useNavigate();
   const [objectiveForm] = Form.useForm<ObjectiveFormValues>();
   const [clarificationForm] = Form.useForm<ClarificationFormValues>();
+  const [quickClarificationForm] = Form.useForm<QuickClarificationValues>();
   const selectedProjectId = useUiStore((state) => state.selectedProjectId);
   const [objective, setObjective] = useState(defaultObjective);
   // 同一个助手页面生命周期内复用稳定会话 ID，使 SESSION_ONLY 模型响应缓存具备安全命中条件。
@@ -503,6 +509,7 @@ function UserAgentAssistant() {
   const [executionAnswer, setExecutionAnswer] = useState<ExecutionAnswer>();
   const [taskImportArtifact, setTaskImportArtifact] = useState<SyncTaskImportArtifact>();
   const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
+  const [showAdvancedClarification, setShowAdvancedClarification] = useState(false);
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -824,31 +831,42 @@ function UserAgentAssistant() {
         streamModelIntent: false,
       };
       if (submission.clarification) {
-        const selectedMode = normalizeUserSyncMode(submission.clarification.syncMode);
-        variables.dataSyncRequest = {
-          taskName: submission.clarification.taskName,
+        const clarification = submission.clarification;
+        const selectedMode = clarification.syncMode
+          ? normalizeUserSyncMode(clarification.syncMode)
+          : undefined;
+        const dataSyncRequest: Record<string, unknown> = {
           taskDescription: submission.objective,
-          sourceDatasourceId: submission.clarification.sourceDatasourceId,
-          targetDatasourceId: submission.clarification.targetDatasourceId,
-          syncMode: selectedMode,
-          writeStrategy: isRealtimeSyncMode(selectedMode)
-            ? "UPDATE"
-            : submission.clarification.writeStrategy,
-          scheduleConfig: isScheduledSyncMode(selectedMode)
-            ? submission.clarification.scheduleConfig
-            : undefined,
-          customSqlText: isSqlSyncMode(selectedMode)
-            ? submission.clarification.customSqlText
-            : undefined,
           groupCode: "DEFAULT",
           groupName: "默认分组",
-          objectMappings: submission.clarification.objectMappings.map((item, index) => ({
+        };
+        if (clarification.taskName) dataSyncRequest.taskName = clarification.taskName;
+        if (clarification.sourceDatasourceId) {
+          dataSyncRequest.sourceDatasourceId = clarification.sourceDatasourceId;
+        }
+        if (clarification.targetDatasourceId) {
+          dataSyncRequest.targetDatasourceId = clarification.targetDatasourceId;
+        }
+        if (selectedMode) {
+          dataSyncRequest.syncMode = selectedMode;
+          dataSyncRequest.writeStrategy = isRealtimeSyncMode(selectedMode)
+            ? "UPDATE"
+            : clarification.writeStrategy;
+          if (isScheduledSyncMode(selectedMode) && clarification.scheduleConfig) {
+            dataSyncRequest.scheduleConfig = clarification.scheduleConfig;
+          }
+          if (isSqlSyncMode(selectedMode) && clarification.customSqlText) {
+            dataSyncRequest.customSqlText = clarification.customSqlText;
+          }
+        }
+        if (clarification.objectMappings?.length) {
+          dataSyncRequest.objectMappings = clarification.objectMappings.map((item, index) => ({
             objectKey: item.objectKey || `agent-mapping-${index + 1}`,
-            sourceSchemaName: isSqlSyncMode(selectedMode) ? undefined : item.sourceSchemaName,
-            sourceObjectName: isSqlSyncMode(selectedMode) ? undefined : item.sourceObjectName,
+            sourceSchemaName: selectedMode && isSqlSyncMode(selectedMode) ? undefined : item.sourceSchemaName,
+            sourceObjectName: selectedMode && isSqlSyncMode(selectedMode) ? undefined : item.sourceObjectName,
             targetSchemaName: item.targetSchemaName,
             targetObjectName: item.targetObjectName,
-            whereCondition: isSqlSyncMode(selectedMode) ? undefined : item.whereCondition,
+            whereCondition: selectedMode && isSqlSyncMode(selectedMode) ? undefined : item.whereCondition,
             fieldMappings: item.fieldMappings
               .filter((field) => field.syncEnabled !== false && field.sourceField && field.targetField)
               .map((field) => ({
@@ -862,8 +880,9 @@ function UserAgentAssistant() {
                 typeCompatible: field.typeCompatible,
                 transform: field.transform,
               })),
-          })),
-        };
+          }));
+        }
+        variables.dataSyncRequest = dataSyncRequest;
       }
       if (submission.taskImportArtifactRef) {
         variables.taskImportArtifactRef = submission.taskImportArtifactRef;
@@ -945,7 +964,11 @@ function UserAgentAssistant() {
 
       if (conversation?.phase === "WAITING_CLARIFICATION") {
         setControlPlane(undefined);
-        if (!submission.clarification) {
+        setShowAdvancedClarification(false);
+        quickClarificationForm.resetFields();
+        if (submission.clarification) {
+          clarificationForm.setFieldsValue(submission.clarification);
+        } else {
           const inferredMode = normalizeUserSyncMode(conversation.structuredIntent.syncMode);
           clarificationForm.resetFields();
           clarificationForm.setFieldsValue({
@@ -964,6 +987,10 @@ function UserAgentAssistant() {
         }
         message.info("Agent 已理解目标，请补充执行所需参数");
         return;
+      }
+
+      if (conversation?.phase === "RESOLVING_AUTONOMOUSLY") {
+        message.info(conversation.assistantMessage);
       }
 
       if (conversation?.phase === "NO_EXECUTABLE_PLAN") {
@@ -1122,6 +1149,29 @@ function UserAgentAssistant() {
   });
 
   const conversation = plan?.agentConversation;
+  const missingParameterSet = new Set(conversation?.missingParameters ?? []);
+  const needsSourceDatasource = missingParameterSet.has("sourceDatasourceId");
+  const needsTargetDatasource = missingParameterSet.has("targetDatasourceId");
+  const needsObjectMappings = missingParameterSet.has("objectMappings");
+  const sourceClarification = conversation?.clarificationQuestions.find(
+    (question) => question.parameterName === "sourceDatasourceId",
+  );
+  const targetClarification = conversation?.clarificationQuestions.find(
+    (question) => question.parameterName === "targetDatasourceId",
+  );
+  const quickSourceOptions = sourceClarification?.candidates?.length
+    ? sourceClarification.candidates.map((item) => ({
+        value: item.datasourceId,
+        label: `#${item.datasourceId} ${item.name}（${item.type}）`,
+      }))
+    : sourceOptions;
+  const quickTargetOptions = targetClarification?.candidates?.length
+    ? targetClarification.candidates.map((item) => ({
+        value: item.datasourceId,
+        label: `#${item.datasourceId} ${item.name}（${item.type}）`,
+      }))
+    : targetOptions;
+  const hasQuickClarificationFields = needsSourceDatasource || needsTargetDatasource;
   const planItems = plan?.plan?.toolPlans ?? [];
   const latestDurableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
     .reverse()
@@ -1464,6 +1514,17 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
+      {conversation?.phase === "RESOLVING_AUTONOMOUSLY" ? (
+        <Alert
+          showIcon
+          icon={<Spin size="small" />}
+          type="info"
+          message="Agent 正在自主核对执行条件"
+          description={conversation.assistantMessage}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
+
       {conversation?.phase === "WAITING_CLARIFICATION" ? (
         <Card id="agent-clarification-card" title="补充 Agent 执行所需信息" className="compact-card">
           <Space wrap style={{ marginBottom: 16 }}>
@@ -1471,11 +1532,107 @@ function UserAgentAssistant() {
               <Tag key={question.parameterName} color="gold">{question.question}</Tag>
             ))}
           </Space>
+          {!showAdvancedClarification ? (
+            <>
+              <Alert
+                showIcon
+                type={hasQuickClarificationFields ? "info" : "warning"}
+                message={hasQuickClarificationFields
+                  ? "只需回答当前缺失或存在歧义的信息"
+                  : "Agent 已完成自动核对，但对象映射仍需要你确认"}
+                description={hasQuickClarificationFields
+                  ? `${conversation.assistantMessage} 提交后 Agent 会继续测试连接、读取真实元数据并尝试形成完整任务。`
+                  : `${conversation.assistantMessage} 你可以切换到高级编辑器接管存在冲突的映射；其余内容继续沿用当前会话。`}
+                style={{ marginBottom: 16 }}
+              />
+              {hasQuickClarificationFields ? (
+                <Form<QuickClarificationValues>
+                  form={quickClarificationForm}
+                  layout="vertical"
+                  onFinish={(values) => planMutation.mutate({
+                    objective,
+                    clarification: values,
+                    preserveTimeline: true,
+                  })}
+                >
+                  <div className="grid grid-two-form">
+                    {needsSourceDatasource ? (
+                      <Form.Item
+                        name="sourceDatasourceId"
+                        label="明确源端数据源"
+                        rules={[{ required: true, message: "请选择 Agent 应使用的源端数据源" }]}
+                      >
+                        <Select
+                          showSearch
+                          optionFilterProp="label"
+                          options={quickSourceOptions}
+                          loading={sourceQuery.isLoading}
+                          placeholder={sourceClarification?.candidates?.length
+                            ? "名称存在歧义，请从候选中选择"
+                            : "选择当前项目已授权的 SOURCE 数据源"}
+                        />
+                      </Form.Item>
+                    ) : <div />}
+                    {needsTargetDatasource ? (
+                      <Form.Item
+                        name="targetDatasourceId"
+                        label="明确目标端数据源"
+                        rules={[{ required: true, message: "请选择 Agent 应使用的目标端数据源" }]}
+                      >
+                        <Select
+                          showSearch
+                          optionFilterProp="label"
+                          options={quickTargetOptions}
+                          loading={targetQuery.isLoading}
+                          placeholder={targetClarification?.candidates?.length
+                            ? "名称存在歧义，请从候选中选择"
+                            : "选择当前项目已授权的 TARGET 数据源"}
+                        />
+                      </Form.Item>
+                    ) : <div />}
+                  </div>
+                  <Space wrap>
+                    <Button
+                      type="primary"
+                      htmlType="submit"
+                      icon={<ArrowRightOutlined />}
+                      loading={planMutation.isPending && Boolean(planMutation.variables?.clarification)}
+                    >
+                      继续由 Agent 自动核对
+                    </Button>
+                    <Button onClick={() => setShowAdvancedClarification(true)}>
+                      高级手工接管
+                    </Button>
+                  </Space>
+                </Form>
+              ) : (
+                <Button type="primary" onClick={() => setShowAdvancedClarification(true)}>
+                  编辑对象与字段映射
+                </Button>
+              )}
+              {needsObjectMappings && hasQuickClarificationFields ? (
+                <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+                  对象映射暂不要求手工填写。Agent 会先依据你选择的数据源读取真实元数据；只有无法唯一匹配或校验冲突时才再次追问。
+                </Typography.Paragraph>
+              ) : null}
+            </>
+          ) : (
           <Form<ClarificationFormValues>
             form={clarificationForm}
             layout="vertical"
-            onFinish={(values) => planMutation.mutate({ objective, clarification: values })}
+            onFinish={(values) => planMutation.mutate({
+              objective,
+              clarification: values,
+              preserveTimeline: true,
+            })}
           >
+            <Button
+              type="link"
+              onClick={() => setShowAdvancedClarification(false)}
+              style={{ paddingInline: 0, marginBottom: 8 }}
+            >
+              返回渐进式追问
+            </Button>
             <div className="grid grid-two-form">
               <Form.Item name="taskName" label="任务名称" rules={[{ required: true, message: "请输入任务名称" }]}>
                 <Input maxLength={128} />
@@ -1780,6 +1937,7 @@ function UserAgentAssistant() {
               提交补充信息并生成计划
             </Button>
           </Form>
+          )}
         </Card>
       ) : null}
 
