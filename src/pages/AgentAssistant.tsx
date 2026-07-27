@@ -171,6 +171,22 @@ const syncModeLabels: Record<string, string> = {
   REAL_TIME: "实时同步",
 };
 
+const clarificationParameterLabels: Record<string, string> = {
+  sourceDatasourceId: "源端数据源",
+  targetDatasourceId: "目标端数据源",
+  objectMappings: "源表到目标表的对象映射、字段映射和可选 WHERE 条件",
+  scheduleFrequency: "定期任务执行频率",
+  scheduleStartTime: "首次执行时间",
+  customSqlConfirmation: "SQL 内容确认",
+  targetTableResolution: "目标表不存在时的处理方式",
+  fieldMappingConversions: "字段类型冲突的转换或映射方案",
+};
+
+function clarificationParameterLabel(parameterName: string) {
+  return clarificationParameterLabels[parameterName]
+    || `其他必要配置（${parameterName}）`;
+}
+
 function textField(record: Record<string, unknown> | undefined, key: string) {
   const value = record?.[key];
   return typeof value === "string" && value.trim() ? value : undefined;
@@ -1026,7 +1042,19 @@ function UserAgentAssistant() {
 
       if (conversation?.phase === "WAITING_CLARIFICATION") {
         setControlPlane(undefined);
-        setShowAdvancedClarification(false);
+        const waitingParameters = new Set(conversation.missingParameters ?? []);
+        const hasInlineClarification = [
+          "sourceDatasourceId",
+          "targetDatasourceId",
+          "scheduleFrequency",
+          "scheduleStartTime",
+          "customSqlConfirmation",
+          "targetTableResolution",
+        ].some((parameterName) => waitingParameters.has(parameterName));
+        setShowAdvancedClarification(
+          !hasInlineClarification
+          && (waitingParameters.has("objectMappings") || waitingParameters.has("fieldMappingConversions")),
+        );
         quickClarificationForm.resetFields();
         if (submission.clarification) {
           clarificationForm.setFieldsValue(submission.clarification);
@@ -1248,6 +1276,8 @@ function UserAgentAssistant() {
   const needsSqlConfirmation = missingParameterSet.has("customSqlConfirmation");
   const needsTargetTableResolution = missingParameterSet.has("targetTableResolution");
   const needsFieldMappingConversions = missingParameterSet.has("fieldMappingConversions");
+  const missingParameterLabels = (conversation?.missingParameters ?? [])
+    .map(clarificationParameterLabel);
   const sourceClarification = conversation?.clarificationQuestions.find(
     (question) => question.parameterName === "sourceDatasourceId",
   );
@@ -1705,11 +1735,24 @@ function UserAgentAssistant() {
 
       {conversation?.phase === "WAITING_CLARIFICATION" ? (
         <Card id="agent-clarification-card" title="补充 Agent 执行所需信息" className="compact-card">
-          <Space wrap style={{ marginBottom: 16 }}>
-            {conversation.clarificationQuestions.map((question) => (
-              <Tag key={question.parameterName} color="gold">{question.question}</Tag>
-            ))}
-          </Space>
+          <Alert
+            showIcon
+            type="warning"
+            message={`当前还需补充 ${missingParameterLabels.length || 1} 项任务配置`}
+            description={(
+              <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                <Typography.Text>{conversation.assistantMessage}</Typography.Text>
+                <Space wrap>
+                  {missingParameterLabels.length ? missingParameterLabels.map((label) => (
+                    <Tag key={label} color="gold">必填：{label}</Tag>
+                  )) : conversation.clarificationQuestions.map((question) => (
+                    <Tag key={question.parameterName} color="gold">{question.question}</Tag>
+                  ))}
+                </Space>
+              </Space>
+            )}
+            style={{ marginBottom: 16 }}
+          />
           {!showAdvancedClarification ? (
             <>
               <Alert
@@ -1893,6 +1936,13 @@ function UserAgentAssistant() {
             >
               返回渐进式追问
             </Button>
+            <Alert
+              showIcon
+              type="info"
+              message="请在下方补齐当前任务缺少的配置"
+              description={`当前待填写：${missingParameterLabels.join("；") || "任务对象与字段映射"}。表和字段均来自已选数据源的真实元数据，不需要填写 JSON。`}
+              style={{ marginBottom: 16 }}
+            />
             <div className="grid grid-two-form">
               <Form.Item name="taskName" label="任务名称" rules={[{ required: true, message: "请输入任务名称" }]}>
                 <Input maxLength={128} />

@@ -78,9 +78,29 @@ export function ProjectMembers() {
     ?? session?.authorizedProjects?.find((project) => Number(project.projectId ?? project.id) === currentProjectId)?.projectName
     ?? (currentProjectId == null ? "未选择项目" : `未找到项目名称（ID ${currentProjectId}）`);
   const globalRole = normalizeRole(session?.actorRole);
-  const projectRoleOfCurrentActor = currentProjectRole(session, currentProjectId);
   const globalAdministrator = ["TENANT_ADMINISTRATOR", "PLATFORM_ADMINISTRATOR"].includes(globalRole);
+  const currentActorId = Number(session?.actorId);
+  const hasCurrentActor = Number.isFinite(currentActorId) && currentActorId > 0;
+  const currentActorMembershipQuery = useQuery({
+    queryKey: ["project-members-current-actor", currentProjectId, currentActorId],
+    queryFn: () => api.listProjectMemberships({
+      projectId: currentProjectId,
+      actorId: currentActorId,
+      enabled: true,
+      current: 1,
+      size: 2,
+    }),
+    enabled: currentProjectId != null && hasCurrentActor && !globalAdministrator,
+  });
+  const currentActorMembership = currentActorMembershipQuery.data?.data.records.find((record) => (
+    Number(record.projectId) === currentProjectId
+    && Number(record.actorId) === currentActorId
+    && record.enabled
+  ));
+  const projectRoleOfCurrentActor = normalizeRole(currentActorMembership?.projectRole)
+    || currentProjectRole(session, currentProjectId);
   const canManage = globalAdministrator || projectRoleOfCurrentActor === "OWNER";
+  const currentRoleLoading = !globalAdministrator && currentActorMembershipQuery.isLoading;
 
   const membershipQuery = useQuery({
     queryKey: ["project-members", currentProjectId, projectRole, enabled, page.current, page.size],
@@ -116,7 +136,7 @@ export function ProjectMembers() {
       message.success("项目成员角色已更新");
       setEditing(undefined);
       editForm.resetFields();
-      await Promise.all([membershipQuery.refetch(), sessionQuery.refetch()]);
+      await Promise.all([membershipQuery.refetch(), currentActorMembershipQuery.refetch(), sessionQuery.refetch()]);
     },
     onError: (error) => message.error(error instanceof Error ? error.message : "项目成员角色更新失败"),
   });
@@ -128,7 +148,7 @@ export function ProjectMembers() {
     ),
     onSuccess: async (_, variables) => {
       message.success(variables.nextEnabled ? "项目成员已启用" : "项目成员已禁用");
-      await Promise.all([membershipQuery.refetch(), sessionQuery.refetch()]);
+      await Promise.all([membershipQuery.refetch(), currentActorMembershipQuery.refetch(), sessionQuery.refetch()]);
     },
     onError: (error) => message.error(error instanceof Error ? error.message : "项目成员状态更新失败"),
   });
@@ -259,10 +279,12 @@ export function ProjectMembers() {
       <div className="grid grid-three">
         <Card><Statistic title="当前项目" value={projectName} prefix={<TeamOutlined />} /></Card>
         <Card><Statistic title="成员总数" value={membershipQuery.data?.data.total ?? 0} /></Card>
-        <Card><Statistic title="我的项目角色" value={projectRoleLabels[projectRoleOfCurrentActor] || projectRoleOfCurrentActor || "管理员范围"} /></Card>
+        <Card><Statistic title="我的项目角色" value={currentRoleLoading
+          ? "加载中"
+          : projectRoleLabels[projectRoleOfCurrentActor] || projectRoleOfCurrentActor || (globalAdministrator ? "管理员范围" : "未识别")} /></Card>
       </div>
 
-      {!canManage ? (
+      {!currentRoleLoading && !canManage ? (
         <Alert
           showIcon
           type="info"
