@@ -1157,6 +1157,9 @@ export interface AgentClarificationQuestion {
     label: string;
   }>;
   reasonCode?: string;
+  ambiguityType?: string;
+  requestedDatasourceType?: string;
+  allowsNaturalLanguageCorrection?: boolean;
   repairGuidance?: string;
   configurationPreview?: {
     kind?: string;

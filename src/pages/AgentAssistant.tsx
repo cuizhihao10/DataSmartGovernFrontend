@@ -117,6 +117,7 @@ type AgentScheduleFrequency = "HOURLY" | "DAILY" | "WEEKLY" | "CUSTOM_CRON";
 interface PlanSubmission {
   objective: string;
   clarification?: Partial<ClarificationFormValues>;
+  followUpMessage?: string;
   taskImportArtifactRef?: string;
   taskImportRunImmediately?: boolean;
   recoveryTaskId?: number;
@@ -550,6 +551,7 @@ function UserAgentAssistant() {
   const [taskImportArtifact, setTaskImportArtifact] = useState<SyncTaskImportArtifact>();
   const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
   const [showAdvancedClarification, setShowAdvancedClarification] = useState(false);
+  const [followUpMessage, setFollowUpMessage] = useState("");
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -870,6 +872,13 @@ function UserAgentAssistant() {
         // 限流、重试、fallback 和用量，同时避免向用户暴露原始模型推理。
         streamModelIntent: false,
       };
+      const latestUserMessage = submission.followUpMessage?.trim();
+      if (latestUserMessage) {
+        variables.latestUserMessage = latestUserMessage;
+        variables.conversationMode = "CLARIFICATION_OR_CORRECTION";
+        variables.previousTurnId = plan?.agentConversation?.turnId;
+        variables.previousIntentType = plan?.agentConversation?.structuredIntent.intentType;
+      }
       if (submission.clarification) {
         const clarification = submission.clarification;
         const selectedMode = normalizeUserSyncMode(
@@ -1013,6 +1022,7 @@ function UserAgentAssistant() {
       setPlan(nextPlan);
       setExecutionResults([]);
       setExecutionAnswer(undefined);
+      if (submission.followUpMessage) setFollowUpMessage("");
 
       if (conversation?.phase === "WAITING_CLARIFICATION") {
         setControlPlane(undefined);
@@ -1020,6 +1030,7 @@ function UserAgentAssistant() {
         quickClarificationForm.resetFields();
         if (submission.clarification) {
           clarificationForm.setFieldsValue(submission.clarification);
+          quickClarificationForm.setFieldsValue(submission.clarification);
         } else {
           const inferredMode = normalizeUserSyncMode(conversation.structuredIntent.syncMode);
           clarificationForm.resetFields();
@@ -1201,6 +1212,33 @@ function UserAgentAssistant() {
   });
 
   const conversation = plan?.agentConversation;
+
+  const continueConversation = () => {
+    const latestMessage = followUpMessage.trim();
+    if (!latestMessage || planMutation.isPending) return;
+    const clarification: Partial<ClarificationFormValues> = {
+      ...clarificationForm.getFieldsValue(),
+      ...quickClarificationForm.getFieldsValue(),
+    };
+    const mentionsSource = /(源端|源数据源|源库|source)/i.test(latestMessage);
+    const mentionsTarget = /(目标端|目标数据源|目标库|target)/i.test(latestMessage);
+    const rejectsCurrentDatasource = /(不是(这个|当前)?数据源|数据源.*(错了|不对)|理解错.*数据源)/i.test(latestMessage);
+    if (mentionsSource || (rejectsCurrentDatasource && !mentionsTarget)) {
+      delete clarification.sourceDatasourceId;
+    }
+    if (mentionsTarget || (rejectsCurrentDatasource && !mentionsSource)) {
+      delete clarification.targetDatasourceId;
+    }
+    if (/(表|schema|字段|映射|where|过滤|sql)/i.test(latestMessage)) {
+      delete clarification.objectMappings;
+    }
+    planMutation.mutate({
+      objective,
+      clarification,
+      followUpMessage: latestMessage,
+      preserveTimeline: true,
+    });
+  };
   const missingParameterSet = new Set(conversation?.missingParameters ?? []);
   const needsSourceDatasource = missingParameterSet.has("sourceDatasourceId");
   const needsTargetDatasource = missingParameterSet.has("targetDatasourceId");
@@ -1547,6 +1585,32 @@ function UserAgentAssistant() {
               description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
             />
           ) : null}
+          <div style={{ marginTop: 16 }}>
+            <Input.TextArea
+              value={followUpMessage}
+              onChange={(event) => setFollowUpMessage(event.target.value)}
+              onPressEnter={(event) => {
+                if (!event.shiftKey) {
+                  event.preventDefault();
+                  continueConversation();
+                }
+              }}
+              autoSize={{ minRows: 2, maxRows: 6 }}
+              placeholder="继续补充或纠正，例如：MySQL 是数据库类型，源端数据源改为 customer-prod-source"
+              disabled={executionInProgress}
+            />
+            <Space wrap style={{ marginTop: 10 }}>
+              <Button
+                type="primary"
+                icon={<ArrowRightOutlined />}
+                onClick={continueConversation}
+                loading={planMutation.isPending && Boolean(planMutation.variables?.followUpMessage)}
+                disabled={!followUpMessage.trim() || executionInProgress}
+              >
+                发送补充或纠正
+              </Button>
+            </Space>
+          </div>
         </Card>
       ) : null}
 

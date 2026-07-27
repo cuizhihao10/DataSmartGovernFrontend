@@ -2051,6 +2051,9 @@ function normalizeAgentClarificationQuestion(value: unknown): AgentClarification
     candidates: candidates.length ? candidates : undefined,
     options: options.length ? options : undefined,
     reasonCode: readOptionalString(record.reasonCode),
+    ambiguityType: readOptionalString(record.ambiguityType),
+    requestedDatasourceType: readOptionalString(record.requestedDatasourceType),
+    allowsNaturalLanguageCorrection: readBoolean(record.allowsNaturalLanguageCorrection),
     repairGuidance: readOptionalString(record.repairGuidance),
     configurationPreview: Object.keys(preview).length ? {
       kind: readOptionalString(preview.kind),
