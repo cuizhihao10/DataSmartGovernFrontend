@@ -47,7 +47,7 @@ import type { ColumnsType } from "antd/es/table";
 import type { DataNode } from "antd/es/tree";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import type { Key } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   api,
   type CloneSyncTaskPayload,
@@ -1446,7 +1446,7 @@ export function DataSync() {
     }
   };
 
-  const runWizardAutoPrecheck = async (templateId?: number) => {
+  const runWizardAutoPrecheck = useCallback(async (templateId?: number) => {
     const effectiveTemplateId = templateId ?? wizardDraft?.templateId;
     if (!effectiveTemplateId) {
       setWizardPrecheckResult(null);
@@ -1463,14 +1463,14 @@ export function DataSync() {
     } finally {
       setWizardPrecheckLoading(false);
     }
-  };
+  }, [message, wizardDraft?.templateId]);
 
   useEffect(() => {
     if (!wizardOpen || wizardStep !== 3 || !wizardDraft?.templateId) {
       return;
     }
     void runWizardAutoPrecheck(wizardDraft.templateId);
-  }, [wizardOpen, wizardStep, wizardDraft?.templateId]);
+  }, [runWizardAutoPrecheck, wizardOpen, wizardStep, wizardDraft?.templateId]);
 
   const createGroupMutation = useMutation({
     mutationFn: (payload: CreateSyncTaskGroupPayload) => api.createSyncTaskGroup(payload),
@@ -2226,7 +2226,7 @@ export function DataSync() {
     setTargetObjectPageSize(10);
   };
 
-  const applyObjectScopeType = (value: ObjectScopeType) => {
+  const applyObjectScopeType = useCallback((value: ObjectScopeType) => {
     wizardForm.setFieldsValue({
       objectScopeType: value,
       syncScopeType: value === "SCHEMA_FULL" ? "SCHEMA_FULL" : value === "DATABASE_FULL" ? "DATABASE_FULL" : "OBJECT_LIST",
@@ -2248,7 +2248,7 @@ export function DataSync() {
     setTargetSchemaFilter(undefined);
     setSourceObjectPageSize(10);
     setTargetObjectPageSize(10);
-  };
+  }, [wizardForm]);
   const selectDatasource = (field: "sourceDatasourceId" | "targetDatasourceId", id: number) => {
     const record = dataSources.find((item) => item.id === id);
     const connectorCode = codeFromDataSourceType(record?.type);
@@ -2945,9 +2945,9 @@ export function DataSync() {
     if (!sqlTransferMode && !sourceSchemaCapable && currentObjectScopeType !== "TABLES") {
       applyObjectScopeType("TABLES");
     }
-  }, [currentObjectScopeType, sourceSchemaCapable, sqlTransferMode]);
+  }, [applyObjectScopeType, currentObjectScopeType, sourceSchemaCapable, sqlTransferMode]);
 
-  const findMetadataTableForMapping = (
+  const findMetadataTableForMapping = useCallback((
     discovery: SyncTaskMetadataDiscoveryResult | null,
     tableIndex?: string,
     schemaName?: string,
@@ -2961,9 +2961,9 @@ export function DataSync() {
         table.tableName.toLowerCase() === objectName.toLowerCase()
         && (!schemaName || !table.schemaName || table.schemaName.toLowerCase() === schemaName.toLowerCase()),
     );
-  };
+  }, []);
 
-  const makeFieldMappingsForObject = (
+  const makeFieldMappingsForObject = useCallback((
     mapping: ObjectMappingRow,
     sourceDiscoverySnapshot: SyncTaskMetadataDiscoveryResult | null | undefined = sourceDiscovery,
     targetDiscoverySnapshot: SyncTaskMetadataDiscoveryResult | null | undefined = targetDiscovery,
@@ -2981,7 +2981,7 @@ export function DataSync() {
       mapping.targetObjectName,
     );
     return makeFieldMappings(sortedColumns(sourceTable), sortedColumns(targetTable));
-  };
+  }, [findMetadataTableForMapping, sourceDiscovery, targetDiscovery]);
 
   const ensureFieldMappingsForObject = (mapping: ObjectMappingRow, forceWhenEmpty = false) => {
     /*
@@ -3053,7 +3053,7 @@ export function DataSync() {
       });
       return changed ? nextRows : rows;
     });
-  }, [wizardOpen, sqlTransferMode, objectMappings, sourceDiscovery, targetDiscovery]);
+  }, [makeFieldMappingsForObject, objectMappings, sqlTransferMode, wizardOpen]);
 
   const buildWizardPrecheckItems = () => {
     const values = wizardForm.getFieldsValue(true);

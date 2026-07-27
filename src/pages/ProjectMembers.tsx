@@ -93,8 +93,8 @@ export function ProjectMembers() {
     }),
     enabled: currentProjectId != null,
   });
-  const records = membershipQuery.data?.data.records ?? [];
   const filteredRecords = useMemo(() => {
+    const records = membershipQuery.data?.data.records ?? [];
     const normalized = keyword.trim().toLowerCase();
     if (!normalized) return records;
     return records.filter((record) => [
@@ -107,7 +107,7 @@ export function ProjectMembers() {
       record.projectRole,
       record.actorRole,
     ].join(" ").toLowerCase().includes(normalized));
-  }, [keyword, records]);
+  }, [keyword, membershipQuery.data?.data.records]);
 
   const updateMutation = useMutation({
     mutationFn: ({ membershipId, payload }: { membershipId: number; payload: ProjectMembershipUpdatePayload }) =>
@@ -353,4 +353,3 @@ export function ProjectMembers() {
     </div>
   );
 }
-
