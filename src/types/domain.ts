@@ -1152,6 +1152,19 @@ export interface AgentClarificationQuestion {
     type: string;
     usagePurpose?: string;
   }>;
+  options?: Array<{
+    value: string | boolean;
+    label: string;
+  }>;
+  reasonCode?: string;
+  repairGuidance?: string;
+  configurationPreview?: {
+    kind?: string;
+    customSqlText?: string;
+    generatedByAgent?: boolean;
+    requiresExplicitConfirmation?: boolean;
+    payloadPolicy?: string;
+  };
 }
 
 export interface AgentStructuredIntent {

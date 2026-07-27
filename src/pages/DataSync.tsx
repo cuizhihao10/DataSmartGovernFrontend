@@ -47,7 +47,8 @@ import type { ColumnsType } from "antd/es/table";
 import type { DataNode } from "antd/es/tree";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import type { Key } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   api,
   type CloneSyncTaskPayload,
@@ -428,6 +429,27 @@ interface ObjectMappingRow {
   targetObjectName?: string;
   objectType?: string;
   whereCondition?: string;
+}
+
+interface AgentWizardHandoff {
+  handoffId: string;
+  taskName?: string;
+  syncMode?: string;
+  writeStrategy?: string;
+  sourceDatasourceId?: number;
+  targetDatasourceId?: number;
+  scheduleConfig?: string;
+  customSqlText?: string;
+  source?: string;
+  objectMappings?: Array<{
+    objectKey?: string;
+    sourceSchemaName?: string;
+    sourceObjectName?: string;
+    targetSchemaName?: string;
+    targetObjectName?: string;
+    whereCondition?: string;
+    fieldMappings?: FieldMappingRow[];
+  }>;
 }
 
 interface FieldMappingDetailRow extends FieldMappingRow {
@@ -936,6 +958,9 @@ function downloadBlob(blob: Blob, fileName: string) {
 
 export function DataSync() {
   const { message, modal } = App.useApp();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const consumedAgentHandoffId = useRef<string>();
   const [wizardForm] = Form.useForm<SyncWizardValues>();
   const [createGroupForm] = Form.useForm<CreateSyncTaskGroupPayload>();
   const [editTaskForm] = Form.useForm<UpdateSyncTaskPayload>();
@@ -1752,8 +1777,9 @@ export function DataSync() {
     [flatGroupNodes],
   );
 
-  const findGroupNode = (groupCode?: string) =>
-    groupCode ? flatGroupNodes.find((group) => group.groupCode === groupCode) : undefined;
+  const findGroupNode = useCallback((groupCode?: string) => (
+    groupCode ? flatGroupNodes.find((group) => group.groupCode === groupCode) : undefined
+  ), [flatGroupNodes]);
 
   const selectedGroupNode = taskGroupTreeKeyFilter
     ? groupNodeByTreeKey.get(taskGroupTreeKeyFilter)
@@ -2066,6 +2092,135 @@ export function DataSync() {
       message.warning("草稿已恢复，但部分源端/目标端元数据刷新失败；可以继续编辑，第四步预检查会再次校验真实库表结构。");
     }
   };
+
+  useEffect(() => {
+    const state = location.state as { agentWizardHandoff?: AgentWizardHandoff } | null;
+    const handoff = state?.agentWizardHandoff;
+    const session = sessionQuery.data?.data;
+    if (!handoff?.handoffId || !session || consumedAgentHandoffId.current === handoff.handoffId) {
+      return;
+    }
+    consumedAgentHandoffId.current = handoff.handoffId;
+
+    const mode = (handoff.syncMode || "FULL").toUpperCase();
+    const transferMode = transferModeFromSyncMode(mode);
+    const sourceDatasource = dataSources.find((item) => Number(item.id) === Number(handoff.sourceDatasourceId));
+    const targetDatasource = dataSources.find((item) => Number(item.id) === Number(handoff.targetDatasourceId));
+    const mappings: ObjectMappingRow[] = (handoff.objectMappings ?? []).map((item, index) => ({
+      key: item.objectKey || `agent-handoff-mapping-${index + 1}`,
+      sourceSchemaName: item.sourceSchemaName,
+      sourceObjectName: item.sourceObjectName,
+      targetSchemaName: item.targetSchemaName,
+      targetObjectName: item.targetObjectName,
+      objectType: "TABLE",
+      whereCondition: item.whereCondition,
+    }));
+    const mappingsByObject = Object.fromEntries((handoff.objectMappings ?? []).map((item, index) => {
+      const key = item.objectKey || `agent-handoff-mapping-${index + 1}`;
+      return [key, (item.fieldMappings ?? []).map((field, fieldIndex) => ({
+        ...field,
+        key: field.key || `${key}-field-${fieldIndex + 1}`,
+      }))];
+    }));
+    const firstMapping = mappings[0];
+    const firstFields = firstMapping ? mappingsByObject[firstMapping.key] ?? [] : [];
+    const actorId = Number(session.actorId);
+    const projectId = Number(selectedProjectId ?? session.authorizedProjectIds?.[0]);
+    const selectedGroup = findGroupNode(taskGroupFilter);
+    const values: SyncWizardValues = {
+      tenantId: Number(session.tenantId) || undefined,
+      projectId: Number.isFinite(projectId) ? projectId : undefined,
+      transferMode,
+      objectScopeType: "TABLES",
+      syncScopeType: mode === "CUSTOM_SQL_QUERY"
+        ? "CUSTOM_SQL_QUERY"
+        : mappings.length <= 1 ? "SINGLE_OBJECT" : "OBJECT_LIST",
+      sourceDatasourceId: handoff.sourceDatasourceId,
+      targetDatasourceId: handoff.targetDatasourceId,
+      sourceConnectorType: codeFromDataSourceType(sourceDatasource?.type),
+      targetConnectorType: codeFromDataSourceType(targetDatasource?.type),
+      sourceSchemaName: firstMapping?.sourceSchemaName,
+      sourceObjectName: firstMapping?.sourceObjectName,
+      targetSchemaName: firstMapping?.targetSchemaName,
+      targetObjectName: firstMapping?.targetObjectName,
+      syncMode: mode,
+      writeStrategy: mode === "CDC_STREAMING" ? "UPDATE" : handoff.writeStrategy || "INSERT",
+      customSqlText: handoff.customSqlText,
+      groupCode: selectedGroup?.groupCode || "DEFAULT",
+      groupName: selectedGroup?.groupName || "默认分组",
+      taskName: handoff.taskName || "Agent 创建的数据同步任务",
+      taskDescription: "由智能助手解析后转入完整任务向导继续配置。",
+      priority: "MEDIUM",
+      runMode: transferModeProfiles[transferMode].runMode,
+      scheduleConfig: handoff.scheduleConfig,
+      ownerId: Number.isFinite(actorId) ? actorId : undefined,
+    };
+
+    wizardForm.resetFields();
+    wizardForm.setFieldsValue(values);
+    setSourceDiscovery(null);
+    setTargetDiscovery(null);
+    setObjectMappings(mappings);
+    setFieldMappings(firstFields);
+    setFieldMappingsByObjectKey(mappingsByObject);
+    setActiveObjectMappingKey(firstMapping?.key);
+    setWizardDraft(null);
+    setWizardPrecheckResult(null);
+    setBatchWhereCondition("");
+    setSourceObjectKeyword("");
+    setTargetObjectKeyword("");
+    setSourceSchemaFilter(undefined);
+    setTargetSchemaFilter(undefined);
+    setExcludedSourceObjects([]);
+    setWizardStep(mappings.length || handoff.customSqlText ? 2 : 1);
+    setWizardOpen(true);
+    navigate(location.pathname, { replace: true, state: null });
+
+    const discover = async () => {
+      const requests: Array<Promise<void>> = [];
+      if (handoff.sourceDatasourceId) {
+        requests.push(api.discoverSyncTaskMetadata({
+          datasourceId: handoff.sourceDatasourceId,
+          side: "SOURCE",
+          connectorType: codeFromDataSourceType(sourceDatasource?.type),
+          filterMode: "ALL",
+          includeColumns: true,
+          includeViews: true,
+          maxTables: METADATA_DISCOVERY_MAX_TABLES,
+          maxColumnsPerTable: METADATA_DISCOVERY_MAX_COLUMNS_PER_TABLE,
+        }).then((result) => setSourceDiscovery(result.data)));
+      }
+      if (handoff.targetDatasourceId) {
+        requests.push(api.discoverSyncTaskMetadata({
+          datasourceId: handoff.targetDatasourceId,
+          side: "TARGET",
+          connectorType: codeFromDataSourceType(targetDatasource?.type),
+          filterMode: "ALL",
+          includeColumns: true,
+          includeViews: true,
+          maxTables: METADATA_DISCOVERY_MAX_TABLES,
+          maxColumnsPerTable: METADATA_DISCOVERY_MAX_COLUMNS_PER_TABLE,
+        }).then((result) => setTargetDiscovery(result.data)));
+      }
+      const results = await Promise.allSettled(requests);
+      if (results.some((item) => item.status === "rejected")) {
+        message.warning("Agent 草稿已接管，但部分元数据刷新失败；可以继续编辑，预检查会再次验证真实结构。");
+      }
+    };
+    void discover();
+    message.info("已把 Agent 解析结果带入完整任务向导，可以从当前步骤继续编辑。");
+  }, [
+    dataSources,
+    findGroupNode,
+    location.pathname,
+    location.state,
+    message,
+    navigate,
+    selectedProjectId,
+    sessionQuery.data?.data,
+    taskGroupFilter,
+    wizardForm,
+  ]);
 
   const openDraftWizard = async (task: SyncTask) => {
     setWizardSaving(true);

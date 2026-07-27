@@ -93,14 +93,26 @@ interface ClarificationFormValues {
   targetDatasourceId: number;
   writeStrategy: "INSERT" | "UPDATE";
   scheduleConfig?: string;
+  scheduleFrequency?: AgentScheduleFrequency;
+  scheduleStartTime?: string;
+  scheduleCron?: string;
   customSqlText?: string;
+  customSqlConfirmed?: boolean;
+  targetTableResolution?: "CREATE_FROM_SOURCE" | "SELECT_EXISTING";
   objectMappings: ObjectMappingInput[];
 }
 
 interface QuickClarificationValues {
   sourceDatasourceId?: number;
   targetDatasourceId?: number;
+  scheduleFrequency?: AgentScheduleFrequency;
+  scheduleStartTime?: string;
+  scheduleCron?: string;
+  customSqlConfirmed?: boolean;
+  targetTableResolution?: "CREATE_FROM_SOURCE" | "SELECT_EXISTING";
 }
+
+type AgentScheduleFrequency = "HOURLY" | "DAILY" | "WEEKLY" | "CUSTOM_CRON";
 
 interface PlanSubmission {
   objective: string;
@@ -120,6 +132,34 @@ interface ExecutionAnswer {
 
 const defaultObjective = "将 MySQL 中的 fs_test_customer_source 和 fs_test_customer_target 全量同步到 PostgreSQL public schema 的同名表。";
 const taskImportObjective = "检查这个任务文件，先试运行；若失败则检索产品文档和历史案例，提出可执行修复方案，经我确认后修复、重新校验并导入。";
+
+function normalizeScheduleStartAt(value?: string) {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(normalized)) return normalized;
+  return `${normalized.length === 16 ? `${normalized}:00` : normalized}+08:00`;
+}
+
+function buildAgentScheduleConfig(
+  frequency?: AgentScheduleFrequency,
+  startTime?: string,
+  customCron?: string,
+) {
+  if (!frequency || !startTime) return undefined;
+  const common = {
+    timezone: "Asia/Shanghai",
+    startAt: normalizeScheduleStartAt(startTime),
+    misfirePolicy: "FIRE_ONCE",
+    allowConcurrentRuns: false,
+    maxCatchUpRuns: 1,
+  };
+  if (frequency === "CUSTOM_CRON") {
+    const cron = customCron?.trim();
+    return cron ? JSON.stringify({ ...common, type: "CRON", cron }) : undefined;
+  }
+  const intervalSeconds = frequency === "HOURLY" ? 3600 : frequency === "DAILY" ? 86_400 : 604_800;
+  return JSON.stringify({ ...common, type: "FIXED_RATE", intervalSeconds });
+}
 
 const syncModeLabels: Record<string, string> = {
   FULL: "全量传输",
@@ -832,9 +872,10 @@ function UserAgentAssistant() {
       };
       if (submission.clarification) {
         const clarification = submission.clarification;
-        const selectedMode = clarification.syncMode
-          ? normalizeUserSyncMode(clarification.syncMode)
-          : undefined;
+        const selectedMode = normalizeUserSyncMode(
+          clarification.syncMode
+          || plan?.agentConversation?.structuredIntent.syncMode,
+        );
         const dataSyncRequest: Record<string, unknown> = {
           taskDescription: submission.objective,
           groupCode: "DEFAULT",
@@ -852,12 +893,23 @@ function UserAgentAssistant() {
           dataSyncRequest.writeStrategy = isRealtimeSyncMode(selectedMode)
             ? "UPDATE"
             : clarification.writeStrategy;
-          if (isScheduledSyncMode(selectedMode) && clarification.scheduleConfig) {
-            dataSyncRequest.scheduleConfig = clarification.scheduleConfig;
+          if (isScheduledSyncMode(selectedMode)) {
+            const scheduleConfig = clarification.scheduleConfig || buildAgentScheduleConfig(
+              clarification.scheduleFrequency,
+              clarification.scheduleStartTime,
+              clarification.scheduleCron,
+            );
+            if (scheduleConfig) dataSyncRequest.scheduleConfig = scheduleConfig;
           }
           if (isSqlSyncMode(selectedMode) && clarification.customSqlText) {
             dataSyncRequest.customSqlText = clarification.customSqlText;
           }
+        }
+        if (clarification.customSqlConfirmed !== undefined) {
+          dataSyncRequest.customSqlConfirmed = clarification.customSqlConfirmed;
+        }
+        if (clarification.targetTableResolution) {
+          dataSyncRequest.targetTableResolution = clarification.targetTableResolution;
         }
         if (clarification.objectMappings?.length) {
           dataSyncRequest.objectMappings = clarification.objectMappings.map((item, index) => ({
@@ -1153,12 +1205,22 @@ function UserAgentAssistant() {
   const needsSourceDatasource = missingParameterSet.has("sourceDatasourceId");
   const needsTargetDatasource = missingParameterSet.has("targetDatasourceId");
   const needsObjectMappings = missingParameterSet.has("objectMappings");
+  const needsScheduleFrequency = missingParameterSet.has("scheduleFrequency");
+  const needsScheduleStartTime = missingParameterSet.has("scheduleStartTime");
+  const needsSqlConfirmation = missingParameterSet.has("customSqlConfirmation");
+  const needsTargetTableResolution = missingParameterSet.has("targetTableResolution");
+  const needsFieldMappingConversions = missingParameterSet.has("fieldMappingConversions");
   const sourceClarification = conversation?.clarificationQuestions.find(
     (question) => question.parameterName === "sourceDatasourceId",
   );
   const targetClarification = conversation?.clarificationQuestions.find(
     (question) => question.parameterName === "targetDatasourceId",
   );
+  const sqlConfirmationQuestion = conversation?.clarificationQuestions.find(
+    (question) => question.parameterName === "customSqlConfirmation",
+  );
+  const generatedSqlPreview = sqlConfirmationQuestion?.configurationPreview?.customSqlText;
+  const quickScheduleFrequency = Form.useWatch("scheduleFrequency", quickClarificationForm);
   const quickSourceOptions = sourceClarification?.candidates?.length
     ? sourceClarification.candidates.map((item) => ({
         value: item.datasourceId,
@@ -1171,7 +1233,12 @@ function UserAgentAssistant() {
         label: `#${item.datasourceId} ${item.name}（${item.type}）`,
       }))
     : targetOptions;
-  const hasQuickClarificationFields = needsSourceDatasource || needsTargetDatasource;
+  const hasQuickClarificationFields = needsSourceDatasource
+    || needsTargetDatasource
+    || needsScheduleFrequency
+    || needsScheduleStartTime
+    || needsSqlConfirmation
+    || needsTargetTableResolution;
   const planItems = plan?.plan?.toolPlans ?? [];
   const latestDurableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
     .reverse()
@@ -1277,6 +1344,53 @@ function UserAgentAssistant() {
       objective: taskImportObjective,
       taskImportArtifactRef: taskImportArtifact.artifactRef,
       taskImportRunImmediately,
+    });
+  };
+
+  const handoffToManualWizard = () => {
+    const draftArguments = plan?.plan?.toolPlans.find(
+      (item) => item.toolName === "sync.task.draft.save",
+    )?.arguments;
+    const sourceMetadataArguments = plan?.plan?.toolPlans.find(
+      (item) => item.toolName === "datasource.source.metadata.read",
+    )?.arguments;
+    const targetMetadataArguments = plan?.plan?.toolPlans.find(
+      (item) => item.toolName === "datasource.target.metadata.read",
+    )?.arguments;
+    const formValues = clarificationForm.getFieldsValue(true);
+    const mode = normalizeUserSyncMode(
+      formValues.syncMode
+      || textField(draftArguments, "syncMode")
+      || conversation?.structuredIntent.syncMode,
+    );
+    const sourceDatasourceId = formValues.sourceDatasourceId
+      || numberField(draftArguments, "sourceDatasourceId")
+      || numberField(sourceMetadataArguments, "datasourceId");
+    const targetDatasourceId = formValues.targetDatasourceId
+      || numberField(draftArguments, "targetDatasourceId")
+      || numberField(targetMetadataArguments, "datasourceId");
+    const objectMappings = formValues.objectMappings?.length
+      ? formValues.objectMappings
+      : Array.isArray(draftArguments?.objectMappings)
+        ? draftArguments.objectMappings
+        : [];
+    navigate("/sync", {
+      state: {
+        agentWizardHandoff: {
+          handoffId: crypto.randomUUID(),
+          taskName: formValues.taskName || textField(draftArguments, "taskName") || "Agent 创建的数据同步任务",
+          syncMode: mode,
+          writeStrategy: isRealtimeSyncMode(mode)
+            ? "UPDATE"
+            : formValues.writeStrategy || textField(draftArguments, "writeStrategy") || "INSERT",
+          sourceDatasourceId,
+          targetDatasourceId,
+          scheduleConfig: formValues.scheduleConfig || textField(draftArguments, "scheduleConfig"),
+          customSqlText: formValues.customSqlText || textField(draftArguments, "customSqlText") || generatedSqlPreview,
+          objectMappings,
+          source: "AGENT_PROGRESSIVE_CLARIFICATION",
+        },
+      },
     });
   };
 
@@ -1549,11 +1663,20 @@ function UserAgentAssistant() {
                 <Form<QuickClarificationValues>
                   form={quickClarificationForm}
                   layout="vertical"
-                  onFinish={(values) => planMutation.mutate({
-                    objective,
-                    clarification: values,
-                    preserveTimeline: true,
-                  })}
+                  onFinish={(values) => {
+                    if (values.targetTableResolution === "SELECT_EXISTING") {
+                      handoffToManualWizard();
+                      return;
+                    }
+                    planMutation.mutate({
+                      objective,
+                      clarification: {
+                        ...values,
+                        customSqlText: values.customSqlConfirmed ? generatedSqlPreview : undefined,
+                      },
+                      preserveTimeline: true,
+                    });
+                  }}
                 >
                   <div className="grid grid-two-form">
                     {needsSourceDatasource ? (
@@ -1591,6 +1714,73 @@ function UserAgentAssistant() {
                       </Form.Item>
                     ) : <div />}
                   </div>
+                  {needsScheduleFrequency || needsScheduleStartTime ? (
+                    <div className="grid grid-two-form">
+                      {needsScheduleFrequency ? (
+                        <Form.Item
+                          name="scheduleFrequency"
+                          label="执行频率"
+                          rules={[{ required: true, message: "请选择定期任务执行频率" }]}
+                        >
+                          <Select
+                            options={[
+                              { value: "HOURLY", label: "每小时" },
+                              { value: "DAILY", label: "每天" },
+                              { value: "WEEKLY", label: "每周" },
+                              { value: "CUSTOM_CRON", label: "自定义 Cron" },
+                            ]}
+                          />
+                        </Form.Item>
+                      ) : <div />}
+                      {needsScheduleStartTime ? (
+                        <Form.Item
+                          name="scheduleStartTime"
+                          label="首次执行时间（北京时间）"
+                          rules={[{ required: true, message: "请选择首次执行时间" }]}
+                        >
+                          <Input type="datetime-local" />
+                        </Form.Item>
+                      ) : <div />}
+                    </div>
+                  ) : null}
+                  {quickScheduleFrequency === "CUSTOM_CRON" ? (
+                    <Form.Item
+                      name="scheduleCron"
+                      label="Spring 六段 Cron"
+                      rules={[{ required: true, message: "请输入六段 Cron 表达式" }]}
+                    >
+                      <Input placeholder="例如 0 0 2 * * *" />
+                    </Form.Item>
+                  ) : null}
+                  {needsSqlConfirmation ? (
+                    <Card size="small" title="Agent 生成的只读 SQL" style={{ marginBottom: 16 }}>
+                      <Input.TextArea value={generatedSqlPreview} readOnly autoSize={{ minRows: 4, maxRows: 12 }} />
+                      <Form.Item
+                        name="customSqlConfirmed"
+                        valuePropName="checked"
+                        rules={[{
+                          validator: async (_, checked?: boolean) => {
+                            if (!checked) throw new Error("请确认 SQL，或进入高级编辑器修改");
+                          },
+                        }]}
+                        style={{ marginTop: 12, marginBottom: 0 }}
+                      >
+                        <Checkbox>我已核对 SQL 的表、字段、别名和过滤范围，同意用于本任务</Checkbox>
+                      </Form.Item>
+                    </Card>
+                  ) : null}
+                  {needsTargetTableResolution ? (
+                    <Form.Item
+                      name="targetTableResolution"
+                      label="目标表不存在，选择处理方式"
+                      rules={[{ required: true, message: "请选择创建目标表或改选已有表" }]}
+                    >
+                      <Select options={[
+                        { value: "CREATE_FROM_SOURCE", label: "按源表结构生成建表预览，确认后创建" },
+                        { value: "SELECT_EXISTING", label: "进入手工向导选择其他已有目标表" },
+                      ]} />
+                    </Form.Item>
+                  ) : null}
                   <Space wrap>
                     <Button
                       type="primary"
@@ -1600,15 +1790,21 @@ function UserAgentAssistant() {
                     >
                       继续由 Agent 自动核对
                     </Button>
-                    <Button onClick={() => setShowAdvancedClarification(true)}>
-                      高级手工接管
+                    <Button onClick={handoffToManualWizard}>
+                      进入完整任务向导
+                    </Button>
+                    <Button type="link" onClick={() => setShowAdvancedClarification(true)}>
+                      当前页编辑映射
                     </Button>
                   </Space>
                 </Form>
               ) : (
-                <Button type="primary" onClick={() => setShowAdvancedClarification(true)}>
-                  编辑对象与字段映射
-                </Button>
+                <Space wrap>
+                  <Button type="primary" onClick={handoffToManualWizard}>
+                    {needsFieldMappingConversions ? "进入向导处理类型转换" : "进入完整任务向导"}
+                  </Button>
+                  <Button onClick={() => setShowAdvancedClarification(true)}>当前页编辑映射</Button>
+                </Space>
               )}
               {needsObjectMappings && hasQuickClarificationFields ? (
                 <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>

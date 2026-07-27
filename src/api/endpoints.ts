@@ -2030,6 +2030,16 @@ function normalizeAgentClarificationQuestion(value: unknown): AgentClarification
         };
       }).filter((item) => item.datasourceId > 0 && item.name)
     : [];
+  const options = Array.isArray(record.options)
+    ? record.options.map((item) => {
+        const option = readRecord(item);
+        return {
+          value: typeof option.value === "boolean" ? option.value : readString(option.value),
+          label: readString(option.label),
+        };
+      }).filter((item) => item.label && (typeof item.value === "boolean" || item.value))
+    : [];
+  const preview = readRecord(record.configurationPreview);
   return {
     parameterName: readString(record.parameterName),
     fieldPath: readString(record.fieldPath),
@@ -2039,6 +2049,16 @@ function normalizeAgentClarificationQuestion(value: unknown): AgentClarification
     required: readBoolean(record.required, true),
     sensitive: readBoolean(record.sensitive),
     candidates: candidates.length ? candidates : undefined,
+    options: options.length ? options : undefined,
+    reasonCode: readOptionalString(record.reasonCode),
+    repairGuidance: readOptionalString(record.repairGuidance),
+    configurationPreview: Object.keys(preview).length ? {
+      kind: readOptionalString(preview.kind),
+      customSqlText: readOptionalString(preview.customSqlText),
+      generatedByAgent: readBoolean(preview.generatedByAgent),
+      requiresExplicitConfirmation: readBoolean(preview.requiresExplicitConfirmation),
+      payloadPolicy: readOptionalString(preview.payloadPolicy),
+    } : undefined,
   };
 }
 
