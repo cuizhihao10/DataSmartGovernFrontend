@@ -72,8 +72,8 @@ import type {
   SyncTaskMetadataDiscoveryResult,
   SyncTaskOperationResult,
   SyncTask,
-  SyncTemplate,
-  SyncTemplateExecutionPrecheckResponse,
+  SyncTaskDefinition,
+  SyncTaskExecutionPrecheckResponse,
 } from "@/types/domain";
 
 export interface CreateDataSourcePayload {
@@ -389,7 +389,7 @@ export interface RunQualityCheckPayload {
   notes?: string;
 }
 
-export interface CreateSyncTemplatePayload {
+export interface SyncTaskDefinitionPayload {
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
@@ -417,24 +417,8 @@ export interface CreateSyncTemplatePayload {
   timeoutPolicy?: string;
 }
 
-export interface CreateSyncTaskPayload {
-  tenantId?: number;
-  projectId?: number;
-  workspaceId?: number;
-  templateId: number;
-  groupCode?: string;
-  groupName?: string;
-  name?: string;
-  description?: string;
-  priority?: string;
-  scheduleConfig?: string;
-  runMode?: string;
-  ownerId?: number;
-}
-
-export interface SyncTaskCreateWizardDraftPayload extends Omit<CreateSyncTemplatePayload, "name"> {
+export interface SyncTaskCreateWizardDraftPayload extends Omit<SyncTaskDefinitionPayload, "name"> {
   taskId?: number;
-  templateId?: number;
   stepCode?: string;
   taskName?: string;
   name?: string;
@@ -448,7 +432,6 @@ export interface SyncTaskCreateWizardDraftPayload extends Omit<CreateSyncTemplat
 
 export interface SyncTaskCreateWizardDraftResult {
   taskId: number;
-  templateId: number;
   created: boolean;
   currentState: string;
   scheduleEnabled?: boolean;
@@ -457,14 +440,13 @@ export interface SyncTaskCreateWizardDraftResult {
   groupName?: string;
   nextActions?: string[];
   task?: SyncTask;
-  template?: SyncTemplate;
+  definition?: SyncTaskDefinition;
 }
 
 export interface SyncTaskQueryParams {
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
-  templateId?: number;
   ownerId?: number;
   groupCode?: string;
   currentState?: string;
@@ -1078,7 +1060,7 @@ function normalizeQualityReport(value: unknown, index: number): QualityReport {
   };
 }
 
-function normalizeSyncTemplate(value: unknown, index: number): SyncTemplate {
+function normalizeSyncTaskDefinition(value: unknown, index: number): SyncTaskDefinition {
   const record = isRecord(value) ? value : {};
   const id = readNumber(record.id, index + 1);
   return {
@@ -1086,7 +1068,7 @@ function normalizeSyncTemplate(value: unknown, index: number): SyncTemplate {
     tenantId: readOptionalNumber(record.tenantId),
     projectId: readOptionalNumber(record.projectId),
     workspaceId: readOptionalNumber(record.workspaceId),
-    name: readString(record.name, `sync-template-${id}`),
+    name: readString(record.name, `sync-task-definition-${id}`),
     description: readString(record.description),
     sourceDatasourceId: readNumber(record.sourceDatasourceId),
     targetDatasourceId: readNumber(record.targetDatasourceId),
@@ -1126,7 +1108,9 @@ function normalizeSyncTask(value: unknown, index: number): SyncTask {
     tenantId: readOptionalNumber(record.tenantId),
     projectId: readOptionalNumber(record.projectId),
     workspaceId: readOptionalNumber(record.workspaceId),
-    templateId: readNumber(record.templateId),
+    definition: isRecord(record.definition)
+      ? normalizeSyncTaskDefinition(record.definition, index)
+      : undefined,
     groupCode,
     groupName,
     name: readString(record.name, `sync-task-${id}`),
@@ -1488,7 +1472,6 @@ function normalizeSyncObjectExecution(value: unknown, index: number): SyncObject
     workspaceId: readOptionalNumber(record.workspaceId),
     syncTaskId: readNumber(record.syncTaskId),
     executionId: readNumber(record.executionId),
-    templateId: readOptionalNumber(record.templateId),
     objectOrdinal: readOptionalNumber(record.objectOrdinal),
     workUnitType: readString(record.workUnitType),
     shardOrPartition: readString(record.shardOrPartition),
@@ -1562,7 +1545,6 @@ function normalizeSyncAuditRecord(value: unknown, index: number): SyncAuditRecor
     tenantId: readOptionalNumber(record.tenantId),
     projectId: readOptionalNumber(record.projectId),
     workspaceId: readOptionalNumber(record.workspaceId),
-    templateId: readOptionalNumber(record.templateId),
     syncTaskId: readOptionalNumber(record.syncTaskId),
     executionId: readOptionalNumber(record.executionId),
     actionType: readString(record.actionType),
@@ -2349,7 +2331,6 @@ const closureProbeTargets: Array<{ key: string; name: string; path: string }> = 
   { key: "task", name: "任务列表", path: "/task/tasks?current=1&size=1" },
   { key: "quality", name: "质量规则", path: "/quality/quality-rules?current=1&size=1" },
   { key: "syncCapabilities", name: "同步连接器", path: "/sync/sync-connectors/capabilities" },
-  { key: "syncTemplates", name: "同步模板", path: "/sync/sync-templates?current=1&size=1" },
   { key: "syncTasks", name: "同步任务", path: "/sync/sync-tasks?current=1&size=1" },
   { key: "agent", name: "Agent 工具", path: "/agent/tools?enabledOnly=false" },
   { key: "permission", name: "权限角色", path: "/permission/roles" },
@@ -2514,24 +2495,6 @@ export const api = {
       qualityReports,
       normalizeQualityReport,
     ),
-  createSyncTemplate: (payload: CreateSyncTemplatePayload) =>
-    postJson<SyncTemplate>("/sync/sync-templates", payload),
-  validateSyncTemplate: (id: number) => postJson<unknown>(`/sync/sync-templates/${id}/validate`),
-  getSyncTemplate: async (id: number) => {
-    const result = await request<unknown>(`/sync/sync-templates/${id}`);
-    return {
-      ...result,
-      data: normalizeSyncTemplate(result.data, 0),
-    };
-  },
-  previewSyncTemplate: (id: number) => postJson<unknown>(`/sync/sync-templates/${id}/preview`),
-  precheckSyncTemplate: (id: number) =>
-    postJson<SyncTemplateExecutionPrecheckResponse>(`/sync/sync-templates/${id}/precheck`),
-  buildSyncOfflineJobPlan: (id: number) =>
-    postJson<Record<string, unknown>>(`/sync/sync-templates/${id}/offline-job-plan`),
-  listSyncTemplates: () =>
-    pageEndpoint<SyncTemplate>("/sync/sync-templates?current=1&size=20", [], normalizeSyncTemplate),
-  createSyncTask: (payload: CreateSyncTaskPayload) => postJson<SyncTask>("/sync/sync-tasks", payload),
   getSyncTask: async (id: number) => {
     const result = await request<unknown>(`/sync/sync-tasks/${id}`);
     return {
@@ -2541,6 +2504,8 @@ export const api = {
   },
   saveSyncTaskCreateWizardDraft: (payload: SyncTaskCreateWizardDraftPayload) =>
     postJson<SyncTaskCreateWizardDraftResult>("/sync/sync-tasks/create-wizard/drafts", payload),
+  precheckSyncTask: (id: number) =>
+    postJson<SyncTaskExecutionPrecheckResponse>(`/sync/sync-tasks/${id}/precheck`),
   updateSyncTask: (id: number, payload?: UpdateSyncTaskPayload) => putJson<SyncTask>(`/sync/sync-tasks/${id}`, payload),
   publishSyncTask: (id: number, payload?: PublishSyncTaskPayload) =>
     postJson<SyncTaskOperationResult>(`/sync/sync-tasks/${id}/publish`, payload),

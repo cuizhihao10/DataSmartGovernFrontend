@@ -282,7 +282,7 @@ export interface QualityReport {
   generatedAt: string;
 }
 
-export interface SyncTemplate {
+export interface SyncTaskDefinition {
   id: number;
   tenantId?: number;
   projectId?: number;
@@ -321,7 +321,7 @@ export interface SyncTask {
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
-  templateId: number;
+  definition?: SyncTaskDefinition;
   groupCode?: string;
   groupName?: string;
   name: string;
@@ -525,8 +525,7 @@ export interface SyncTaskMetadataDiscoveryResult {
   warnings?: string[];
 }
 
-export interface SyncTemplateExecutionPrecheckResponse {
-  templateId?: number;
+export interface SyncTaskExecutionPrecheckResponse {
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
@@ -702,7 +701,6 @@ export interface SyncObjectExecution {
   workspaceId?: number;
   syncTaskId: number;
   executionId: number;
-  templateId?: number;
   objectOrdinal?: number;
   workUnitType?: string;
   shardOrPartition?: string;
@@ -767,7 +765,6 @@ export interface SyncAuditRecord {
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
-  templateId?: number;
   syncTaskId?: number;
   executionId?: number;
   actionType?: string;

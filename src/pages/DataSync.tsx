@@ -100,8 +100,7 @@ import type {
   SyncTaskImportRowResult,
   SyncTaskMetadataDiscoveryResult,
   SyncTaskMetadataTable,
-  SyncTemplate,
-  SyncTemplateExecutionPrecheckResponse,
+  SyncTaskExecutionPrecheckResponse,
 } from "@/types/domain";
 import { formatDateTime } from "@/utils/format";
 import {
@@ -976,7 +975,6 @@ export function DataSync() {
   const [executionPolicyForm] = Form.useForm<UpsertSyncExecutionPolicyPayload>();
   const [activeTab, setActiveTab] = useState("tasks");
   const [taskTreeView, setTaskTreeView] = useState<"tasks" | "recycle">("tasks");
-  const [templateKeyword, setTemplateKeyword] = useState("");
   const [taskKeyword, setTaskKeyword] = useState("");
   const [taskGroupFilter, setTaskGroupFilter] = useState<string>();
   const [taskGroupTreeKeyFilter, setTaskGroupTreeKeyFilter] = useState<string>();
@@ -1000,10 +998,10 @@ export function DataSync() {
   const [fieldMappings, setFieldMappings] = useState<FieldMappingRow[]>([]);
   const [fieldMappingsByObjectKey, setFieldMappingsByObjectKey] = useState<Record<string, FieldMappingRow[]>>({});
   const [activeObjectMappingKey, setActiveObjectMappingKey] = useState<string>();
-  const [wizardDraft, setWizardDraft] = useState<{ taskId?: number; templateId?: number } | null>(null);
+  const [wizardDraft, setWizardDraft] = useState<{ taskId?: number } | null>(null);
   const [wizardSaving, setWizardSaving] = useState(false);
   const [wizardPrecheckLoading, setWizardPrecheckLoading] = useState(false);
-  const [wizardPrecheckResult, setWizardPrecheckResult] = useState<SyncTemplateExecutionPrecheckResponse | null>(null);
+  const [wizardPrecheckResult, setWizardPrecheckResult] = useState<SyncTaskExecutionPrecheckResponse | null>(null);
   const [wizardPrecheckDetail, setWizardPrecheckDetail] = useState<WizardPrecheckItem | null>(null);
   const [sourceObjectPageSize, setSourceObjectPageSize] = useState(10);
   const [targetObjectPageSize, setTargetObjectPageSize] = useState(10);
@@ -1047,10 +1045,6 @@ export function DataSync() {
   const capabilityQuery = useQuery({
     queryKey: ["sync-connector-capabilities"],
     queryFn: api.listSyncConnectorCapabilities,
-  });
-  const templateQuery = useQuery({
-    queryKey: ["sync-templates"],
-    queryFn: api.listSyncTemplates,
   });
   const taskQuery = useQuery({
     queryKey: ["sync-tasks", selectedProjectScopeId, taskGroupFilter, taskStateFilter, normalizedTaskKeyword, taskPage, taskPageSize],
@@ -1134,39 +1128,37 @@ export function DataSync() {
     queryFn: () => api.listSyncAuditRecords(selectedTask!.id, selectedExecutionId),
     enabled: Boolean(selectedTask?.id),
   });
-  const selectedTaskTemplateQuery = useQuery({
-    queryKey: ["sync-task-template-detail", selectedTask?.templateId],
-    queryFn: () => api.getSyncTemplate(selectedTask!.templateId),
-    enabled: Boolean(selectedTask?.templateId),
+  const selectedTaskDetailQuery = useQuery({
+    queryKey: ["sync-task-detail", selectedTask?.id],
+    queryFn: () => api.getSyncTask(selectedTask!.id),
+    enabled: Boolean(selectedTask?.id),
   });
-
   const dataSources = useMemo(() => dataSourceQuery.data?.data.records ?? [], [dataSourceQuery.data?.data.records]);
   const capabilities = useMemo(() => capabilityQuery.data?.data ?? [], [capabilityQuery.data?.data]);
-  const templates = useMemo(() => templateQuery.data?.data.records ?? [], [templateQuery.data?.data.records]);
-  const selectedTaskTemplate = selectedTaskTemplateQuery.data?.data
-    ?? templates.find((template) => template.id === selectedTask?.templateId);
-  const selectedSourceDatasource = dataSources.find((datasource) => datasource.id === selectedTaskTemplate?.sourceDatasourceId);
-  const selectedTargetDatasource = dataSources.find((datasource) => datasource.id === selectedTaskTemplate?.targetDatasourceId);
+  const selectedTaskDetail = selectedTaskDetailQuery.data?.data ?? selectedTask;
+  const selectedTaskDefinition = selectedTaskDetail?.definition;
+  const selectedSourceDatasource = dataSources.find((datasource) => datasource.id === selectedTaskDefinition?.sourceDatasourceId);
+  const selectedTargetDatasource = dataSources.find((datasource) => datasource.id === selectedTaskDefinition?.targetDatasourceId);
   const selectedObjectMappings = useMemo(() => {
-    const parsed = parseObjectMappingsConfig(selectedTaskTemplate?.objectMappingConfig);
-    if (parsed.length || !selectedTaskTemplate) {
+    const parsed = parseObjectMappingsConfig(selectedTaskDefinition?.objectMappingConfig);
+    if (parsed.length || !selectedTaskDefinition) {
       return parsed;
     }
-    if (selectedTaskTemplate.sourceObjectName || selectedTaskTemplate.targetObjectName) {
+    if (selectedTaskDefinition.sourceObjectName || selectedTaskDefinition.targetObjectName) {
       return [{
-        key: "single-object-from-template",
-        sourceSchemaName: selectedTaskTemplate.sourceSchemaName,
-        sourceObjectName: selectedTaskTemplate.sourceObjectName,
-        targetSchemaName: selectedTaskTemplate.targetSchemaName,
-        targetObjectName: selectedTaskTemplate.targetObjectName,
+        key: "single-object-from-definition",
+        sourceSchemaName: selectedTaskDefinition.sourceSchemaName,
+        sourceObjectName: selectedTaskDefinition.sourceObjectName,
+        targetSchemaName: selectedTaskDefinition.targetSchemaName,
+        targetObjectName: selectedTaskDefinition.targetObjectName,
         objectType: "TABLE",
       } satisfies ObjectMappingRow];
     }
     return [];
-  }, [selectedTaskTemplate]);
+  }, [selectedTaskDefinition]);
   const selectedFieldMappingConfig = useMemo(
-    () => parseFieldMappingConfig(selectedTaskTemplate?.fieldMappingConfig),
-    [selectedTaskTemplate?.fieldMappingConfig],
+    () => parseFieldMappingConfig(selectedTaskDefinition?.fieldMappingConfig),
+    [selectedTaskDefinition?.fieldMappingConfig],
   );
   const selectedDetailObjectMappings = useMemo(
     () => selectedObjectMappings.length ? selectedObjectMappings : selectedFieldMappingConfig.objectRows,
@@ -1193,25 +1185,25 @@ export function DataSync() {
     return selectedFieldMappingConfig.rows.map((row, index) => ({
       ...row,
       detailKey: `${row.key || "field"}-${index}`,
-      objectName: selectedTaskTemplate?.syncMode === "CUSTOM_SQL_QUERY" ? "SQL 结果集 -> 目标表" : "全局字段映射",
+      objectName: selectedTaskDefinition?.syncMode === "CUSTOM_SQL_QUERY" ? "SQL 结果集 -> 目标表" : "全局字段映射",
     }));
-  }, [selectedDetailObjectMappings, selectedFieldMappingConfig, selectedTaskTemplate?.syncMode]);
+  }, [selectedDetailObjectMappings, selectedFieldMappingConfig, selectedTaskDefinition?.syncMode]);
   const selectedCustomSqlText = useMemo(
-    () => parseCustomSqlConfig(selectedTaskTemplate?.customSqlConfig),
-    [selectedTaskTemplate?.customSqlConfig],
+    () => parseCustomSqlConfig(selectedTaskDefinition?.customSqlConfig),
+    [selectedTaskDefinition?.customSqlConfig],
   );
   const selectedRawConfigRows = useMemo<TaskRawConfigRow[]>(() => [
     {
       key: "objectMappingConfig",
       name: "对象映射配置",
       description: "保存源端 schema/table 到目标端 schema/table 的对应关系，以及每个对象的 where 条件。",
-      content: formatJsonConfig(selectedTaskTemplate?.objectMappingConfig),
+      content: formatJsonConfig(selectedTaskDefinition?.objectMappingConfig),
     },
     {
       key: "fieldMappingConfig",
       name: "字段映射配置",
       description: "保存每个同步对象下源字段、目标字段、是否同步、类型兼容性和转换规则。",
-      content: formatJsonConfig(selectedTaskTemplate?.fieldMappingConfig),
+      content: formatJsonConfig(selectedTaskDefinition?.fieldMappingConfig),
     },
     {
       key: "scheduleConfig",
@@ -1223,9 +1215,9 @@ export function DataSync() {
       key: "customSqlConfig",
       name: "SQL 语句配置",
       description: "SQL 自定义传输模式使用；详情页会额外以 SQL 文本形式单独展示。",
-      content: formatJsonConfig(selectedTaskTemplate?.customSqlConfig),
+      content: formatJsonConfig(selectedTaskDefinition?.customSqlConfig),
     },
-  ], [selectedTask?.scheduleConfig, selectedTaskTemplate]);
+  ], [selectedTask?.scheduleConfig, selectedTaskDefinition]);
   const tasks = useMemo(() => sortByIdDesc(taskQuery.data?.data.records), [taskQuery.data?.data.records]);
   const taskGroupTree = useMemo(
     () => normalizeSyncGroupTree(taskGroupTreeQuery.data?.data ?? []),
@@ -1425,7 +1417,6 @@ export function DataSync() {
     const fieldConfig = buildFieldMappingConfig(fieldMappings, objectMappings, effectiveRowsByObjectKey);
     return compactPayload<SyncTaskCreateWizardDraftPayload>({
       taskId: wizardDraft?.taskId,
-      templateId: wizardDraft?.templateId,
       stepCode,
       tenantId: values.tenantId,
       projectId: values.projectId,
@@ -1462,24 +1453,24 @@ export function DataSync() {
     setWizardSaving(true);
     try {
       const result = await api.saveSyncTaskCreateWizardDraft(buildWizardDraftPayload(stepCode, discoverySnapshot));
-      setWizardDraft({ taskId: result.data.taskId, templateId: result.data.templateId });
+      setWizardDraft({ taskId: result.data.taskId });
       message.success(result.data.created ? "同步任务草稿已创建，任务列表会显示编辑中记录" : "同步任务草稿已保存");
-      await Promise.all([templateQuery.refetch(), taskQuery.refetch(), taskGroupQuery.refetch(), taskGroupTreeQuery.refetch()]);
+      await Promise.all([taskQuery.refetch(), taskGroupQuery.refetch(), taskGroupTreeQuery.refetch()]);
       return result.data;
     } finally {
       setWizardSaving(false);
     }
   };
 
-  const runWizardAutoPrecheck = useCallback(async (templateId?: number) => {
-    const effectiveTemplateId = templateId ?? wizardDraft?.templateId;
-    if (!effectiveTemplateId) {
+  const runWizardAutoPrecheck = useCallback(async (taskId?: number) => {
+    const effectiveTaskId = taskId ?? wizardDraft?.taskId;
+    if (!effectiveTaskId) {
       setWizardPrecheckResult(null);
       return;
     }
     setWizardPrecheckLoading(true);
     try {
-      const precheckResult = await api.precheckSyncTemplate(effectiveTemplateId);
+      const precheckResult = await api.precheckSyncTask(effectiveTaskId);
       setWizardPrecheckResult(precheckResult.data);
       message.success("服务端预检查已完成");
     } catch (error) {
@@ -1488,14 +1479,14 @@ export function DataSync() {
     } finally {
       setWizardPrecheckLoading(false);
     }
-  }, [message, wizardDraft?.templateId]);
+  }, [message, wizardDraft?.taskId]);
 
   useEffect(() => {
-    if (!wizardOpen || wizardStep !== 3 || !wizardDraft?.templateId) {
+    if (!wizardOpen || wizardStep !== 3 || !wizardDraft?.taskId) {
       return;
     }
-    void runWizardAutoPrecheck(wizardDraft.templateId);
-  }, [runWizardAutoPrecheck, wizardOpen, wizardStep, wizardDraft?.templateId]);
+    void runWizardAutoPrecheck(wizardDraft.taskId);
+  }, [runWizardAutoPrecheck, wizardOpen, wizardStep, wizardDraft?.taskId]);
 
   const createGroupMutation = useMutation({
     mutationFn: (payload: CreateSyncTaskGroupPayload) => api.createSyncTaskGroup(payload),
@@ -1563,7 +1554,7 @@ export function DataSync() {
       await Promise.all([taskQuery.refetch(), taskGroupQuery.refetch(), taskGroupTreeQuery.refetch(), recycleBinQuery.refetch()]);
       if (selectedTask) {
         await Promise.all([
-          selectedTaskTemplateQuery.refetch(),
+          selectedTaskDetailQuery.refetch(),
           executionQuery.refetch(),
           objectExecutionQuery.refetch(),
           errorSampleQuery.refetch(),
@@ -1759,15 +1750,6 @@ export function DataSync() {
     },
     onError: (error) => message.error(error instanceof Error ? error.message : "执行策略禁用失败"),
   });
-
-  const filteredTemplates = sortByIdDesc(
-    templates.filter((record) =>
-      [record.name, record.sourceObjectName, record.targetObjectName, record.syncMode, record.syncScopeType]
-        .join(" ")
-        .toLowerCase()
-        .includes(templateKeyword.toLowerCase()),
-    ),
-  );
 
   const filteredTasks = tasks;
   const filteredRecycledTasks = recycledTasks;
@@ -2225,49 +2207,49 @@ export function DataSync() {
   const openDraftWizard = async (task: SyncTask) => {
     setWizardSaving(true);
     try {
-      const [freshTaskResult, templateResult] = await Promise.all([
-        api.getSyncTask(task.id),
-        api.getSyncTemplate(task.templateId),
-      ]);
+      const freshTaskResult = await api.getSyncTask(task.id);
       const freshTask = freshTaskResult.data;
-      const template = templateResult.data;
-      const transferMode = transferModeFromSyncMode(template.syncMode);
-      const syncScopeType = (template.syncScopeType || transferModeProfiles[transferMode].syncScopeType) as SyncWizardValues["syncScopeType"];
+      const definition = freshTask.definition;
+      if (!definition) {
+        throw new Error("任务定义不存在，无法恢复编辑。请刷新任务列表后重试。");
+      }
+      const transferMode = transferModeFromSyncMode(definition.syncMode);
+      const syncScopeType = (definition.syncScopeType || transferModeProfiles[transferMode].syncScopeType) as SyncWizardValues["syncScopeType"];
       const objectScopeType: ObjectScopeType = syncScopeType === "SCHEMA_FULL"
         ? "SCHEMA_FULL"
         : syncScopeType === "DATABASE_FULL"
           ? "DATABASE_FULL"
           : "TABLES";
-      const fieldConfig = parseFieldMappingConfig(template.fieldMappingConfig);
-      const objectConfigRows = parseObjectMappingsConfig(template.objectMappingConfig);
+      const fieldConfig = parseFieldMappingConfig(definition.fieldMappingConfig);
+      const objectConfigRows = parseObjectMappingsConfig(definition.objectMappingConfig);
       const objectRows = fieldConfig.objectRows.length ? fieldConfig.objectRows : objectConfigRows;
-      const customSqlText = parseCustomSqlConfig(template.customSqlConfig);
-      const sourceConnectorType = template.sourceConnectorType
-        || codeFromDataSourceType(dataSources.find((item) => item.id === template.sourceDatasourceId)?.type);
-      const targetConnectorType = template.targetConnectorType
-        || codeFromDataSourceType(dataSources.find((item) => item.id === template.targetDatasourceId)?.type);
+      const customSqlText = parseCustomSqlConfig(definition.customSqlConfig);
+      const sourceConnectorType = definition.sourceConnectorType
+        || codeFromDataSourceType(dataSources.find((item) => item.id === definition.sourceDatasourceId)?.type);
+      const targetConnectorType = definition.targetConnectorType
+        || codeFromDataSourceType(dataSources.find((item) => item.id === definition.targetDatasourceId)?.type);
       const wizardValues: SyncWizardValues = compactPayload({
-        tenantId: freshTask.tenantId ?? template.tenantId,
-        projectId: freshTask.projectId ?? template.projectId,
+        tenantId: freshTask.tenantId ?? definition.tenantId,
+        projectId: freshTask.projectId ?? definition.projectId,
         transferMode,
         objectScopeType,
         syncScopeType,
-        sourceDatasourceId: template.sourceDatasourceId,
-        targetDatasourceId: template.targetDatasourceId,
+        sourceDatasourceId: definition.sourceDatasourceId,
+        targetDatasourceId: definition.targetDatasourceId,
         sourceConnectorType,
         targetConnectorType,
-        sourceSchemaName: template.sourceSchemaName,
-        sourceObjectName: template.sourceObjectName,
-        targetSchemaName: template.targetSchemaName,
-        targetObjectName: template.targetObjectName,
-        syncMode: template.syncMode,
-        writeStrategy: template.writeStrategy === "UPDATE" || template.writeStrategy === "MERGE" || template.writeStrategy === "UPSERT" ? "UPDATE" : "INSERT",
+        sourceSchemaName: definition.sourceSchemaName,
+        sourceObjectName: definition.sourceObjectName,
+        targetSchemaName: definition.targetSchemaName,
+        targetObjectName: definition.targetObjectName,
+        syncMode: definition.syncMode,
+        writeStrategy: definition.writeStrategy === "UPDATE" || definition.writeStrategy === "MERGE" || definition.writeStrategy === "UPSERT" ? "UPDATE" : "INSERT",
         customSqlText,
-        filterConfig: template.filterConfig,
+        filterConfig: definition.filterConfig,
         groupCode: freshTask.groupCode,
         groupName: freshTask.groupName,
         taskName: freshTask.name,
-        taskDescription: freshTask.description ?? template.description,
+        taskDescription: freshTask.description ?? definition.description,
         priority: freshTask.priority || "MEDIUM",
         runMode: freshTask.runMode || transferModeProfiles[transferMode].runMode,
         scheduleConfig: freshTask.scheduleConfig,
@@ -2276,10 +2258,8 @@ export function DataSync() {
 
       /*
        * 草稿续编的关键是“恢复创建向导现场”，而不是打开旧的任务定义编辑弹窗。
-       * DRAFT 任务背后已有 SyncTask + SyncTemplate，两者分别承载运营属性和同步配置：
-       * - SyncTask：任务名称、分组、负责人、调度配置、当前状态；
-       * - SyncTemplate：源/目标数据源、传输模式、对象映射、字段映射、SQL、过滤条件。
-       * 这里把两份快照重新组装回 wizardForm 与本地 mapping state，用户关闭页面后再次进入仍能从第二步/第三步继续。
+       * DRAFT 任务自身携带一对一的 definition，运营属性和同步配置都从同一个任务详情恢复。
+       * 这里把任务快照重新组装回 wizardForm 与本地 mapping state，用户关闭页面后再次进入仍能继续编辑。
        */
       wizardForm.resetFields();
       wizardForm.setFieldsValue(wizardValues);
@@ -2289,7 +2269,7 @@ export function DataSync() {
       setFieldMappings(fieldConfig.rows);
       setFieldMappingsByObjectKey(fieldConfig.rowsByObjectKey);
       setActiveObjectMappingKey(objectRows[0]?.key);
-      setWizardDraft({ taskId: freshTask.id, templateId: template.id });
+      setWizardDraft({ taskId: freshTask.id });
       setWizardPrecheckResult(null);
       setBatchWhereCondition("");
       setSourceObjectKeyword("");
@@ -2317,10 +2297,10 @@ export function DataSync() {
      * “编辑任务”和“新建任务”必须进入同一套四步向导。
      * 如果已发布/已配置任务继续使用旧的小弹窗，只能改名称、分组、调度等运营字段，
      * 用户就无法按创建流程重新检查源表、目标表、字段映射、where 条件和预检查结果。
-     * 这里统一通过 openDraftWizard 恢复 SyncTask + SyncTemplate 快照：
+     * 这里统一通过 openDraftWizard 恢复 SyncTask + definition 快照：
      * - DRAFT 任务是继续编辑草稿；
      * - CONFIGURED/SCHEDULED/FAILED 等可编辑任务是把既有定义重新带回向导修订；
-     * - 保存仍走 create-wizard draft 接口，后端会根据 taskId/templateId 更新原任务与模板。
+     * - 保存仍走 create-wizard draft 接口，后端会根据 taskId 更新原任务及其定义。
      */
     void openDraftWizard(task);
   };
@@ -2887,7 +2867,7 @@ export function DataSync() {
       setWizardStep(3);
       return;
     }
-    await runWizardAutoPrecheck(draft.templateId);
+    await runWizardAutoPrecheck(draft.taskId);
   };
 
   const updateMapping = (key: string, patch: Partial<FieldMappingRow>) => {
@@ -2945,7 +2925,6 @@ export function DataSync() {
     void Promise.all([
       dataSourceQuery.refetch(),
       capabilityQuery.refetch(),
-      templateQuery.refetch(),
       taskQuery.refetch(),
       taskGroupQuery.refetch(),
       taskGroupTreeQuery.refetch(),
@@ -3768,52 +3747,6 @@ export function DataSync() {
     label: `${column.fieldName}${column.primaryKey ? " · PK" : ""}`,
   }));
 
-  const templateColumns: ColumnsType<SyncTemplate> = [
-    {
-      title: "模板",
-      dataIndex: "name",
-      render: (value, record) => (
-        <Space direction="vertical" size={0}>
-          <Typography.Text strong>{value}</Typography.Text>
-          <Typography.Text className="mono" type="secondary">#{record.id}</Typography.Text>
-        </Space>
-      ),
-    },
-    {
-      title: "源端 -> 目标端",
-      render: (_, record) => (
-        <Space direction="vertical" size={0}>
-          <Typography.Text className="mono">{`${record.sourceDatasourceId} -> ${record.targetDatasourceId}`}</Typography.Text>
-          <Typography.Text type="secondary">{`${record.sourceObjectName || "-"} -> ${record.targetObjectName || "-"}`}</Typography.Text>
-        </Space>
-      ),
-    },
-    {
-      title: "模式/范围",
-      render: (_, record) => (
-        <Space direction="vertical" size={0}>
-          <Tag color="blue">{labelOf(record.syncMode, syncModeLabels)}</Tag>
-          <Tag>{labelOf(record.syncScopeType || "SINGLE_OBJECT", syncScopeLabels)}</Tag>
-        </Space>
-      ),
-    },
-    { title: "写入", dataIndex: "writeStrategy", render: (value) => <Tag>{labelOf(value || "INSERT", writeStrategyLabels)}</Tag> },
-    { title: "启用", dataIndex: "enabled", render: (value) => <BooleanTag value={value} /> },
-    { title: "更新", dataIndex: "updateTime", render: (value) => formatDateTime(value) },
-    {
-      title: "操作",
-      width: 260,
-      render: (_, record) => (
-        <Space>
-          <Button aria-label="校验模板" title="校验模板" icon={<CheckCircleOutlined />} onClick={() => api.validateSyncTemplate(record.id).then(() => message.success("模板校验已通过")).catch((error) => message.error(error instanceof Error ? error.message : "模板校验失败"))} />
-          <Button aria-label="规划预览" title="规划预览" icon={<EyeOutlined />} onClick={() => api.previewSyncTemplate(record.id).then((result) => setPreviewPayload(result.data)).catch((error) => message.error(error instanceof Error ? error.message : "规划预览失败"))} />
-          <Button aria-label="执行预检" title="执行预检" icon={<SearchOutlined />} onClick={() => api.precheckSyncTemplate(record.id).then((result) => setPreviewPayload(result.data)).catch((error) => message.error(error instanceof Error ? error.message : "执行预检失败"))} />
-          <Button aria-label="离线计划" title="离线计划" icon={<CloudSyncOutlined />} onClick={() => api.buildSyncOfflineJobPlan(record.id).then((result) => setPreviewPayload(result.data)).catch((error) => message.error(error instanceof Error ? error.message : "离线作业计划失败"))} />
-        </Space>
-      ),
-    },
-  ];
-
   const confirmTaskAction = (
     record: SyncTask,
     action: "terminate" | "offline" | "recycle" | "hardDelete" | "cancel",
@@ -4523,7 +4456,7 @@ export function DataSync() {
         subtitle="真实源端数据库到目标端数据库的离线传输闭环、预检、执行、恢复和调度观测"
         actions={
           <>
-            <DataSourceIndicator meta={templateQuery.data?.meta ?? dataSourceQuery.data?.meta} />
+            <DataSourceIndicator meta={dataSourceQuery.data?.meta} />
             <Button aria-label="刷新同步数据" title="刷新同步数据" icon={<ReloadOutlined />} onClick={refetchAll} />
             <Button icon={<UploadOutlined />} disabled={!canManageCurrentProject} onClick={() => setImportOpen(true)}>导入任务定义</Button>
             <Button icon={<DownloadOutlined />} loading={exportMutation.isPending} onClick={() => exportMutation.mutate("CSV")}>导出任务定义</Button>
@@ -4536,7 +4469,7 @@ export function DataSync() {
         showIcon
         type="success"
         message="当前页面按真实多服务端到端链路组织"
-        description="覆盖建数据源后的模板创建、连接器兼容性、字段/对象映射、服务端校验、规划预览、执行预检、离线作业计划、任务发布、手工调度、执行器处理、定时派发、任务分组、回收站、任务定义 CSV/XLSX 导入导出、对象级失败重试、脏数据修复回放、断点记录和低敏审计。任务定义导入导出只处理控制面配置，不导出连接串、密码、完整 SQL 或客户业务数据。"
+        description="覆盖任务草稿创建、连接器兼容性、字段/对象映射、服务端校验、执行预检、任务发布、手工调度、执行器处理、定时派发、任务分组、回收站、任务定义 CSV/XLSX 导入导出、对象级失败重试、脏数据修复回放、断点记录和低敏审计。任务定义导入导出只处理控制面配置，不导出连接串、密码、完整 SQL 或客户业务数据。"
       />
 
       <div className="grid grid-three">
@@ -4546,9 +4479,9 @@ export function DataSync() {
           <div className="metric-delta">按源端/目标端用途区分的数据源</div>
         </Card>
         <Card className="compact-card">
-          <div className="split-row"><Typography.Text type="secondary">同步模板</Typography.Text><CheckCircleOutlined style={{ color: "#0f9f6e" }} /></div>
-          <div className="metric-value">{templateQuery.data?.data.total ?? 0}</div>
-          <div className="metric-delta">来自真实后端的模板记录</div>
+          <div className="split-row"><Typography.Text type="secondary">连接器能力</Typography.Text><CheckCircleOutlined style={{ color: "#0f9f6e" }} /></div>
+          <div className="metric-value">{capabilities.length}</div>
+          <div className="metric-delta">当前可用于任务定义与预检查的连接器</div>
         </Card>
         <Card className="compact-card">
           <div className="split-row"><Typography.Text type="secondary">同步任务</Typography.Text><SyncOutlined style={{ color: "#d97706" }} /></div>
@@ -4740,22 +4673,6 @@ export function DataSync() {
                       },
                     })}
                   />
-                </Card>
-              </div>
-            ),
-          },
-          {
-            key: "templates",
-            label: "同步模板",
-            children: (
-              <div className="page-stack">
-                <Card className="compact-card">
-                  <div className="toolbar">
-                    <Input allowClear prefix={<SearchOutlined />} placeholder="搜索模板、对象、模式" value={templateKeyword} onChange={(event) => setTemplateKeyword(event.target.value)} style={{ width: 300 }} />
-                  </div>
-                </Card>
-                <Card className="table-card">
-                  <Table rowKey="id" columns={templateColumns} dataSource={filteredTemplates} loading={templateQuery.isLoading} locale={{ emptyText: <RealEmpty meta={templateQuery.data?.meta} description="暂无同步模板记录" /> }} pagination={defaultTablePagination(8)} />
                 </Card>
               </div>
             ),
@@ -4966,7 +4883,7 @@ export function DataSync() {
                 {wizardStep === 0 ? "保存并进入对象映射" : "保存并进入下一步"}
               </Button>
             ) : (
-              <Button type="primary" loading={wizardSaving || wizardPrecheckLoading} disabled={!canSubmitWizard || !wizardDraft?.templateId} onClick={submitWizard}>重新保存并运行预检查</Button>
+              <Button type="primary" loading={wizardSaving || wizardPrecheckLoading} disabled={!canSubmitWizard || !wizardDraft?.taskId} onClick={submitWizard}>重新保存并运行预检查</Button>
             )}
           </Space>
         }
@@ -5319,7 +5236,6 @@ export function DataSync() {
               {wizardDraft ? (
                 <Descriptions size="small" column={2} style={{ marginTop: 16 }}>
                   <Descriptions.Item label="草稿任务 ID">{wizardDraft.taskId}</Descriptions.Item>
-                  <Descriptions.Item label="草稿模板 ID">{wizardDraft.templateId}</Descriptions.Item>
                   <Descriptions.Item label="任务状态">编辑中 / DRAFT</Descriptions.Item>
                   <Descriptions.Item label="服务端状态">{wizardPrecheckResult?.precheckStatus || "未返回"}</Descriptions.Item>
                   <Descriptions.Item label="可执行">{wizardPrecheckResult?.canStartExecution ? "是" : "否"}</Descriptions.Item>
@@ -5954,7 +5870,6 @@ export function DataSync() {
           <div className="page-stack">
             <Descriptions column={2} bordered size="small">
               <Descriptions.Item label="任务 ID">{selectedTask.id}</Descriptions.Item>
-              <Descriptions.Item label="模板 ID">{selectedTask.templateId}</Descriptions.Item>
               <Descriptions.Item label="任务分组">{selectedTask.groupName || "默认分组"}</Descriptions.Item>
               <Descriptions.Item label="状态">{statusTag(selectedTask.currentState, stateColor, syncTaskStateLabels)}</Descriptions.Item>
               <Descriptions.Item label="最近执行">{selectedTask.lastExecutionId || "-"}</Descriptions.Item>
@@ -5977,38 +5892,37 @@ export function DataSync() {
                         message="这里展示的是任务定义快照，不是某一次执行日志"
                         description="任务配置用于回答“这个任务应该同步什么、从哪里同步到哪里、用什么模式写入”。执行历史和运行日志用于回答“某一次执行实际跑到了哪一步”。连接密码、token、where 原始敏感样本不会在这里展示。"
                       />
-                      <Card className="compact-card" title="基础定义" loading={selectedTaskTemplateQuery.isLoading}>
+                      <Card className="compact-card" title="基础定义" loading={selectedTaskDetailQuery.isLoading}>
                         <Descriptions column={2} bordered size="small">
                           <Descriptions.Item label="任务名称">{selectedTask.name}</Descriptions.Item>
                           <Descriptions.Item label="任务 ID">{selectedTask.id}</Descriptions.Item>
-                          <Descriptions.Item label="模板 ID">{selectedTask.templateId}</Descriptions.Item>
                           <Descriptions.Item label="所属项目">
-                            {projectOptions.find((project) => project.value === String(selectedTask.projectId ?? selectedTaskTemplate?.projectId))?.label
+                            {projectOptions.find((project) => project.value === String(selectedTask.projectId ?? selectedTaskDefinition?.projectId))?.label
                               ?? "未找到项目名称"}
                           </Descriptions.Item>
                           <Descriptions.Item label="任务分组">{selectedTask.groupName || "默认分组"}</Descriptions.Item>
                           <Descriptions.Item label="负责人">{selectedTask.ownerId || "-"}</Descriptions.Item>
                           <Descriptions.Item label="任务状态">{statusTag(selectedTask.currentState, stateColor, syncTaskStateLabels)}</Descriptions.Item>
-                          <Descriptions.Item label="同步模式">{labelOf(selectedTaskTemplate?.syncMode, syncModeLabels)}</Descriptions.Item>
-                          <Descriptions.Item label="同步范围">{labelOf(selectedTaskTemplate?.syncScopeType, syncScopeLabels)}</Descriptions.Item>
-                          <Descriptions.Item label="写入模式">{labelOf(selectedTaskTemplate?.writeStrategy, writeStrategyLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="同步模式">{labelOf(selectedTaskDefinition?.syncMode, syncModeLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="同步范围">{labelOf(selectedTaskDefinition?.syncScopeType, syncScopeLabels)}</Descriptions.Item>
+                          <Descriptions.Item label="写入模式">{labelOf(selectedTaskDefinition?.writeStrategy, writeStrategyLabels)}</Descriptions.Item>
                           <Descriptions.Item label="优先级">{labelOf(selectedTask.priority, priorityLabels)}</Descriptions.Item>
                           <Descriptions.Item label="创建时间">{formatDateTime(selectedTask.createTime)}</Descriptions.Item>
                           <Descriptions.Item label="更新时间">{formatDateTime(selectedTask.updateTime)}</Descriptions.Item>
-                          <Descriptions.Item label="任务描述" span={2}>{selectedTask.description || selectedTaskTemplate?.description || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="任务描述" span={2}>{selectedTask.description || selectedTaskDefinition?.description || "-"}</Descriptions.Item>
                         </Descriptions>
                       </Card>
 
-                      <Card className="compact-card" title="源端与目标端数据源" loading={dataSourceQuery.isLoading || selectedTaskTemplateQuery.isLoading}>
+                      <Card className="compact-card" title="源端与目标端数据源" loading={dataSourceQuery.isLoading || selectedTaskDetailQuery.isLoading}>
                         <Descriptions column={2} bordered size="small">
                           <Descriptions.Item label="源端数据源" span={2}>{datasourceDetailLabel(selectedSourceDatasource)}</Descriptions.Item>
-                          <Descriptions.Item label="源端类型">{selectedSourceDatasource?.type || selectedTaskTemplate?.sourceConnectorType || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="源端类型">{selectedSourceDatasource?.type || selectedTaskDefinition?.sourceConnectorType || "-"}</Descriptions.Item>
                           <Descriptions.Item label="源端用途">{selectedSourceDatasource?.usageRole || "-"}</Descriptions.Item>
                           <Descriptions.Item label="源端环境">{selectedSourceDatasource?.environment || "-"}</Descriptions.Item>
                           <Descriptions.Item label="源端健康">{selectedSourceDatasource?.connectionHealth || selectedSourceDatasource?.status || "-"}</Descriptions.Item>
                           <Descriptions.Item label="源端 JDBC" span={2}>{selectedSourceDatasource?.jdbcUrl || "-"}</Descriptions.Item>
                           <Descriptions.Item label="目标端数据源" span={2}>{datasourceDetailLabel(selectedTargetDatasource)}</Descriptions.Item>
-                          <Descriptions.Item label="目标端类型">{selectedTargetDatasource?.type || selectedTaskTemplate?.targetConnectorType || "-"}</Descriptions.Item>
+                          <Descriptions.Item label="目标端类型">{selectedTargetDatasource?.type || selectedTaskDefinition?.targetConnectorType || "-"}</Descriptions.Item>
                           <Descriptions.Item label="目标端用途">{selectedTargetDatasource?.usageRole || "-"}</Descriptions.Item>
                           <Descriptions.Item label="目标端环境">{selectedTargetDatasource?.environment || "-"}</Descriptions.Item>
                           <Descriptions.Item label="目标端健康">{selectedTargetDatasource?.connectionHealth || selectedTargetDatasource?.status || "-"}</Descriptions.Item>
@@ -6032,7 +5946,7 @@ export function DataSync() {
                         </Descriptions>
                       </Card>
 
-                      {selectedTaskTemplate?.syncMode === "CUSTOM_SQL_QUERY" || selectedCustomSqlText ? (
+                      {selectedTaskDefinition?.syncMode === "CUSTOM_SQL_QUERY" || selectedCustomSqlText ? (
                         <Card className="compact-card" title="SQL 自定义传输语句">
                           <Alert
                             showIcon

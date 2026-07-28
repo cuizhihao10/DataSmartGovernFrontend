@@ -44,7 +44,6 @@ const scopeColor: Record<PermissionRole["scope"], string> = {
 const resourceTypeLabels: Record<string, string> = {
   DATASOURCE: "数据源",
   SYNC_TASK: "同步任务",
-  SYNC_TEMPLATE: "同步模板",
   SYNC_EXECUTION: "同步执行",
   SYSTEM_SETTING: "系统设置",
   AI_RUNTIME: "智能体运行时",
