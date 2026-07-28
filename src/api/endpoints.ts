@@ -2068,12 +2068,35 @@ function normalizeAgentConversation(value: unknown): AgentConversation | undefin
   if (!isRecord(value)) {
     return undefined;
   }
+  const resolved = readRecord(value.resolvedConfiguration);
+  const resolvedMappings = Array.isArray(resolved.objectMappings)
+    ? resolved.objectMappings.map(readRecord).filter((item) => Object.keys(item).length > 0)
+    : [];
   return {
     schemaVersion: readString(value.schemaVersion, "1.0"),
     turnId: readOptionalString(value.turnId),
     phase: readString(value.phase, "NO_EXECUTABLE_PLAN"),
     assistantMessage: readString(value.assistantMessage),
     structuredIntent: normalizeAgentStructuredIntent(value.structuredIntent),
+    resolvedConfiguration: {
+      taskName: readOptionalString(resolved.taskName),
+      syncMode: readOptionalString(resolved.syncMode),
+      writeStrategy: readOptionalString(resolved.writeStrategy),
+      sourceDatasourceId: readOptionalNumber(resolved.sourceDatasourceId),
+      sourceDatasourceName: readOptionalString(resolved.sourceDatasourceName),
+      targetDatasourceId: readOptionalNumber(resolved.targetDatasourceId),
+      targetDatasourceName: readOptionalString(resolved.targetDatasourceName),
+      scheduleConfig: readOptionalString(resolved.scheduleConfig),
+      customSqlText: readOptionalString(resolved.customSqlText),
+      customSqlConfirmed: resolved.customSqlConfirmed === undefined
+        ? undefined
+        : readBoolean(resolved.customSqlConfirmed),
+      targetTableResolution: readOptionalString(resolved.targetTableResolution),
+      objectMappings: resolvedMappings,
+      objectMappingSource: readOptionalString(resolved.objectMappingSource),
+      autoFilledFields: readStringArray(resolved.autoFilledFields),
+      payloadPolicy: readOptionalString(resolved.payloadPolicy),
+    },
     missingParameters: readStringArray(value.missingParameters),
     clarificationQuestions: Array.isArray(value.clarificationQuestions)
       ? value.clarificationQuestions.map(normalizeAgentClarificationQuestion)

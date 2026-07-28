@@ -1181,6 +1181,24 @@ export interface AgentStructuredIntent {
   objectMappingCount: number;
 }
 
+export interface AgentResolvedSyncConfiguration {
+  taskName?: string;
+  syncMode?: string;
+  writeStrategy?: string;
+  sourceDatasourceId?: number;
+  sourceDatasourceName?: string;
+  targetDatasourceId?: number;
+  targetDatasourceName?: string;
+  scheduleConfig?: string;
+  customSqlText?: string;
+  customSqlConfirmed?: boolean;
+  targetTableResolution?: string;
+  objectMappings: JsonObject[];
+  objectMappingSource?: string;
+  autoFilledFields: string[];
+  payloadPolicy?: string;
+}
+
 export interface AgentConversation {
   schemaVersion: string;
   turnId?: string;
@@ -1192,6 +1210,7 @@ export interface AgentConversation {
     | string;
   assistantMessage: string;
   structuredIntent: AgentStructuredIntent;
+  resolvedConfiguration: AgentResolvedSyncConfiguration;
   missingParameters: string[];
   clarificationQuestions: AgentClarificationQuestion[];
   canExecute: boolean;

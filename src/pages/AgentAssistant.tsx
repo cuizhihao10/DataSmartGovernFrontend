@@ -37,13 +37,14 @@ import {
   Upload,
   message,
 } from "antd";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "@/api/endpoints";
 import type { AgentPlanStreamFrame, AgentPlanStreamProgressEvent } from "@/api/endpoints";
 import { PageHeader } from "@/components/PageHeader";
 import {
   findMetadataTableByKey,
+  findMetadataTableByName,
   findSameNameTargetTable,
   isMysqlLikeConnector,
   isRealtimeSyncMode,
@@ -118,11 +119,18 @@ interface PlanSubmission {
   objective: string;
   clarification?: Partial<ClarificationFormValues>;
   followUpMessage?: string;
+  conversationContext?: AgentChatMessage[];
   taskImportArtifactRef?: string;
   taskImportRunImmediately?: boolean;
   recoveryTaskId?: number;
   recoveryExecutionId?: number;
   preserveTimeline?: boolean;
+}
+
+interface AgentChatMessage {
+  id: string;
+  role: "USER" | "AGENT";
+  content: string;
 }
 
 interface ExecutionAnswer {
@@ -199,6 +207,52 @@ function booleanField(record: Record<string, unknown> | undefined, key: string) 
 function numberField(record: Record<string, unknown> | undefined, key: string) {
   const value = record?.[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function resolvedObjectMappings(value: unknown): ObjectMappingInput[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((rawMapping, mappingIndex) => {
+    if (!rawMapping || typeof rawMapping !== "object" || Array.isArray(rawMapping)) return [];
+    const mapping = rawMapping as Record<string, unknown>;
+    const sourceObjectName = textField(mapping, "sourceObjectName");
+    const targetObjectName = textField(mapping, "targetObjectName");
+    if (!targetObjectName) return [];
+    const rawFields = Array.isArray(mapping.fieldMappings) ? mapping.fieldMappings : [];
+    const fieldMappings = rawFields.flatMap((rawField, fieldIndex) => {
+      if (!rawField || typeof rawField !== "object" || Array.isArray(rawField)) return [];
+      const field = rawField as Record<string, unknown>;
+      const sourceField = textField(field, "sourceField");
+      const targetField = textField(field, "targetField");
+      if (!sourceField || !targetField) return [];
+      return [{
+        key: `agent-resolved-${mappingIndex}-${fieldIndex}-${sourceField}`,
+        sourceField,
+        sourceType: textField(field, "sourceType"),
+        targetField,
+        targetType: textField(field, "targetType"),
+        nullable: field.nullable === undefined ? undefined : Boolean(field.nullable),
+        primaryKey: field.primaryKey === undefined ? undefined : Boolean(field.primaryKey),
+        syncEnabled: field.syncEnabled !== false,
+        typeCompatible: field.typeCompatible === undefined ? undefined : Boolean(field.typeCompatible),
+        transform: textField(field, "transform"),
+      }];
+    });
+    return [{
+      objectKey: textField(mapping, "objectKey") || `agent-resolved-mapping-${mappingIndex + 1}`,
+      sourceSchemaName: textField(mapping, "sourceSchemaName"),
+      sourceObjectName,
+      targetSchemaName: textField(mapping, "targetSchemaName"),
+      targetObjectName,
+      whereCondition: textField(mapping, "whereCondition"),
+      fieldMappings,
+    }];
+  });
+}
+
+function definedFormValues<T extends object>(values: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== undefined),
+  ) as Partial<T>;
 }
 
 function errorMessage(error: unknown) {
@@ -568,6 +622,8 @@ function UserAgentAssistant() {
   const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
   const [showAdvancedClarification, setShowAdvancedClarification] = useState(false);
   const [followUpMessage, setFollowUpMessage] = useState("");
+  const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
+  const autoAdvanceTurnRef = useRef<string>();
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -579,7 +635,11 @@ function UserAgentAssistant() {
   const clarificationSourceDatasourceId = Form.useWatch("sourceDatasourceId", clarificationForm);
   const clarificationTargetDatasourceId = Form.useWatch("targetDatasourceId", clarificationForm);
   const clarificationSyncMode = Form.useWatch("syncMode", clarificationForm);
-  const clarificationMappings = Form.useWatch("objectMappings", clarificationForm) ?? [];
+  const watchedClarificationMappings = Form.useWatch("objectMappings", clarificationForm);
+  const clarificationMappings = useMemo(
+    () => watchedClarificationMappings ?? [],
+    [watchedClarificationMappings],
+  );
   const sourceQuery = useQuery({
     queryKey: ["agent-assistant-source-datasources", projectId],
     queryFn: () => api.listDataSources({ current: 1, size: 100, projectId, usagePurpose: "SOURCE", status: "ENABLED" }),
@@ -879,16 +939,34 @@ function UserAgentAssistant() {
       if (!session?.tenantId || !projectId || !session.actorId) {
         throw new Error("缺少登录租户、项目或操作者上下文，请先选择项目");
       }
+      const latestUserMessage = submission.followUpMessage?.trim();
+      const requestConversation = submission.conversationContext ?? conversationMessages;
+      const lastConversationMessage = requestConversation[requestConversation.length - 1];
+      const currentTurnAlreadyIncluded = Boolean(
+        latestUserMessage
+        && lastConversationMessage?.role === "USER"
+        && lastConversationMessage.content === latestUserMessage,
+      );
+      const completeConversation = latestUserMessage && !currentTurnAlreadyIncluded
+        ? [...requestConversation, {
+            id: `request-user-${crypto.randomUUID()}`,
+            role: "USER" as const,
+            content: latestUserMessage,
+          }]
+        : requestConversation;
       const variables: Record<string, unknown> = {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
         sessionId: agentConversationSessionId,
         cacheKeyScope: "session_only",
+        conversationMessages: completeConversation.slice(-12).map((item) => ({
+          role: item.role === "USER" ? "user" : "assistant",
+          content: item.content,
+        })),
         // NDJSON 只流式传输可审计的阶段事实；模型 token 流保持关闭，以便查询引擎完整治理
         // 限流、重试、fallback 和用量，同时避免向用户暴露原始模型推理。
         streamModelIntent: false,
       };
-      const latestUserMessage = submission.followUpMessage?.trim();
       if (latestUserMessage) {
         variables.latestUserMessage = latestUserMessage;
         variables.conversationMode = "CLARIFICATION_OR_CORRECTION";
@@ -1036,52 +1114,93 @@ function UserAgentAssistant() {
         });
       }
       setPlan(nextPlan);
+      setLiveObservationItems((current) => current.map((item) => (
+        item.id.startsWith("live-") && item.status === "RUNNING"
+          ? {
+              ...item,
+              status: "SUCCEEDED",
+              summary: "本轮阶段已完成，后续结果已写入当前会话。",
+            }
+          : item
+      )));
       setExecutionResults([]);
       setExecutionAnswer(undefined);
       if (submission.followUpMessage) setFollowUpMessage("");
+      if (conversation?.assistantMessage) {
+        const messageId = `agent-${conversation.turnId || nextPlan.plan?.requestId || crypto.randomUUID()}`;
+        setConversationMessages((current) => (
+          current.some((item) => item.id === messageId)
+            ? current.map((item) => item.id === messageId
+                ? { ...item, content: conversation.assistantMessage }
+                : item)
+            : [...current, { id: messageId, role: "AGENT", content: conversation.assistantMessage }]
+        ));
+      }
+
+      if (conversation?.resolvedConfiguration) {
+        const resolved = conversation.resolvedConfiguration;
+        const inferredMode = normalizeUserSyncMode(
+          resolved.syncMode || conversation.structuredIntent.syncMode,
+        );
+        const currentValues = clarificationForm.getFieldsValue(true);
+        const resolvedMappings = resolvedObjectMappings(resolved.objectMappings);
+        const nextValues: Partial<ClarificationFormValues> = {
+          taskName: currentValues.taskName || resolved.taskName || "Agent 创建的数据同步任务",
+          syncMode: inferredMode,
+          writeStrategy: isRealtimeSyncMode(inferredMode)
+            ? "UPDATE"
+            : (resolved.writeStrategy === "UPDATE" ? "UPDATE" : currentValues.writeStrategy || "INSERT"),
+          scheduleConfig: resolved.scheduleConfig || currentValues.scheduleConfig,
+          customSqlText: resolved.customSqlText || currentValues.customSqlText,
+          customSqlConfirmed: resolved.customSqlConfirmed ?? currentValues.customSqlConfirmed,
+          sourceDatasourceId: resolved.sourceDatasourceId || currentValues.sourceDatasourceId,
+          targetDatasourceId: resolved.targetDatasourceId || currentValues.targetDatasourceId,
+          targetTableResolution: resolved.targetTableResolution === "CREATE_FROM_SOURCE"
+            || resolved.targetTableResolution === "SELECT_EXISTING"
+            ? resolved.targetTableResolution
+            : currentValues.targetTableResolution,
+          objectMappings: resolvedMappings.length
+            ? resolvedMappings
+            : currentValues.objectMappings?.length
+              ? currentValues.objectMappings
+              : [{
+                  objectKey: isSqlSyncMode(inferredMode) ? "agent-sql-result" : "agent-mapping-1",
+                  targetObjectName: "",
+                  fieldMappings: [],
+                }],
+          ...submission.clarification,
+        };
+        if (submission.followUpMessage) {
+          if (resolved.taskName) nextValues.taskName = resolved.taskName;
+          if (resolved.syncMode) nextValues.syncMode = inferredMode;
+          if (resolved.writeStrategy) {
+            nextValues.writeStrategy = resolved.writeStrategy === "UPDATE" ? "UPDATE" : "INSERT";
+          }
+          if (resolved.scheduleConfig) nextValues.scheduleConfig = resolved.scheduleConfig;
+          if (resolved.customSqlText) nextValues.customSqlText = resolved.customSqlText;
+        }
+        // Tool-resolved values are authoritative for the current turn. Merge
+        // them while autonomous discovery is still running as well as when a
+        // user-facing clarification is required, so metadata queries can start
+        // immediately instead of waiting for the advanced editor to be opened.
+        if (resolved.sourceDatasourceId) nextValues.sourceDatasourceId = resolved.sourceDatasourceId;
+        if (resolved.targetDatasourceId) nextValues.targetDatasourceId = resolved.targetDatasourceId;
+        if (resolvedMappings.length) nextValues.objectMappings = resolvedMappings;
+        clarificationForm.setFieldsValue(nextValues);
+        quickClarificationForm.setFieldsValue(nextValues);
+      }
 
       if (conversation?.phase === "WAITING_CLARIFICATION") {
         setControlPlane(undefined);
-        const waitingParameters = new Set(conversation.missingParameters ?? []);
-        const hasInlineClarification = [
-          "sourceDatasourceId",
-          "targetDatasourceId",
-          "scheduleFrequency",
-          "scheduleStartTime",
-          "customSqlConfirmation",
-          "targetTableResolution",
-        ].some((parameterName) => waitingParameters.has(parameterName));
-        setShowAdvancedClarification(
-          !hasInlineClarification
-          && (waitingParameters.has("objectMappings") || waitingParameters.has("fieldMappingConversions")),
-        );
-        quickClarificationForm.resetFields();
-        if (submission.clarification) {
-          clarificationForm.setFieldsValue(submission.clarification);
-          quickClarificationForm.setFieldsValue(submission.clarification);
-        } else {
-          const inferredMode = normalizeUserSyncMode(conversation.structuredIntent.syncMode);
-          clarificationForm.resetFields();
-          clarificationForm.setFieldsValue({
-            taskName: "Agent 创建的数据同步任务",
-            syncMode: inferredMode,
-            writeStrategy: isRealtimeSyncMode(inferredMode) ? "UPDATE" : "INSERT",
-            scheduleConfig: isScheduledSyncMode(inferredMode)
-              ? '{"cron":"0 0 2 * * ?","timezone":"Asia/Shanghai"}'
-              : undefined,
-            objectMappings: [{
-              objectKey: isSqlSyncMode(inferredMode) ? "agent-sql-result" : "agent-mapping-1",
-              targetObjectName: "",
-              fieldMappings: [],
-            }],
-          });
-        }
+        setShowAdvancedClarification(false);
         message.info("Agent 已理解目标，请补充执行所需参数");
         return;
       }
 
       if (conversation?.phase === "RESOLVING_AUTONOMOUSLY") {
+        setControlPlane(undefined);
         message.info(conversation.assistantMessage);
+        return;
       }
 
       if (conversation?.phase === "NO_EXECUTABLE_PLAN") {
@@ -1108,6 +1227,11 @@ function UserAgentAssistant() {
     },
     onError: (error) => {
       const summary = errorMessage(error);
+      setConversationMessages((current) => [...current, {
+        id: `agent-error-${crypto.randomUUID()}`,
+        role: "AGENT",
+        content: `本轮处理失败：${summary}`,
+      }]);
       setLiveObservationItems((current) => [
         ...current.filter((item) => item.status !== "RUNNING"),
         {
@@ -1245,25 +1369,33 @@ function UserAgentAssistant() {
     const latestMessage = followUpMessage.trim();
     if (!latestMessage || planMutation.isPending) return;
     const clarification: Partial<ClarificationFormValues> = {
-      ...clarificationForm.getFieldsValue(),
-      ...quickClarificationForm.getFieldsValue(),
+      ...clarificationForm.getFieldsValue(true),
+      ...definedFormValues(quickClarificationForm.getFieldsValue(true)),
     };
-    const mentionsSource = /(源端|源数据源|源库|source)/i.test(latestMessage);
-    const mentionsTarget = /(目标端|目标数据源|目标库|target)/i.test(latestMessage);
+    const mentionsSource = /(源数据源|源库|source\s*datasource)/i.test(latestMessage);
+    const mentionsTarget = /(目标数据源|目标库|target\s*datasource)/i.test(latestMessage);
     const rejectsCurrentDatasource = /(不是(这个|当前)?数据源|数据源.*(错了|不对)|理解错.*数据源)/i.test(latestMessage);
     if (mentionsSource || (rejectsCurrentDatasource && !mentionsTarget)) {
       delete clarification.sourceDatasourceId;
+      clarificationForm.setFieldValue("sourceDatasourceId", undefined);
+      quickClarificationForm.setFieldValue("sourceDatasourceId", undefined);
     }
     if (mentionsTarget || (rejectsCurrentDatasource && !mentionsSource)) {
       delete clarification.targetDatasourceId;
+      clarificationForm.setFieldValue("targetDatasourceId", undefined);
+      quickClarificationForm.setFieldValue("targetDatasourceId", undefined);
     }
-    if (/(表|schema|字段|映射|where|过滤|sql)/i.test(latestMessage)) {
-      delete clarification.objectMappings;
-    }
+    const nextConversationMessages: AgentChatMessage[] = [...conversationMessages, {
+      id: `user-${crypto.randomUUID()}`,
+      role: "USER",
+      content: latestMessage,
+    }];
+    setConversationMessages(nextConversationMessages);
     planMutation.mutate({
       objective,
       clarification,
       followUpMessage: latestMessage,
+      conversationContext: nextConversationMessages,
       preserveTimeline: true,
     });
   };
@@ -1360,7 +1492,7 @@ function UserAgentAssistant() {
     const finalizedStages = new Set(planningItems.map((item) => item.stage));
     // 最终响应中的产品化摘要替换同阶段的临时事件；上下文等未被聚合覆盖的节点继续保留，便于完整回放。
     const retainedLiveItems = liveObservationItems.filter((item) => (
-      item.id.startsWith("history-") || item.status === "RUNNING" || !finalizedStages.has(item.stage)
+      item.id.startsWith("history-") || !finalizedStages.has(item.stage)
     ));
     const executionItems = audits.map((audit) => ({
       id: `execution-${audit.auditId}`,
@@ -1383,6 +1515,125 @@ function UserAgentAssistant() {
     } satisfies AgentObservationTimelineItem));
     return [...retainedLiveItems, ...planningItems, ...executionItems];
   }, [audits, liveObservationItems, plan?.agentObservationTimeline?.items]);
+
+  useEffect(() => {
+    if (!sourceMetadata || !targetMetadata || !clarificationMappings.length) return;
+    let changed = false;
+    const nextMappings = clarificationMappings.map((mapping, mappingIndex) => {
+      if (!mapping.sourceObjectName || !mapping.targetObjectName) return mapping;
+      const sourceTable = findMetadataTableByName(
+        sourceMetadata,
+        mapping.sourceSchemaName,
+        mapping.sourceObjectName,
+      );
+      const targetTable = findMetadataTableByName(
+        targetMetadata,
+        mapping.targetSchemaName,
+        mapping.targetObjectName,
+      );
+      if (!sourceTable || !targetTable) return mapping;
+      const sourceIndex = (sourceMetadata.tables ?? []).indexOf(sourceTable);
+      const targetIndex = (targetMetadata.tables ?? []).indexOf(targetTable);
+      const sourceTableKey = tableObjectKey(sourceTable, sourceIndex);
+      const targetTableKey = tableObjectKey(targetTable, targetIndex);
+      const fieldMappings = makeFieldMappings(
+        sortedColumns(sourceTable),
+        sortedColumns(targetTable),
+      );
+      if (
+        mapping.sourceTableKey === sourceTableKey
+        && mapping.targetTableKey === targetTableKey
+        && mapping.fieldMappings.length === fieldMappings.length
+      ) {
+        return mapping;
+      }
+      changed = true;
+      return {
+        ...mapping,
+        objectKey: mapping.objectKey || `agent-resolved-mapping-${mappingIndex + 1}`,
+        sourceTableKey,
+        targetTableKey,
+        sourceSchemaName: sourceTable.schemaName,
+        sourceObjectName: sourceTable.tableName,
+        targetSchemaName: targetTable.schemaName,
+        targetObjectName: targetTable.tableName,
+        fieldMappings,
+      };
+    });
+    if (changed) clarificationForm.setFieldValue("objectMappings", nextMappings);
+  }, [clarificationForm, clarificationMappings, sourceMetadata, targetMetadata]);
+
+  useEffect(() => {
+    const resolved = conversation?.resolvedConfiguration;
+    const mappingSource = resolved?.objectMappingSource;
+    const phaseAllowsMetadataContinuation = conversation
+      ? ["WAITING_CLARIFICATION", "RESOLVING_AUTONOMOUSLY"].includes(conversation.phase)
+      : false;
+    const hasOnlyMappingClarification = (conversation?.missingParameters ?? [])
+      .every((parameterName) => parameterName === "objectMappings");
+    const mappingsExistInMetadata = Boolean(
+      sourceMetadata
+      && targetMetadata
+      && clarificationMappings.length
+      && clarificationMappings.every((mapping) => (
+        Boolean(mapping.sourceObjectName)
+        && Boolean(mapping.targetObjectName)
+        && Boolean(findMetadataTableByName(
+          sourceMetadata,
+          mapping.sourceSchemaName,
+          mapping.sourceObjectName,
+        ))
+        && Boolean(findMetadataTableByName(
+          targetMetadata,
+          mapping.targetSchemaName,
+          mapping.targetObjectName,
+        ))
+      )),
+    );
+    if (
+      !phaseAllowsMetadataContinuation
+      || !hasOnlyMappingClarification
+      || !["VERIFIED_METADATA_SAME_NAME_MATCH", "USER_STATED_SAME_NAME_MAPPING"].includes(mappingSource || "")
+      || !clarificationSourceDatasourceId
+      || !clarificationTargetDatasourceId
+      || !mappingsExistInMetadata
+      || planMutation.isPending
+    ) {
+      return;
+    }
+    const turnKey = [
+      conversation?.turnId,
+      clarificationSourceDatasourceId,
+      clarificationTargetDatasourceId,
+      ...clarificationMappings.map((item) => (
+        `${item.sourceSchemaName || ""}.${item.sourceObjectName}->`
+        + `${item.targetSchemaName || ""}.${item.targetObjectName}`
+      )),
+    ].join("|");
+    if (autoAdvanceTurnRef.current === turnKey) return;
+    autoAdvanceTurnRef.current = turnKey;
+    const timer = window.setTimeout(() => {
+      const values = clarificationForm.getFieldsValue(true);
+      message.info(`Agent 已根据真实元数据自动补全 ${clarificationMappings.length} 条同名表映射，正在继续核对`);
+      planMutation.mutate({
+        objective,
+        clarification: values,
+        preserveTimeline: true,
+      });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [
+    clarificationForm,
+    clarificationMappings,
+    clarificationSourceDatasourceId,
+    clarificationTargetDatasourceId,
+    conversation,
+    objective,
+    planMutation,
+    sourceMetadata,
+    targetMetadata,
+  ]);
+
   const projectUnavailableMessage = sessionQuery.isError
     ? "登录或项目上下文加载失败，请刷新页面后重试"
     : "请先在页面顶部选择一个项目";
@@ -1395,6 +1646,16 @@ function UserAgentAssistant() {
     setControlPlane(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
+    setFollowUpMessage("");
+    setShowAdvancedClarification(false);
+    autoAdvanceTurnRef.current = undefined;
+    clarificationForm.resetFields();
+    quickClarificationForm.resetFields();
+    setConversationMessages([{
+      id: `user-${crypto.randomUUID()}`,
+      role: "USER",
+      content: values.objective,
+    }]);
     planMutation.mutate({ objective: values.objective });
   };
 
@@ -1584,13 +1845,42 @@ function UserAgentAssistant() {
       ) : null}
 
       {conversation ? (
-        <Card title="Agent 回复" className="compact-card">
-          <Alert
-            showIcon
-            type={conversation.phase === "NO_EXECUTABLE_PLAN" ? "warning" : "success"}
-            message={conversation.assistantMessage}
-          />
-          <Space wrap style={{ marginTop: 16 }}>
+        <Card
+          title="与 Agent 协作"
+          className="compact-card agent-conversation-card"
+          extra={<Tag color={planMutation.isPending ? "processing" : "blue"}>
+            {planMutation.isPending ? "Agent 正在处理" : "可继续补充或纠正"}
+          </Tag>}
+        >
+          <div className="agent-message-list">
+            {conversationMessages.map((item) => (
+              <div
+                key={item.id}
+                className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}
+              >
+                <div className="agent-message-meta">
+                  {item.role === "USER" ? "你" : "Agent"}
+                </div>
+                <div className="agent-message-bubble">
+                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
+                    {item.content}
+                  </Typography.Paragraph>
+                </div>
+              </div>
+            ))}
+            {planMutation.isPending ? (
+              <div className="agent-message-row is-agent">
+                <div className="agent-message-meta">Agent</div>
+                <div className="agent-message-bubble is-running">
+                  <Space>
+                    <Spin size="small" />
+                    <Typography.Text type="secondary">正在理解这轮补充并核对真实资源...</Typography.Text>
+                  </Space>
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <Space wrap className="agent-resolution-strip">
             <Tag color="blue">{conversation.structuredIntent.intentType}</Tag>
             {conversation.structuredIntent.syncMode ? (
               <Tag color="cyan">{syncModeLabels[syncMode] || syncMode}</Tag>
@@ -1605,7 +1895,40 @@ function UserAgentAssistant() {
             ) : null}
             {modelLatencyMs !== undefined ? <Tag>{modelLatencyMs} ms</Tag> : null}
             {modelTotalTokens !== undefined ? <Tag>{modelTotalTokens} tokens</Tag> : null}
+            {conversation.resolvedConfiguration.taskName ? (
+              <Tag color="blue">任务：{conversation.resolvedConfiguration.taskName}</Tag>
+            ) : null}
+            {conversation.resolvedConfiguration.sourceDatasourceName ? (
+              <Tag color="green">源端：{conversation.resolvedConfiguration.sourceDatasourceName}</Tag>
+            ) : null}
+            {conversation.resolvedConfiguration.targetDatasourceName ? (
+              <Tag color="green">目标端：{conversation.resolvedConfiguration.targetDatasourceName}</Tag>
+            ) : null}
+            {conversation.resolvedConfiguration.objectMappings.length ? (
+              <Tag color="green">已补全 {conversation.resolvedConfiguration.objectMappings.length} 条对象映射</Tag>
+            ) : null}
           </Space>
+          {conversation.resolvedConfiguration.objectMappings.length ? (
+            <div className="agent-resolved-mapping-list">
+              {resolvedObjectMappings(conversation.resolvedConfiguration.objectMappings).map((mapping) => (
+                <div className="agent-resolved-mapping-row" key={mapping.objectKey}>
+                  <Typography.Text>
+                    {mapping.sourceSchemaName ? `${mapping.sourceSchemaName}.` : ""}
+                    {mapping.sourceObjectName || "SQL 结果集"}
+                    {" → "}
+                    {mapping.targetSchemaName ? `${mapping.targetSchemaName}.` : ""}
+                    {mapping.targetObjectName}
+                  </Typography.Text>
+                  {mapping.whereCondition ? (
+                    <Tag color="cyan">WHERE {mapping.whereCondition}</Tag>
+                  ) : null}
+                  {mapping.fieldMappings.length ? (
+                    <Tag>{mapping.fieldMappings.length} 个字段</Tag>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
           {!modelSucceeded ? (
             <Alert
               showIcon
@@ -1615,7 +1938,37 @@ function UserAgentAssistant() {
               description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
             />
           ) : null}
-          <div style={{ marginTop: 16 }}>
+          {conversation.phase === "WAITING_CLARIFICATION" ? (
+            <Alert
+              showIcon
+              type="warning"
+              className="agent-inline-clarification"
+              message="Agent 还需要确认以下信息"
+              description={(
+                <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                  <Space wrap>
+                    {missingParameterLabels.length ? missingParameterLabels.map((label) => (
+                      <Tag key={label} color="gold">{label}</Tag>
+                    )) : (
+                      <Tag color="gold">请根据 Agent 回复继续补充或纠正</Tag>
+                    )}
+                  </Space>
+                  <Typography.Text type="secondary">
+                    直接在下方用自然语言回答即可，Agent 会重新核对数据源和真实元数据，并自动更新已解析配置。
+                  </Typography.Text>
+                  <Button
+                    type="link"
+                    size="small"
+                    className="agent-inline-clarification-link"
+                    onClick={() => scrollToAgentSection("agent-clarification-card")}
+                  >
+                    自动补全失败时使用高级配置
+                  </Button>
+                </Space>
+              )}
+            />
+          ) : null}
+          <div className="agent-composer">
             <Input.TextArea
               value={followUpMessage}
               onChange={(event) => setFollowUpMessage(event.target.value)}
@@ -1626,10 +1979,13 @@ function UserAgentAssistant() {
                 }
               }}
               autoSize={{ minRows: 2, maxRows: 6 }}
-              placeholder="继续补充或纠正，例如：MySQL 是数据库类型，源端数据源改为 customer-prod-source"
+              placeholder="继续告诉 Agent 需要补充、修改或纠正什么。Enter 发送，Shift + Enter 换行"
               disabled={executionInProgress}
             />
-            <Space wrap style={{ marginTop: 10 }}>
+            <div className="agent-composer-footer">
+              <Typography.Text type="secondary">
+                后续消息会沿用当前会话，Agent 将重新理解并自动更新已解析配置。
+              </Typography.Text>
               <Button
                 type="primary"
                 icon={<ArrowRightOutlined />}
@@ -1637,9 +1993,9 @@ function UserAgentAssistant() {
                 loading={planMutation.isPending && Boolean(planMutation.variables?.followUpMessage)}
                 disabled={!followUpMessage.trim() || executionInProgress}
               >
-                发送补充或纠正
+                发送
               </Button>
-            </Space>
+            </div>
           </div>
         </Card>
       ) : null}
@@ -1734,7 +2090,11 @@ function UserAgentAssistant() {
       ) : null}
 
       {conversation?.phase === "WAITING_CLARIFICATION" ? (
-        <Card id="agent-clarification-card" title="补充 Agent 执行所需信息" className="compact-card">
+        <Card
+          id="agent-clarification-card"
+          title="高级配置（仅在自动补全失败时使用）"
+          className="compact-card"
+        >
           <Alert
             showIcon
             type="warning"
