@@ -141,6 +141,8 @@ interface ExecutionAnswer {
   modelProviderStatus: string;
 }
 
+type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED";
+
 const defaultObjective = "将 MySQL 中的 fs_test_customer_source 和 fs_test_customer_target 全量同步到 PostgreSQL public schema 的同名表。";
 const taskImportObjective = "检查这个任务文件，先试运行；若失败则检索产品文档和历史案例，提出可执行修复方案，经我确认后修复、重新校验并导入。";
 
@@ -364,6 +366,7 @@ function streamEventPresentation(event: AgentPlanStreamProgressEvent) {
     skill_admission_evaluated: { category: "SKILL", title: "加载并校验 Skill" },
     model_query_started: { category: "MODEL", title: "调用真实模型", status: "RUNNING" },
     model_query_executed: { category: "MODEL", title: "真实模型调用完成" },
+    model_public_output_ready: { category: "MODEL", title: "模型公开输出" },
     model_tool_call_proposed: { category: "TOOL", title: "模型提出工具调用" },
     model_tool_call_accepted: { category: "TOOL", title: "工具建议通过治理" },
     model_tool_call_rejected: { category: "PERMISSION", title: "工具建议被安全门禁拒绝", status: "BLOCKED" },
@@ -392,27 +395,54 @@ function streamEventToObservation(event: AgentPlanStreamProgressEvent): AgentObs
   const presentation = streamEventPresentation(event);
   const eventFailed = event.severity?.toLowerCase() === "error";
   const eventWarning = event.severity?.toLowerCase() === "warning";
-  const isModelStage = event.stage === "invoke_model_intent";
   // 规则分析器的 confidence 是内部启发式匹配分，不是模型校准置信度，也不适合驱动用户决策。
   // 工作过程只展示可验证的领域、候选工具、风险和缺参事实，避免把固定分值误读成 AI 自信程度。
   const publicAttributes = Object.fromEntries(
-    Object.entries(event.attributes || {}).filter(([key]) => !["confidence", "ruleConfidence"].includes(key)),
+    Object.entries(event.attributes || {}).filter(([key]) => (
+      !["confidence", "ruleConfidence", "publicContent"].includes(key)
+    )),
   );
   const requestScope = event.requestId?.slice(0, 12) || "current";
+  const publicContent = typeof event.attributes?.publicContent === "string"
+    ? event.attributes.publicContent
+    : undefined;
   return {
-    id: isModelStage
-      ? `live-${requestScope}-model-invocation`
-      : `live-${requestScope}-${event.eventType}-${event.sequence ?? event.stage}`,
+    id: `live-${requestScope}-${event.eventType}-${event.sequence ?? event.stage}`,
     category: presentation.category,
     stage: event.stage,
     status: eventFailed ? "FAILED" : presentation.status || (eventWarning ? "FALLBACK" : "SUCCEEDED"),
     title: presentation.title,
-    summary: event.message,
+    summary: publicContent || event.message,
     details: {
       ...publicAttributes,
       occurredAt: event.createdAt,
     },
   };
+}
+
+function formatAgentProcessElapsed(elapsedMs: number) {
+  const totalSeconds = Math.max(0, Math.round(elapsedMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function agentProcessActionSummaries(items: AgentObservationTimelineItem[]) {
+  const modelCount = items.filter((item) => (
+    item.category === "MODEL"
+    && ["model-invocation", "model_public_output_ready", "model_second_turn_completed"].some((marker) => (
+      item.id.includes(marker) || item.stage.includes(marker)
+    ))
+  )).length;
+  const skillCount = items.filter((item) => item.category === "SKILL").length;
+  const toolCount = items.filter((item) => item.category === "TOOL").length;
+  const commandCount = items.filter((item) => item.category === "COMMAND").length;
+  return [
+    modelCount ? `完成 ${modelCount} 个模型步骤` : undefined,
+    skillCount ? `加载 ${skillCount} 个 Skill` : undefined,
+    toolCount ? `记录 ${toolCount} 个工具步骤` : undefined,
+    commandCount ? `执行 ${commandCount} 个命令或 API` : undefined,
+  ].filter((item): item is string => Boolean(item));
 }
 
 function observationDetailLabel(key: string) {
@@ -642,6 +672,10 @@ function UserAgentAssistant() {
   const [plan, setPlan] = useState<AgentPlanResponse>();
   const [liveObservationItems, setLiveObservationItems] = useState<AgentObservationTimelineItem[]>([]);
   const [liveRequestId, setLiveRequestId] = useState<string>();
+  const [processStatus, setProcessStatus] = useState<AgentProcessStatus>("IDLE");
+  const [processStartedAt, setProcessStartedAt] = useState<number>();
+  const [processElapsedMs, setProcessElapsedMs] = useState(0);
+  const [processExpanded, setProcessExpanded] = useState(true);
   const [executionInProgress, setExecutionInProgress] = useState(false);
   const [executionResults, setExecutionResults] = useState<AgentToolExecutionResult[]>([]);
   const [executionAnswer, setExecutionAnswer] = useState<ExecutionAnswer>();
@@ -652,11 +686,47 @@ function UserAgentAssistant() {
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
   const autoAdvanceTurnRef = useRef<string>();
+  const processStartedAtRef = useRef<number>();
+  const streamElapsedMsRef = useRef<number>();
+  const processOwnerRef = useRef<"PLAN" | "EXECUTION">();
   const reviewEditSnapshotRef = useRef<{
     values: Partial<ClarificationFormValues>;
     controlPlane?: { sessionId: string; runId: string };
     reviewConfirmed: boolean;
   }>();
+
+  const beginAgentProcess = (owner: "PLAN" | "EXECUTION") => {
+    const startedAt = Date.now();
+    processOwnerRef.current = owner;
+    processStartedAtRef.current = startedAt;
+    streamElapsedMsRef.current = undefined;
+    setProcessStartedAt(startedAt);
+    setProcessElapsedMs(0);
+    setProcessStatus("RUNNING");
+    setProcessExpanded(true);
+  };
+
+  const finishAgentProcess = (
+    owner: "PLAN" | "EXECUTION",
+    status: Exclude<AgentProcessStatus, "IDLE" | "RUNNING">,
+  ) => {
+    if (processOwnerRef.current !== owner) return;
+    const measuredElapsedMs = processStartedAtRef.current
+      ? Date.now() - processStartedAtRef.current
+      : 0;
+    setProcessElapsedMs(Math.max(streamElapsedMsRef.current ?? 0, measuredElapsedMs));
+    setProcessStatus(status);
+    setProcessExpanded(false);
+    processOwnerRef.current = undefined;
+  };
+
+  useEffect(() => {
+    if (processStatus !== "RUNNING" || !processStartedAt) return;
+    const updateElapsed = () => setProcessElapsedMs(Date.now() - processStartedAt);
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 250);
+    return () => window.clearInterval(timer);
+  }, [processStartedAt, processStatus]);
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -935,17 +1005,16 @@ function UserAgentAssistant() {
 
   const consumePlanStreamFrame = (frame: AgentPlanStreamFrame) => {
     if (frame.requestId) setLiveRequestId(frame.requestId);
+    if ((frame.type === "heartbeat" || frame.type === "result" || frame.type === "error")
+      && frame.elapsedMs !== undefined) {
+      streamElapsedMsRef.current = frame.elapsedMs;
+      setProcessElapsedMs(frame.elapsedMs);
+    }
     if (frame.type === "heartbeat") {
       const elapsedSeconds = Math.max(1, Math.round((frame.elapsedMs ?? 0) / 1000));
       setLiveObservationItems((current) => {
-        let runningIndex = -1;
-        for (let index = current.length - 1; index >= 0; index -= 1) {
-          if (current[index].status === "RUNNING") {
-            runningIndex = index;
-            break;
-          }
-        }
-        if (runningIndex < 0) return current;
+        const runningIndex = current.length - 1;
+        if (runningIndex < 0 || current[runningIndex].status !== "RUNNING") return current;
         const next = [...current];
         const runningItem = current[runningIndex];
         next[runningIndex] = {
@@ -963,9 +1032,13 @@ function UserAgentAssistant() {
     if (frame.type !== "progress" || !frame.event) return;
     const item = streamEventToObservation(frame.event);
     setLiveObservationItems((current) => {
-      const existingIndex = current.findIndex((candidate) => candidate.id === item.id);
-      if (existingIndex < 0) return [...current, item];
-      const next = [...current];
+      const next = current.map((candidate) => (
+        candidate.status === "RUNNING" && candidate.stage === item.stage
+          ? { ...candidate, status: "SUCCEEDED" }
+          : candidate
+      ));
+      const existingIndex = next.findIndex((candidate) => candidate.id === item.id);
+      if (existingIndex < 0) return [...next, item];
       next[existingIndex] = item;
       return next;
     });
@@ -1101,6 +1174,7 @@ function UserAgentAssistant() {
       }, consumePlanStreamFrame);
     },
     onMutate: (submission) => {
+      beginAgentProcess("PLAN");
       // A new natural-language turn or form submission may change the task
       // definition. The previous control-plane confirmation must never remain
       // executable while the latest configuration is being resolved.
@@ -1112,6 +1186,7 @@ function UserAgentAssistant() {
       }
     },
     onSuccess: (result, submission) => {
+      finishAgentProcess("PLAN", "SUCCEEDED");
       const nextPlan = result.data;
       const conversation = nextPlan.agentConversation;
       if (submission.preserveTimeline) {
@@ -1270,6 +1345,7 @@ function UserAgentAssistant() {
         : "Agent 已生成可审计执行计划，请确认后执行");
     },
     onError: (error) => {
+      finishAgentProcess("PLAN", "FAILED");
       const summary = errorMessage(error);
       setConversationMessages((current) => [...current, {
         id: `agent-error-${crypto.randomUUID()}`,
@@ -1309,7 +1385,10 @@ function UserAgentAssistant() {
         comment: "用户在智能助手页面确认执行数据同步计划",
       });
     },
-    onMutate: () => setExecutionInProgress(true),
+    onMutate: () => {
+      beginAgentProcess("EXECUTION");
+      setExecutionInProgress(true);
+    },
     onSuccess: async (result) => {
       setExecutionResults(result.data.toolResults);
       setLiveObservationItems((current) => {
@@ -1403,8 +1482,14 @@ function UserAgentAssistant() {
         preserveTimeline: true,
       });
     },
-    onError: (error) => message.error(errorMessage(error)),
-    onSettled: () => setExecutionInProgress(false),
+    onError: (error) => {
+      finishAgentProcess("EXECUTION", "FAILED");
+      message.error(errorMessage(error));
+    },
+    onSettled: () => {
+      finishAgentProcess("EXECUTION", "SUCCEEDED");
+      setExecutionInProgress(false);
+    },
   });
 
   const conversation = plan?.agentConversation;
@@ -1834,6 +1919,118 @@ function UserAgentAssistant() {
   const editingReadyConfiguration = showAdvancedClarification
     && conversation?.phase !== "WAITING_CLARIFICATION";
 
+  let latestUserMessageIndex = -1;
+  conversationMessages.forEach((item, index) => {
+    if (item.role === "USER") latestUserMessageIndex = index;
+  });
+  let currentTurnAgentMessageIndex = -1;
+  conversationMessages.forEach((item, index) => {
+    if (index > latestUserMessageIndex && item.role === "AGENT") currentTurnAgentMessageIndex = index;
+  });
+  const currentTurnAgentMessage = currentTurnAgentMessageIndex >= 0
+    ? conversationMessages[currentTurnAgentMessageIndex]
+    : undefined;
+  const conversationHistoryMessages = conversationMessages.filter(
+    (_, index) => index !== currentTurnAgentMessageIndex,
+  );
+  const processActionSummaries = agentProcessActionSummaries(observationItems);
+  const currentProcessItem = observationItems[observationItems.length - 1];
+  const processPanel = processStartedAt || observationItems.length ? (
+    <div className={`agent-process-shell is-${processStatus.toLowerCase()}`}>
+      <Collapse
+        ghost
+        activeKey={processExpanded ? ["agent-process"] : []}
+        onChange={(keys) => setProcessExpanded(Array.isArray(keys)
+          ? keys.includes("agent-process")
+          : keys === "agent-process")}
+        expandIconPosition="end"
+        items={[{
+          key: "agent-process",
+          label: processStatus === "RUNNING" ? (
+            <div className="agent-process-heading is-running">
+              <Spin size="small" />
+              <Typography.Text strong>
+                正在处理 {formatAgentProcessElapsed(processElapsedMs)}
+              </Typography.Text>
+              {currentProcessItem ? (
+                <Typography.Text type="secondary" ellipsis>{currentProcessItem.title}</Typography.Text>
+              ) : null}
+            </div>
+          ) : (
+            <Typography.Text strong className={processStatus === "FAILED" ? "agent-process-failed" : undefined}>
+              {processStatus === "FAILED" ? "处理失败" : "已处理"} {formatAgentProcessElapsed(processElapsedMs)}
+            </Typography.Text>
+          ),
+          children: (
+            <div className="agent-process-body">
+              <div className="agent-process-summary">
+                {processActionSummaries.map((summary) => <Tag key={summary}>{summary}</Tag>)}
+                {liveRequestId ? <Tag>请求 {liveRequestId.slice(0, 8)}</Tag> : null}
+                <Typography.Text type="secondary">公开过程，不展示隐藏推理</Typography.Text>
+              </div>
+              <Timeline
+                className="agent-process-timeline"
+                items={observationItems.map((item) => {
+                  const detailEntries = Object.entries(item.details).filter(([key]) => key !== "sequence");
+                  const needsInput = item.category === "USER_ACTION"
+                    || (item.category === "PERMISSION" && item.status === "WAITING_INPUT");
+                  const needsConfirmation = item.category === "PERMISSION" && item.status === "WAITING_APPROVAL";
+                  return {
+                    color: observationColor(item.status),
+                    dot: item.status === "RUNNING" ? <Spin size="small" /> : observationIcon(item.category),
+                    children: (
+                      <div className="agent-process-step">
+                        <Space wrap>
+                          <Typography.Text strong>{item.title}</Typography.Text>
+                          <Tag color="blue">{observationCategory(item.category)}</Tag>
+                          <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
+                        </Space>
+                        <Typography.Paragraph className="agent-process-step-summary">
+                          {item.summary}
+                        </Typography.Paragraph>
+                        {needsInput ? (
+                          <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-clarification-card")}>
+                            补充执行信息
+                          </Button>
+                        ) : null}
+                        {needsConfirmation ? (
+                          <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-execution-plan-card")}>
+                            查看并确认执行
+                          </Button>
+                        ) : null}
+                        {detailEntries.length ? (
+                          <Collapse
+                            ghost
+                            size="small"
+                            items={[{
+                              key: `${item.id}-details`,
+                              label: observationDetailsTitle(item.category),
+                              children: (
+                                <Descriptions
+                                  size="small"
+                                  column={{ xs: 1, sm: 2, lg: 3 }}
+                                  items={detailEntries.map(([key, value]) => ({
+                                    key,
+                                    label: observationDetailLabel(key),
+                                    children: formatObservationValue(value, key),
+                                  }))}
+                                />
+                              ),
+                            }]}
+                          />
+                        ) : null}
+                      </div>
+                    ),
+                  };
+                })}
+              />
+            </div>
+          ),
+        }]}
+      />
+    </div>
+  ) : null;
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -1933,25 +2130,9 @@ function UserAgentAssistant() {
         </Form>
       </Card>
 
-      {planMutation.isPending && !planMutation.variables?.clarification && liveObservationItems.length === 0 ? (
-        <Card title="Agent 工作过程" className="compact-card">
-          <Timeline
-            items={[{
-              color: "blue",
-              dot: <Spin size="small" />,
-              children: (
-                <div>
-                  <Space wrap>
-                    <Typography.Text strong>模型正在理解目标并生成受控计划</Typography.Text>
-                    <Tag color="blue">处理中</Tag>
-                  </Space>
-                  <Typography.Paragraph type="secondary" style={{ margin: "8px 0 0" }}>
-                    正在建立带认证的实时规划流；连接建立后，每个真实阶段会立即追加到下方工作过程。
-                  </Typography.Paragraph>
-                </div>
-              ),
-            }]}
-          />
+      {!conversation && processPanel ? (
+        <Card className="compact-card agent-process-card">
+          {processPanel}
         </Card>
       ) : null}
 
@@ -1964,7 +2145,7 @@ function UserAgentAssistant() {
           </Tag>}
         >
           <div className="agent-message-list">
-            {conversationMessages.map((item) => (
+            {conversationHistoryMessages.map((item) => (
               <div
                 key={item.id}
                 className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}
@@ -1979,14 +2160,19 @@ function UserAgentAssistant() {
                 </div>
               </div>
             ))}
-            {planMutation.isPending ? (
+            {processPanel ? (
+              <div className="agent-message-row is-agent agent-process-message-row">
+                <div className="agent-message-meta">Agent</div>
+                {processPanel}
+              </div>
+            ) : null}
+            {currentTurnAgentMessage ? (
               <div className="agent-message-row is-agent">
                 <div className="agent-message-meta">Agent</div>
-                <div className="agent-message-bubble is-running">
-                  <Space>
-                    <Spin size="small" />
-                    <Typography.Text type="secondary">正在理解这轮补充并核对真实资源...</Typography.Text>
-                  </Space>
+                <div className="agent-message-bubble is-final">
+                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
+                    {currentTurnAgentMessage.content}
+                  </Typography.Paragraph>
                 </div>
               </div>
             ) : null}
@@ -2108,84 +2294,6 @@ function UserAgentAssistant() {
               </Button>
             </div>
           </div>
-        </Card>
-      ) : null}
-
-      {observationItems.length ? (
-        <Card
-          title="Agent 工作过程"
-          className="compact-card"
-          extra={(
-            <Space wrap>
-              {planMutation.isPending ? <Tag color="processing" icon={<Spin size="small" />}>实时规划中</Tag> : null}
-              {liveRequestId ? <Tag>请求 {liveRequestId.slice(0, 8)}</Tag> : null}
-              <Tag color="cyan">公开摘要，不展示隐藏思维链</Tag>
-            </Space>
-          )}
-        >
-          <Alert
-            showIcon
-            type="info"
-            message="这里展示真实、可操作、可审计的 Agent 工作过程"
-            description="节点完成后会立即出现，当前节点会保持“进行中”；包含模型公开决策摘要、Skill 加载、LangGraph 编排、工具与命令调用、权限门禁、待补信息和执行结果。系统提示词、隐藏推理、凭据与原始参数不会展示。"
-            style={{ marginBottom: 20 }}
-          />
-          <Timeline
-            items={observationItems.map((item) => {
-              // v1 返回过纯排序字段 sequence；即使滚动升级期间命中旧缓存，也不再把它伪装成治理详情。
-              const detailEntries = Object.entries(item.details).filter(([key]) => key !== "sequence");
-              const needsInput = item.category === "USER_ACTION"
-                || (item.category === "PERMISSION" && item.status === "WAITING_INPUT");
-              const needsConfirmation = item.category === "PERMISSION" && item.status === "WAITING_APPROVAL";
-              return {
-                color: observationColor(item.status),
-                dot: item.status === "RUNNING" ? <Spin size="small" /> : observationIcon(item.category),
-                children: (
-                  <div style={{ paddingBottom: 8 }}>
-                    <Space wrap>
-                      <Typography.Text strong>{item.title}</Typography.Text>
-                      <Tag color="blue">{observationCategory(item.category)}</Tag>
-                      <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
-                    </Space>
-                    <Typography.Paragraph style={{ margin: "8px 0", whiteSpace: "pre-wrap" }}>
-                      {item.summary}
-                    </Typography.Paragraph>
-                    {needsInput ? (
-                      <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-clarification-card")}>
-                        补充执行信息
-                      </Button>
-                    ) : null}
-                    {needsConfirmation ? (
-                      <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-execution-plan-card")}>
-                        查看并确认执行
-                      </Button>
-                    ) : null}
-                    {detailEntries.length ? (
-                      <Collapse
-                        ghost
-                        size="small"
-                        items={[{
-                          key: `${item.id}-details`,
-                          label: observationDetailsTitle(item.category),
-                          children: (
-                            <Descriptions
-                              size="small"
-                              column={{ xs: 1, sm: 2, lg: 3 }}
-                              items={detailEntries.map(([key, value]) => ({
-                                key,
-                                label: observationDetailLabel(key),
-                                children: formatObservationValue(value, key),
-                              }))}
-                            />
-                          ),
-                        }]}
-                      />
-                    ) : null}
-                  </div>
-                ),
-              };
-            })}
-          />
         </Card>
       ) : null}
 

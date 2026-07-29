@@ -330,6 +330,92 @@ select {
   background: #fbfcfd;
 }
 
+.agent-message-bubble.is-final {
+  border-color: #cfd9e3;
+  background: #ffffff;
+  box-shadow: 0 6px 18px rgba(36, 52, 71, 0.06);
+}
+
+.agent-process-card .ant-card-body {
+  padding: 8px 12px;
+}
+
+.agent-process-message-row,
+.agent-process-shell {
+  width: 100%;
+  min-width: 0;
+}
+
+.agent-process-shell {
+  max-width: min(860px, 96%);
+  overflow: hidden;
+  border-top: 1px solid #dce3ea;
+  border-bottom: 1px solid #dce3ea;
+  background: #ffffff;
+}
+
+.agent-process-message-row .agent-process-shell {
+  align-self: flex-start;
+}
+
+.agent-process-shell > .ant-collapse > .ant-collapse-item > .ant-collapse-header {
+  min-height: 44px;
+  padding: 11px 4px;
+}
+
+.agent-process-shell > .ant-collapse > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
+  padding: 0 4px 12px;
+}
+
+.agent-process-heading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.agent-process-heading .ant-typography:last-child {
+  min-width: 0;
+}
+
+.agent-process-failed {
+  color: #b42318;
+}
+
+.agent-process-body {
+  min-width: 0;
+  padding-top: 4px;
+}
+
+.agent-process-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border-left: 3px solid #3378bb;
+  background: #f7f9fb;
+}
+
+.agent-process-step {
+  min-width: 0;
+  padding: 0 0 10px;
+}
+
+.agent-process-step-summary {
+  margin: 8px 0 !important;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-process-step .ant-collapse-content-box,
+.agent-process-step .ant-descriptions-view,
+.agent-process-step .ant-descriptions-item-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .agent-resolution-strip {
   width: 100%;
   padding: 12px 0;
@@ -493,6 +579,19 @@ select {
 @media (max-width: 768px) {
   .agent-message-bubble {
     max-width: 96%;
+  }
+
+  .agent-process-shell {
+    max-width: 100%;
+  }
+
+  .agent-process-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .agent-process-heading .ant-typography:last-child {
+    flex-basis: 100%;
   }
 
   .agent-composer-footer {
