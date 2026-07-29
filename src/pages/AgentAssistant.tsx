@@ -6,6 +6,8 @@ import {
   CodeOutlined,
   DatabaseOutlined,
   DeleteOutlined,
+  EditOutlined,
+  EyeOutlined,
   FileExcelOutlined,
   PlusOutlined,
   QuestionCircleOutlined,
@@ -168,6 +170,31 @@ function buildAgentScheduleConfig(
   }
   const intervalSeconds = frequency === "HOURLY" ? 3600 : frequency === "DAILY" ? 86_400 : 604_800;
   return JSON.stringify({ ...common, type: "FIXED_RATE", intervalSeconds });
+}
+
+function scheduleConfigSummary(value?: string) {
+  if (!value?.trim()) return "非定期任务";
+  try {
+    const config = JSON.parse(value) as Record<string, unknown>;
+    const timezone = typeof config.timezone === "string" ? config.timezone : "Asia/Shanghai";
+    const startAt = typeof config.startAt === "string" ? `，首次 ${config.startAt}` : "";
+    if (config.type === "FIXED_RATE" && typeof config.intervalSeconds === "number") {
+      const seconds = config.intervalSeconds;
+      const interval = seconds % 604_800 === 0
+        ? `每 ${seconds / 604_800} 周`
+        : seconds % 86_400 === 0
+          ? `每 ${seconds / 86_400} 天`
+          : seconds % 3_600 === 0
+            ? `每 ${seconds / 3_600} 小时`
+            : `每 ${seconds} 秒`;
+      return `${interval}（${timezone}${startAt}）`;
+    }
+    if (typeof config.cron === "string") return `Cron ${config.cron}（${timezone}${startAt}）`;
+  } catch {
+    // The backend precheck will report malformed schedule JSON. The review
+    // still shows the raw value so the user can inspect and correct it.
+  }
+  return value;
 }
 
 const syncModeLabels: Record<string, string> = {
@@ -621,9 +648,15 @@ function UserAgentAssistant() {
   const [taskImportArtifact, setTaskImportArtifact] = useState<SyncTaskImportArtifact>();
   const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
   const [showAdvancedClarification, setShowAdvancedClarification] = useState(false);
+  const [configurationReviewConfirmed, setConfigurationReviewConfirmed] = useState(false);
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
   const autoAdvanceTurnRef = useRef<string>();
+  const reviewEditSnapshotRef = useRef<{
+    values: Partial<ClarificationFormValues>;
+    controlPlane?: { sessionId: string; runId: string };
+    reviewConfirmed: boolean;
+  }>();
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -635,6 +668,10 @@ function UserAgentAssistant() {
   const clarificationSourceDatasourceId = Form.useWatch("sourceDatasourceId", clarificationForm);
   const clarificationTargetDatasourceId = Form.useWatch("targetDatasourceId", clarificationForm);
   const clarificationSyncMode = Form.useWatch("syncMode", clarificationForm);
+  const clarificationTaskName = Form.useWatch("taskName", clarificationForm);
+  const clarificationWriteStrategy = Form.useWatch("writeStrategy", clarificationForm);
+  const clarificationScheduleConfig = Form.useWatch("scheduleConfig", clarificationForm);
+  const clarificationCustomSqlText = Form.useWatch("customSqlText", clarificationForm);
   const watchedClarificationMappings = Form.useWatch("objectMappings", clarificationForm);
   const clarificationMappings = useMemo(
     () => watchedClarificationMappings ?? [],
@@ -1064,6 +1101,11 @@ function UserAgentAssistant() {
       }, consumePlanStreamFrame);
     },
     onMutate: (submission) => {
+      // A new natural-language turn or form submission may change the task
+      // definition. The previous control-plane confirmation must never remain
+      // executable while the latest configuration is being resolved.
+      setControlPlane(undefined);
+      setConfigurationReviewConfirmed(false);
       if (!submission.preserveTimeline) {
         setLiveObservationItems([]);
         setLiveRequestId(undefined);
@@ -1221,6 +1263,8 @@ function UserAgentAssistant() {
         return;
       }
       setControlPlane({ sessionId, runId });
+      setShowAdvancedClarification(false);
+      reviewEditSnapshotRef.current = undefined;
       message.success(durableTurn
         ? "Agent 已推进到下一批 Durable 工具，请查看过程并确认需要授权的动作"
         : "Agent 已生成可审计执行计划，请确认后执行");
@@ -1648,6 +1692,8 @@ function UserAgentAssistant() {
     setExecutionAnswer(undefined);
     setFollowUpMessage("");
     setShowAdvancedClarification(false);
+    setConfigurationReviewConfirmed(false);
+    reviewEditSnapshotRef.current = undefined;
     autoAdvanceTurnRef.current = undefined;
     clarificationForm.resetFields();
     quickClarificationForm.resetFields();
@@ -1703,6 +1749,9 @@ function UserAgentAssistant() {
       : Array.isArray(draftArguments?.objectMappings)
         ? draftArguments.objectMappings
         : [];
+    setControlPlane(undefined);
+    setConfigurationReviewConfirmed(false);
+    reviewEditSnapshotRef.current = undefined;
     navigate("/sync", {
       state: {
         agentWizardHandoff: {
@@ -1722,6 +1771,68 @@ function UserAgentAssistant() {
       },
     });
   };
+
+  const startConfigurationReviewEdit = () => {
+    reviewEditSnapshotRef.current = {
+      values: clarificationForm.getFieldsValue(true),
+      controlPlane,
+      reviewConfirmed: configurationReviewConfirmed,
+    };
+    setConfigurationReviewConfirmed(false);
+    setShowAdvancedClarification(true);
+    window.setTimeout(() => scrollToAgentSection("agent-clarification-card"), 0);
+  };
+
+  const cancelConfigurationReviewEdit = () => {
+    const snapshot = reviewEditSnapshotRef.current;
+    if (snapshot) {
+      clarificationForm.setFieldsValue(snapshot.values);
+      setControlPlane(snapshot.controlPlane);
+      setConfigurationReviewConfirmed(snapshot.reviewConfirmed);
+    }
+    reviewEditSnapshotRef.current = undefined;
+    setShowAdvancedClarification(false);
+    window.setTimeout(() => scrollToAgentSection("agent-execution-plan-card"), 0);
+  };
+
+  const invalidateConfigurationReview = () => {
+    setControlPlane(undefined);
+    setConfigurationReviewConfirmed(false);
+  };
+
+  const resolvedConfiguration = conversation?.resolvedConfiguration;
+  const reviewSyncMode = normalizeUserSyncMode(
+    clarificationSyncMode || resolvedConfiguration?.syncMode || conversation?.structuredIntent.syncMode,
+  );
+  const reviewWriteStrategy = isRealtimeSyncMode(reviewSyncMode)
+    ? "UPDATE"
+    : clarificationWriteStrategy || resolvedConfiguration?.writeStrategy || "INSERT";
+  const reviewMappings = clarificationMappings.length
+    ? clarificationMappings
+    : resolvedObjectMappings(resolvedConfiguration?.objectMappings);
+  const reviewTaskName = clarificationTaskName
+    || resolvedConfiguration?.taskName
+    || "Agent 创建的数据同步任务";
+  const reviewSourceDatasource = selectedSourceDatasource || sourceDatasources.find(
+    (item) => Number(item.id) === Number(resolvedConfiguration?.sourceDatasourceId),
+  );
+  const reviewTargetDatasource = selectedTargetDatasource || targetDatasources.find(
+    (item) => Number(item.id) === Number(resolvedConfiguration?.targetDatasourceId),
+  );
+  const reviewSourceName = reviewSourceDatasource
+    ? `#${reviewSourceDatasource.id} ${reviewSourceDatasource.name}（${reviewSourceDatasource.type}）`
+    : resolvedConfiguration?.sourceDatasourceName
+      || (resolvedConfiguration?.sourceDatasourceId ? `#${resolvedConfiguration.sourceDatasourceId}` : "未选择");
+  const reviewTargetName = reviewTargetDatasource
+    ? `#${reviewTargetDatasource.id} ${reviewTargetDatasource.name}（${reviewTargetDatasource.type}）`
+    : resolvedConfiguration?.targetDatasourceName
+      || (resolvedConfiguration?.targetDatasourceId ? `#${resolvedConfiguration.targetDatasourceId}` : "未选择");
+  const reviewScheduleConfig = clarificationScheduleConfig || resolvedConfiguration?.scheduleConfig;
+  const reviewCustomSqlText = clarificationCustomSqlText || resolvedConfiguration?.customSqlText;
+  const isSyncTaskCreationReview = conversation?.structuredIntent.intentType === "CREATE_DATA_SYNC_TASK"
+    || activeToolNames.includes("sync.task.draft.save");
+  const editingReadyConfiguration = showAdvancedClarification
+    && conversation?.phase !== "WAITING_CLARIFICATION";
 
   return (
     <div className="page-stack">
@@ -1968,7 +2079,7 @@ function UserAgentAssistant() {
               )}
             />
           ) : null}
-          <div className="agent-composer">
+          <div id="agent-conversation-composer" className="agent-composer">
             <Input.TextArea
               value={followUpMessage}
               onChange={(event) => setFollowUpMessage(event.target.value)}
@@ -2089,26 +2200,34 @@ function UserAgentAssistant() {
         />
       ) : null}
 
-      {conversation?.phase === "WAITING_CLARIFICATION" ? (
+      {conversation && (conversation.phase === "WAITING_CLARIFICATION" || showAdvancedClarification) ? (
         <Card
           id="agent-clarification-card"
-          title="高级配置（仅在自动补全失败时使用）"
+          title={editingReadyConfiguration ? "修改 Agent 任务配置" : "高级配置（仅在自动补全失败时使用）"}
           className="compact-card"
         >
           <Alert
             showIcon
-            type="warning"
-            message={`当前还需补充 ${missingParameterLabels.length || 1} 项任务配置`}
+            type={editingReadyConfiguration ? "info" : "warning"}
+            message={editingReadyConfiguration
+              ? "正在修改最新 Agent 配置，保存后会重新生成审核计划"
+              : `当前还需补充 ${missingParameterLabels.length || 1} 项任务配置`}
             description={(
               <Space direction="vertical" size={8} style={{ width: "100%" }}>
-                <Typography.Text>{conversation.assistantMessage}</Typography.Text>
-                <Space wrap>
-                  {missingParameterLabels.length ? missingParameterLabels.map((label) => (
-                    <Tag key={label} color="gold">必填：{label}</Tag>
-                  )) : conversation.clarificationQuestions.map((question) => (
-                    <Tag key={question.parameterName} color="gold">{question.question}</Tag>
-                  ))}
-                </Space>
+                <Typography.Text>
+                  {editingReadyConfiguration
+                    ? "你可以调整任务名称、模式、数据源、对象映射、字段映射、WHERE、调度或 SQL。旧计划在配置发生变化后立即失效。"
+                    : conversation.assistantMessage}
+                </Typography.Text>
+                {!editingReadyConfiguration ? (
+                  <Space wrap>
+                    {missingParameterLabels.length ? missingParameterLabels.map((label) => (
+                      <Tag key={label} color="gold">必填：{label}</Tag>
+                    )) : conversation.clarificationQuestions.map((question) => (
+                      <Tag key={question.parameterName} color="gold">{question.question}</Tag>
+                    ))}
+                  </Space>
+                ) : null}
               </Space>
             )}
             style={{ marginBottom: 16 }}
@@ -2283,6 +2402,7 @@ function UserAgentAssistant() {
           <Form<ClarificationFormValues>
             form={clarificationForm}
             layout="vertical"
+            onValuesChange={invalidateConfigurationReview}
             onFinish={(values) => planMutation.mutate({
               objective,
               clarification: values,
@@ -2291,16 +2411,20 @@ function UserAgentAssistant() {
           >
             <Button
               type="link"
-              onClick={() => setShowAdvancedClarification(false)}
+              onClick={editingReadyConfiguration
+                ? cancelConfigurationReviewEdit
+                : () => setShowAdvancedClarification(false)}
               style={{ paddingInline: 0, marginBottom: 8 }}
             >
-              返回渐进式追问
+              {editingReadyConfiguration ? "取消修改并返回配置审核" : "返回渐进式追问"}
             </Button>
             <Alert
               showIcon
               type="info"
-              message="请在下方补齐当前任务缺少的配置"
-              description={`当前待填写：${missingParameterLabels.join("；") || "任务对象与字段映射"}。表和字段均来自已选数据源的真实元数据，不需要填写 JSON。`}
+              message={editingReadyConfiguration ? "修改最新任务配置" : "请在下方补齐当前任务缺少的配置"}
+              description={editingReadyConfiguration
+                ? "保存后 Agent 会重新读取真实元数据、生成工具计划并进入新的审核阶段。未经重新审核，任务不会执行。"
+                : `当前待填写：${missingParameterLabels.join("；") || "任务对象与字段映射"}。表和字段均来自已选数据源的真实元数据，不需要填写 JSON。`}
               style={{ marginBottom: 16 }}
             />
             <div className="grid grid-two-form">
@@ -2596,16 +2720,20 @@ function UserAgentAssistant() {
                 </Space>
               )}
             </Form.List>
-            <Button
-              type="primary"
-              htmlType="submit"
-              icon={<ArrowRightOutlined />}
-              loading={planMutation.isPending && Boolean(planMutation.variables?.clarification)}
-              disabled={!hasDatasourceOptions}
-              style={{ marginTop: 20 }}
-            >
-              提交补充信息并生成计划
-            </Button>
+            <Space wrap style={{ marginTop: 20 }}>
+              <Button
+                type="primary"
+                htmlType="submit"
+                icon={<ArrowRightOutlined />}
+                loading={planMutation.isPending && Boolean(planMutation.variables?.clarification)}
+                disabled={!hasDatasourceOptions}
+              >
+                {editingReadyConfiguration ? "保存修改并重新生成审核计划" : "提交补充信息并生成计划"}
+              </Button>
+              {editingReadyConfiguration ? (
+                <Button onClick={handoffToManualWizard}>进入完整四步任务向导</Button>
+              ) : null}
+            </Space>
           </Form>
           )}
         </Card>
@@ -2613,6 +2741,138 @@ function UserAgentAssistant() {
 
       {controlPlane && activeToolNames.length && activeRequiresConfirmation ? (
         <Card id="agent-execution-plan-card" title="可观测执行计划" className="compact-card">
+          {isSyncTaskCreationReview ? (
+            <div className="agent-configuration-review">
+              <div className="agent-configuration-review-header">
+                <Space>
+                  <EyeOutlined />
+                  <Typography.Title level={5} style={{ margin: 0 }}>执行前任务配置审核</Typography.Title>
+                </Space>
+                <Tag color="gold">尚未执行</Tag>
+              </div>
+              <Alert
+                showIcon
+                type="info"
+                message="请先审核 Agent 将要创建的任务设置"
+                description="以下内容是本次写入任务草稿、预检查、发布和运行所使用的最新配置。你可以只修改不认可的部分；任何修改都会使当前执行计划失效并重新生成。"
+                style={{ marginBottom: 16 }}
+              />
+              <Descriptions
+                size="small"
+                bordered
+                column={{ xs: 1, md: 2, xl: 3 }}
+                items={[
+                  { key: "taskName", label: "任务名称", children: reviewTaskName },
+                  { key: "project", label: "所属项目", children: selectedProjectId ? `项目 #${selectedProjectId}` : "当前项目" },
+                  { key: "group", label: "任务分组", children: "默认分组（可在完整向导修改）" },
+                  { key: "source", label: "源端数据源", children: reviewSourceName },
+                  { key: "target", label: "目标端数据源", children: reviewTargetName },
+                  { key: "mode", label: "传输模式", children: syncModeLabels[reviewSyncMode] || reviewSyncMode },
+                  { key: "write", label: "写入策略", children: reviewWriteStrategy === "UPDATE" ? "UPDATE / MERGE" : "INSERT" },
+                  { key: "mappingCount", label: "对象映射", children: `${reviewMappings.length} 条` },
+                  { key: "description", label: "任务目标", children: objective, span: 2 },
+                  ...(isScheduledSyncMode(reviewSyncMode) ? [{
+                    key: "schedule",
+                    label: "调度周期",
+                    children: scheduleConfigSummary(reviewScheduleConfig),
+                    span: 3,
+                  }] : []),
+                ]}
+              />
+              {isSqlSyncMode(reviewSyncMode) ? (
+                <div className="agent-configuration-review-section">
+                  <Typography.Text strong>只读 SQL</Typography.Text>
+                  <pre className="agent-configuration-sql">{reviewCustomSqlText || "尚未生成 SQL"}</pre>
+                </div>
+              ) : null}
+              <div className="agent-configuration-review-section">
+                <Typography.Text strong>源表 → 目标表映射</Typography.Text>
+                {reviewMappings.length ? (
+                  <Collapse
+                    className="agent-configuration-mapping-collapse"
+                    items={reviewMappings.map((mapping, mappingIndex) => {
+                      const enabledFields = mapping.fieldMappings.filter((field) => field.syncEnabled !== false);
+                      const disabledFieldCount = mapping.fieldMappings.length - enabledFields.length;
+                      const sourceName = mapping.sourceSchemaName
+                        ? `${mapping.sourceSchemaName}.${mapping.sourceObjectName || "未选择"}`
+                        : mapping.sourceObjectName || "SQL 结果集";
+                      const targetName = mapping.targetSchemaName
+                        ? `${mapping.targetSchemaName}.${mapping.targetObjectName}`
+                        : mapping.targetObjectName;
+                      return {
+                        key: mapping.objectKey || `review-mapping-${mappingIndex + 1}`,
+                        label: (
+                          <div className="agent-configuration-mapping-label">
+                            <Typography.Text strong>{sourceName} → {targetName}</Typography.Text>
+                            <Space wrap>
+                              {mapping.whereCondition ? <Tag color="cyan">WHERE {mapping.whereCondition}</Tag> : <Tag>无 WHERE</Tag>}
+                              <Tag color="blue">同步 {enabledFields.length} 个字段</Tag>
+                              {disabledFieldCount ? <Tag>忽略 {disabledFieldCount} 个字段</Tag> : null}
+                            </Space>
+                          </div>
+                        ),
+                        children: (
+                          <div className="agent-configuration-field-list">
+                            {mapping.fieldMappings.length ? mapping.fieldMappings.map((field, fieldIndex) => (
+                              <div
+                                className={`agent-configuration-field-row${field.syncEnabled === false ? " is-disabled" : ""}`}
+                                key={field.key || `${mapping.objectKey}-field-${fieldIndex}`}
+                              >
+                                <Typography.Text code>{field.sourceField}</Typography.Text>
+                                <Typography.Text type="secondary">{field.sourceType || "未知类型"}</Typography.Text>
+                                <Typography.Text>→</Typography.Text>
+                                <Typography.Text code>{field.targetField || "未映射"}</Typography.Text>
+                                <Typography.Text type="secondary">{field.targetType || "未知类型"}</Typography.Text>
+                                <Tag color={field.syncEnabled === false ? "default" : field.typeCompatible === false ? "red" : "green"}>
+                                  {field.syncEnabled === false ? "不同步" : field.typeCompatible === false ? "类型待处理" : "同步"}
+                                </Tag>
+                              </div>
+                            )) : (
+                              <Alert showIcon type="warning" message="尚未形成字段映射，不能执行" />
+                            )}
+                          </div>
+                        ),
+                      };
+                    })}
+                  />
+                ) : (
+                  <Alert showIcon type="warning" message="尚未形成对象映射，不能执行" style={{ marginTop: 12 }} />
+                )}
+              </div>
+              {isScheduledSyncMode(reviewSyncMode) && reviewScheduleConfig ? (
+                <Collapse
+                  ghost
+                  size="small"
+                  items={[{
+                    key: "schedule-raw",
+                    label: "查看调度配置原文",
+                    children: <pre className="agent-configuration-sql">{reviewScheduleConfig}</pre>,
+                  }]}
+                />
+              ) : null}
+              <div className="agent-configuration-review-actions">
+                <Space wrap>
+                  <Button
+                    icon={<EditOutlined />}
+                    onClick={() => scrollToAgentSection("agent-conversation-composer")}
+                  >
+                    用对话补充或纠偏
+                  </Button>
+                  <Button icon={<EditOutlined />} onClick={startConfigurationReviewEdit}>
+                    当前页修改设置
+                  </Button>
+                  <Button onClick={handoffToManualWizard}>进入完整四步任务向导</Button>
+                </Space>
+                <Checkbox
+                  checked={configurationReviewConfirmed}
+                  disabled={planMutation.isPending || showAdvancedClarification}
+                  onChange={(event) => setConfigurationReviewConfirmed(event.target.checked)}
+                >
+                  我已审核以上最新任务配置，同意按此配置执行
+                </Checkbox>
+              </div>
+            </div>
+          ) : null}
           <Steps
             direction="vertical"
             size="small"
@@ -2670,7 +2930,10 @@ function UserAgentAssistant() {
             danger
             icon={<ArrowRightOutlined />}
             loading={executeMutation.isPending}
-            disabled={Boolean(executionAnswer)}
+            disabled={Boolean(executionAnswer)
+              || planMutation.isPending
+              || showAdvancedClarification
+              || (isSyncTaskCreationReview && !configurationReviewConfirmed)}
             onClick={() => executeMutation.mutate()}
           >
             {confirmationButtonLabel}
