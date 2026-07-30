@@ -70,6 +70,7 @@ import type {
   AgentObservationTimelineItem,
   AgentToolExecutionAudit,
   AgentToolExecutionFailure,
+  AgentRepairProposal,
   AgentToolExecutionResult,
   SyncExecution,
   SyncTaskImportArtifact,
@@ -148,6 +149,7 @@ interface ExecutionAnswer {
   recoveryRunId?: string;
   recoveryRequiresConfirmation?: boolean;
   continuationStatus?: string;
+  repairProposal?: AgentRepairProposal;
 }
 
 type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
@@ -1721,10 +1723,13 @@ function UserAgentAssistant() {
           throw new Error(`Agent continuation 出现重复 Run：${currentRunId}`);
         }
         visitedRunIds.add(currentRunId);
+        const pendingRepair = executionAnswer?.repairProposal;
         const result = await api.confirmAndExecuteAgentRun(controlPlane.sessionId, currentRunId, {
           confirmed: true,
           comment: batchIndex === 0
-            ? "用户已审核完整同步任务配置，同意执行本次计划"
+            ? pendingRepair?.kind === "DUPLICATE_TASK_NAME"
+              ? `用户确认将任务名称从“${pendingRepair.originalTaskName}”改为“${pendingRepair.proposedTaskName}”，并同意重新保存、预检查、发布和执行`
+              : "用户已审核完整同步任务配置，同意执行本次计划"
             : "沿用用户对同一完整同步任务计划的确认，继续执行受控生命周期节点",
         });
         result.data.toolResults.forEach((item) => resultByAuditId.set(item.audit.auditId, item));
@@ -1829,6 +1834,7 @@ function UserAgentAssistant() {
           recoveryRunId,
           recoveryRequiresConfirmation: Boolean(result.data.continuation?.requiresConfirmation),
           continuationStatus: result.data.continuation?.status,
+          repairProposal: result.data.continuation?.repairProposal,
         });
         if (recoveryRunId && result.data.continuation?.sessionId) {
           setControlPlane({
@@ -2084,6 +2090,8 @@ function UserAgentAssistant() {
     executionAnswer?.recoveryRunId
     && controlPlane?.runId === executionAnswer.recoveryRunId,
   );
+  const taskNameRepairActive = failureRecoveryPlanActive
+    && executionAnswer?.repairProposal?.kind === "DUPLICATE_TASK_NAME";
   const activeToolNames = failureRecoveryPlanActive
     ? [...new Set(audits.map((audit) => audit.toolCode))]
     : latestDurableTurn?.submittedToolNames?.length
@@ -2097,7 +2105,9 @@ function UserAgentAssistant() {
         plan?.agentDurableModelToolLoop?.stoppedReason ?? "",
       )
     : planItems.some((item) => item.requiresHumanApproval);
-  const confirmationButtonLabel = failureRecoveryPlanActive
+  const confirmationButtonLabel = taskNameRepairActive
+    ? `确认改名为“${executionAnswer?.repairProposal?.proposedTaskName}”并重新执行`
+    : failureRecoveryPlanActive
     ? "确认并执行 Agent 修复方案"
     : activeToolNames.includes("datasource.schema.repair.apply")
     ? "确认并应用目标表结构修复"
@@ -4061,11 +4071,36 @@ function UserAgentAssistant() {
               </Card>
             );
           })}
+          {taskNameRepairActive && executionAnswer?.repairProposal ? (
+            <Alert
+              showIcon
+              type="warning"
+              message="同名任务修复需要你确认"
+              description={(
+                <Space direction="vertical" size={4} style={{ display: "flex" }}>
+                  <Typography.Text>
+                    原任务名称：<Typography.Text code>{executionAnswer.repairProposal.originalTaskName}</Typography.Text>
+                  </Typography.Text>
+                  <Typography.Text>
+                    建议任务名称：<Typography.Text code>{executionAnswer.repairProposal.proposedTaskName}</Typography.Text>
+                  </Typography.Text>
+                  <Typography.Text type="secondary">
+                    仅修改任务名称；数据源、对象与字段映射、WHERE、同步模式和写入策略保持不变。当前尚未保存或执行。
+                  </Typography.Text>
+                </Space>
+              )}
+              style={{ marginTop: 16 }}
+            />
+          ) : null}
           <Alert
             showIcon
             type="warning"
-            message={isRecoveryConfirmation ? "确认后才会执行受控恢复动作" : "确认后才会执行写节点"}
-            description={isRecoveryConfirmation
+            message={taskNameRepairActive
+              ? "确认后才会使用新名称重新创建并提交任务"
+              : isRecoveryConfirmation ? "确认后才会执行受控恢复动作" : "确认后才会执行写节点"}
+            description={taskNameRepairActive
+              ? "确认会授权 Agent 使用上方建议名称重新执行草稿保存、真实预检查、发布，并按任务同步模式立即运行或启用调度。若再次冲突，Agent 会保留新的失败事实并继续受控处理。"
+              : isRecoveryConfirmation
               ? "诊断、RAG 检索和修复预览均为只读；结构修改、坏行隔离、失败对象重试或修复重放只在本次授权后执行。坏行隔离不会删除源端数据，执行完成后 Agent 会继续验证真实同步结果。"
               : "连接测试和元数据读取为只读节点；草稿保存、预检查、发布和运行会改变业务状态，只在本次确认后执行。"}
             style={{ marginTop: 16, marginBottom: 16 }}
@@ -4137,17 +4172,52 @@ function UserAgentAssistant() {
               ) : null}
             </div>
           ))}
+          {executionAnswer.repairProposal?.kind === "DUPLICATE_TASK_NAME" ? (
+            <Alert
+              showIcon
+              type="warning"
+              message="Agent 已准备同名任务修复方案，尚未执行"
+              description={(
+                <div>
+                  <Typography.Paragraph style={{ marginBottom: 8 }}>
+                    {executionAnswer.repairProposal.summary}
+                  </Typography.Paragraph>
+                  <Descriptions
+                    size="small"
+                    column={1}
+                    items={[
+                      {
+                        key: "original-name",
+                        label: "原任务名称",
+                        children: <Typography.Text code>{executionAnswer.repairProposal.originalTaskName}</Typography.Text>,
+                      },
+                      {
+                        key: "proposed-name",
+                        label: "建议任务名称",
+                        children: <Typography.Text code>{executionAnswer.repairProposal.proposedTaskName}</Typography.Text>,
+                      },
+                    ]}
+                  />
+                </div>
+              )}
+              style={{ marginTop: 12 }}
+            />
+          ) : null}
           {executionAnswer.status === "ERROR" ? (
             <Alert
               showIcon
               type={executionAnswer.recoveryRunId ? "info" : "warning"}
               message={executionAnswer.recoveryRunId
-                ? (executionAnswer.recoveryRequiresConfirmation
+                ? (executionAnswer.repairProposal?.kind === "DUPLICATE_TASK_NAME"
+                  ? "等待你确认任务名称修改"
+                  : executionAnswer.recoveryRequiresConfirmation
                   ? "Agent 已完成只读诊断，并形成需要你确认的修复方案"
                   : "Agent 已创建后续诊断 Run")
                 : "Agent 已完成失败分析，但尚未形成可执行修复动作"}
               description={executionAnswer.recoveryRunId
-                ? `后续 Run：${executionAnswer.recoveryRunId}。只读检查可自动执行；修改任务、表结构或数据前仍需你明确确认。`
+                ? executionAnswer.repairProposal?.kind === "DUPLICATE_TASK_NAME"
+                  ? `后续 Run：${executionAnswer.recoveryRunId}。请在上方核对精确名称变更并确认；确认前不会重新保存或执行任务。`
+                  : `后续 Run：${executionAnswer.recoveryRunId}。只读检查可自动执行；修改任务、表结构或数据前仍需你明确确认。`
                 : "失败事实已保留。你可以继续用自然语言补充信息，Agent 会基于当前会话继续排查。"}
               style={{ marginTop: 12 }}
             />

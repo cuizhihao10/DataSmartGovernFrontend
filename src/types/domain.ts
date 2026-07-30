@@ -1351,8 +1351,21 @@ export interface AgentPostConfirmContinuation {
   assistantReply?: string;
   modelSecondTurn?: JsonObject;
   durableLoop?: JsonObject;
+  repairProposal?: AgentRepairProposal;
   payloadPolicy?: string;
   message?: string;
+}
+
+export interface AgentRepairProposal {
+  kind: string;
+  failureCode?: string;
+  failedToolName?: string;
+  originalTaskName?: string;
+  proposedTaskName?: string;
+  requiresConfirmation: boolean;
+  summary: string;
+  changes: string[];
+  payloadPolicy?: string;
 }
 
 export interface AgentToolExecutionResult {
