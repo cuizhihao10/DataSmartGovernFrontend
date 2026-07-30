@@ -3076,28 +3076,78 @@ function UserAgentAssistant() {
                           || "当前 WHERE 为空，将同步每条对象映射范围内的全部数据。你可以接受默认配置，也可以打开当前页编辑器逐表修改。"}
                         style={{ marginBottom: 12 }}
                       />
-                      <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                      <div className="agent-default-mapping-list">
                         {reviewMappings.map((mapping, index) => {
                           const enabledFields = mapping.fieldMappings.filter(
                             (field) => field.syncEnabled !== false && field.sourceField && field.targetField,
                           );
+                          const disabledFieldCount = mapping.fieldMappings.length - enabledFields.length;
+                          const sourceName = mapping.sourceSchemaName
+                            ? `${mapping.sourceSchemaName}.${mapping.sourceObjectName || "未选择源表"}`
+                            : mapping.sourceObjectName || "未选择源表";
+                          const targetName = mapping.targetSchemaName
+                            ? `${mapping.targetSchemaName}.${mapping.targetObjectName || "未选择目标表"}`
+                            : mapping.targetObjectName || "未选择目标表";
                           return (
-                            <div key={mapping.objectKey || `default-review-${index}`} className="agent-default-mapping-row">
-                              <Typography.Text strong>
-                                {mapping.sourceObjectName || "未选择源表"} → {mapping.targetSchemaName
-                                  ? `${mapping.targetSchemaName}.${mapping.targetObjectName}`
-                                  : mapping.targetObjectName || "未选择目标表"}
-                              </Typography.Text>
-                              <Space wrap>
-                                <Tag color={enabledFields.length ? "blue" : "red"}>
-                                  {enabledFields.length} 个同名字段
-                                </Tag>
-                                <Tag>{mapping.whereCondition ? `WHERE ${mapping.whereCondition}` : "无 WHERE，默认同步全部数据"}</Tag>
-                              </Space>
-                            </div>
+                            <section
+                              key={mapping.objectKey || `default-review-${index}`}
+                              className="agent-default-mapping-detail"
+                            >
+                              <div className="agent-default-mapping-header">
+                                <div className="agent-default-mapping-title">
+                                  <Tag color="blue">映射 {index + 1}</Tag>
+                                  <Typography.Text strong>{sourceName} → {targetName}</Typography.Text>
+                                </div>
+                                <Space wrap>
+                                  <Tag color={enabledFields.length ? "green" : "red"}>
+                                    同步 {enabledFields.length} 个字段
+                                  </Tag>
+                                  {disabledFieldCount ? <Tag>不同步 {disabledFieldCount} 个字段</Tag> : null}
+                                </Space>
+                              </div>
+                              <div className="agent-default-where-row">
+                                <Typography.Text type="secondary">WHERE 条件</Typography.Text>
+                                <Typography.Text code>
+                                  {mapping.whereCondition || "未设置（同步该表全部数据）"}
+                                </Typography.Text>
+                              </div>
+                              {mapping.fieldMappings.length ? (
+                                <div className="agent-configuration-field-list">
+                                  <div className="agent-configuration-field-row is-header" aria-hidden="true">
+                                    <span>源字段</span>
+                                    <span>源类型</span>
+                                    <span />
+                                    <span>目标字段</span>
+                                    <span>目标类型</span>
+                                    <span>同步状态</span>
+                                  </div>
+                                  {mapping.fieldMappings.map((field, fieldIndex) => {
+                                    const fieldEnabled = field.syncEnabled !== false
+                                      && Boolean(field.sourceField && field.targetField);
+                                    return (
+                                      <div
+                                        className={`agent-configuration-field-row${fieldEnabled ? "" : " is-disabled"}`}
+                                        key={field.key || `${mapping.objectKey}-default-field-${fieldIndex}`}
+                                      >
+                                        <Typography.Text code>{field.sourceField || "未设置"}</Typography.Text>
+                                        <Typography.Text type="secondary">{field.sourceType || "未知类型"}</Typography.Text>
+                                        <Typography.Text>→</Typography.Text>
+                                        <Typography.Text code>{field.targetField || "未映射"}</Typography.Text>
+                                        <Typography.Text type="secondary">{field.targetType || "未知类型"}</Typography.Text>
+                                        <Tag color={!fieldEnabled ? "default" : field.typeCompatible === false ? "red" : "green"}>
+                                          {!fieldEnabled ? "不同步" : field.typeCompatible === false ? "类型待处理" : "同步"}
+                                        </Tag>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <Alert showIcon type="warning" message="尚未形成字段映射，不能接受当前默认配置" />
+                              )}
+                            </section>
                           );
                         })}
-                      </Space>
+                      </div>
                       <Form.Item
                         name="mappingDefaultsConfirmed"
                         valuePropName="checked"

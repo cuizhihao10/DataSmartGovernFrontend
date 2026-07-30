@@ -559,20 +559,44 @@ select {
   border-bottom: 1px solid #dce3ea;
 }
 
-.agent-default-mapping-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid #e2e8ee;
-  border-radius: 6px;
-  background: #f8fafc;
+.agent-default-mapping-list {
+  display: grid;
+  gap: 16px;
 }
 
-.agent-default-mapping-row .ant-typography {
+.agent-default-mapping-detail {
+  display: grid;
+  gap: 10px;
+}
+
+.agent-default-mapping-detail + .agent-default-mapping-detail {
+  padding-top: 16px;
+  border-top: 1px solid #dce3ea;
+}
+
+.agent-default-mapping-header,
+.agent-default-mapping-title,
+.agent-default-where-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.agent-default-mapping-header {
+  justify-content: space-between;
+}
+
+.agent-default-mapping-title,
+.agent-default-mapping-title .ant-typography,
+.agent-default-where-row .ant-typography:last-child {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.agent-default-where-row {
+  align-items: flex-start;
+  padding: 8px 10px;
+  background: #f7f9fb;
 }
 
 .agent-configuration-review-header,
@@ -652,6 +676,14 @@ select {
   color: #7c8794;
 }
 
+.agent-configuration-field-row.is-header {
+  padding-block: 7px;
+  background: #f3f6f8;
+  color: #66727f;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .agent-configuration-review-actions {
   align-items: flex-start;
   margin-top: 18px;
@@ -679,7 +711,9 @@ select {
     flex-wrap: wrap;
   }
 
-  .agent-default-mapping-row {
+  .agent-default-mapping-header,
+  .agent-default-mapping-title,
+  .agent-default-where-row {
     align-items: flex-start;
     flex-direction: column;
   }
@@ -705,6 +739,10 @@ select {
   }
 
   .agent-configuration-field-row > :nth-child(3) {
+    display: none;
+  }
+
+  .agent-configuration-field-row.is-header {
     display: none;
   }
 }
