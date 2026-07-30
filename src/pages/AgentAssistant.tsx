@@ -139,9 +139,9 @@ interface AgentChatMessage {
 
 interface ExecutionAnswer {
   content: string;
-  mode: string;
-  modelProviderStatus: string;
-  status: "SUCCESS" | "WARNING" | "ERROR";
+  status: "SUCCESS" | "ERROR";
+  taskId?: number;
+  executionId?: number;
 }
 
 type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED";
@@ -1107,8 +1107,14 @@ function UserAgentAssistant() {
       .reverse()
       .find((turn) => turn.sessionId && turn.runId);
     const ingestion = plan?.controlPlaneIngestion;
-    const sessionId = durableTurn?.sessionId || textField(ingestion, "sessionId");
-    const runId = durableTurn?.runId || textField(ingestion, "runId");
+    const hasCompleteLifecyclePlan = (plan?.plan?.toolPlans ?? [])
+      .some((item) => item.toolName === "sync.task.draft.save");
+    const sessionId = hasCompleteLifecyclePlan
+      ? textField(ingestion, "sessionId") || durableTurn?.sessionId
+      : durableTurn?.sessionId || textField(ingestion, "sessionId");
+    const runId = hasCompleteLifecyclePlan
+      ? textField(ingestion, "runId") || durableTurn?.runId
+      : durableTurn?.runId || textField(ingestion, "runId");
     return sessionId && runId ? { sessionId, runId } : undefined;
   }, [controlPlane, plan]);
 
@@ -1556,8 +1562,14 @@ function UserAgentAssistant() {
         .reverse()
         .find((turn) => turn.sessionId && turn.runId);
       const ingestion = nextPlan.controlPlaneIngestion;
-      const sessionId = durableTurn?.sessionId || textField(ingestion, "sessionId");
-      const runId = durableTurn?.runId || textField(ingestion, "runId");
+      const hasCompleteLifecyclePlan = (nextPlan.plan?.toolPlans ?? [])
+        .some((item) => item.toolName === "sync.task.draft.save");
+      const sessionId = hasCompleteLifecyclePlan
+        ? textField(ingestion, "sessionId") || durableTurn?.sessionId
+        : durableTurn?.sessionId || textField(ingestion, "sessionId");
+      const runId = hasCompleteLifecyclePlan
+        ? textField(ingestion, "runId") || durableTurn?.runId
+        : durableTurn?.runId || textField(ingestion, "runId");
       if (!sessionId || !runId) {
         setControlPlane(undefined);
         message.error("参数已补齐，但 Java 控制面未返回 sessionId/runId，请检查计划接入状态");
@@ -1566,9 +1578,11 @@ function UserAgentAssistant() {
       setControlPlane({ sessionId, runId });
       setShowAdvancedClarification(false);
       reviewEditSnapshotRef.current = undefined;
-      message.success(durableTurn
-        ? "Agent 已推进到下一批 Durable 工具，请查看过程并确认需要授权的动作"
-        : "Agent 已生成可审计执行计划，请确认后执行");
+      message.success(hasCompleteLifecyclePlan
+        ? "Agent 已生成完整任务生命周期计划，请审核后一次确认执行"
+        : durableTurn
+          ? "Agent 已推进到下一批 Durable 工具，请查看过程并确认需要授权的动作"
+          : "Agent 已生成可审计执行计划，请确认后执行");
     },
     onError: (error) => {
       finishAgentProcess("PLAN", "FAILED");
@@ -1604,12 +1618,80 @@ function UserAgentAssistant() {
   });
 
   const executeMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!controlPlane) throw new Error("请先生成 Agent 计划");
-      return api.confirmAndExecuteAgentRun(controlPlane.sessionId, controlPlane.runId, {
-        confirmed: true,
-        comment: "用户在智能助手页面确认执行数据同步计划",
-      });
+      const approvedToolCodes = new Set((plan?.plan?.toolPlans ?? []).map((item) => item.toolName));
+      const approvedSyncMode = normalizeUserSyncMode(
+        clarificationForm.getFieldValue("syncMode") || plan?.agentConversation?.structuredIntent.syncMode,
+      );
+      const resultByAuditId = new Map<string, AgentToolExecutionResult>();
+      const visitedRunIds = new Set<string>();
+      let currentRunId = controlPlane.runId;
+      let totalPlanned = 0;
+      let totalSucceeded = 0;
+      let totalFailed = 0;
+
+      for (let batchIndex = 0; batchIndex < 6; batchIndex += 1) {
+        if (visitedRunIds.has(currentRunId)) {
+          throw new Error(`Agent continuation 出现重复 Run：${currentRunId}`);
+        }
+        visitedRunIds.add(currentRunId);
+        const result = await api.confirmAndExecuteAgentRun(controlPlane.sessionId, currentRunId, {
+          confirmed: true,
+          comment: batchIndex === 0
+            ? "用户已审核完整同步任务配置，同意执行本次计划"
+            : "沿用用户对同一完整同步任务计划的确认，继续执行受控生命周期节点",
+        });
+        result.data.toolResults.forEach((item) => resultByAuditId.set(item.audit.auditId, item));
+        totalPlanned += result.data.plannedCount;
+        totalSucceeded += result.data.succeededCount;
+        totalFailed += result.data.failedCount;
+
+        const combinedResults = [...resultByAuditId.values()];
+        const succeededToolCodes = new Set(combinedResults
+          .filter((item) => item.audit.state === "SUCCEEDED")
+          .map((item) => item.audit.toolCode));
+        const taskSubmissionReached = succeededToolCodes.has("sync.task.run")
+          || (["SCHEDULED_BATCH", "SCHEDULED_FULL", "CDC_STREAMING"].includes(approvedSyncMode)
+            && succeededToolCodes.has("sync.task.publish"));
+        const aggregateResult = {
+          ...result,
+          data: {
+            ...result.data,
+            runId: currentRunId,
+            plannedCount: totalPlanned,
+            succeededCount: totalSucceeded,
+            failedCount: totalFailed,
+            toolResults: combinedResults,
+          },
+        };
+        if (result.data.failedCount > 0 || taskSubmissionReached) {
+          return aggregateResult;
+        }
+
+        const continuation = result.data.continuation;
+        const nextRunId = continuation?.nextRunId;
+        if (!nextRunId) {
+          return aggregateResult;
+        }
+        if (continuation.sessionId && continuation.sessionId !== controlPlane.sessionId) {
+          throw new Error("Agent continuation 返回了不同会话，已阻止跨会话自动执行");
+        }
+
+        // One review may cover several Durable batches, but never tools that
+        // were absent from the configuration plan shown to the user.
+        const nextAudits = (await api.listAgentToolExecutions(controlPlane.sessionId, nextRunId)).data;
+        const unexpectedTools = [...new Set(nextAudits
+          .map((audit) => audit.toolCode)
+          .filter((toolCode) => !approvedToolCodes.has(toolCode)))];
+        if (!nextAudits.length || unexpectedTools.length) {
+          throw new Error(unexpectedTools.length
+            ? `下一批出现未审核工具：${unexpectedTools.join("、")}，需要重新生成并确认计划`
+            : "下一批 Agent Run 没有可执行工具，已停止自动续跑");
+        }
+        currentRunId = nextRunId;
+      }
+      throw new Error("Agent 受控续跑批次超过安全上限，请查看运行诊断");
     },
     onMutate: () => {
       beginAgentProcess("EXECUTION");
@@ -1636,28 +1718,39 @@ function UserAgentAssistant() {
       const succeededToolCodes = new Set(result.data.toolResults
         .filter((item) => item.audit.state === "SUCCEEDED")
         .map((item) => item.audit.toolCode));
-      const taskLifecycleReached = [
-        "sync.task.draft.save",
-        "sync.task.precheck",
-        "sync.task.publish",
-        "sync.task.run",
-        "sync.execution.status",
-      ].some((toolCode) => succeededToolCodes.has(toolCode));
-      const answerStatus: ExecutionAnswer["status"] = result.data.failedCount > 0
-        ? "ERROR"
-        : taskLifecycleReached
-          ? "SUCCESS"
-          : "WARNING";
-      setExecutionAnswer({
-        content: result.data.assistantReply || "工具执行已经结束，请查看节点状态。",
-        mode: result.data.answerMode || "DETERMINISTIC_FALLBACK",
-        modelProviderStatus: result.data.modelProviderStatus || "RESERVED_NOT_INVOKED",
-        status: answerStatus,
-      });
+      const taskLifecycleReached = succeededToolCodes.has("sync.task.run")
+        || (["SCHEDULED_BATCH", "SCHEDULED_FULL", "CDC_STREAMING"].includes(reviewSyncMode)
+          && succeededToolCodes.has("sync.task.publish"));
+      const createdTaskId = [...result.data.toolResults]
+        .reverse()
+        .map((item) => findNumericField(item.output, ["taskId", "syncTaskId"]))
+        .find(Boolean);
+      const createdExecutionId = [...result.data.toolResults]
+        .reverse()
+        .map((item) => findNumericField(item.output, ["executionId"]))
+        .find(Boolean);
+      if (result.data.failedCount > 0 || taskLifecycleReached) {
+        setExecutionAnswer({
+          content: result.data.assistantReply || (taskLifecycleReached
+            ? "同步任务已创建并进入业务执行链路。"
+            : "同步任务创建或提交失败，请查看失败节点。"),
+          status: taskLifecycleReached ? "SUCCESS" : "ERROR",
+          taskId: createdTaskId,
+          executionId: createdExecutionId,
+        });
+      } else {
+        // Read-only discovery is an intermediate Agent step, not a task
+        // creation conclusion. Keep the review surface available to continue.
+        setExecutionAnswer(undefined);
+      }
       if (result.data.failedCount > 0) {
         message.error(`工具执行失败 ${result.data.failedCount} 个；任务未成功创建或运行，请查看失败节点`);
       } else if (taskLifecycleReached) {
-        message.success("Agent 控制面节点已执行完成，同步任务已进入真实业务执行链路");
+        message.success(isScheduledSyncMode(reviewSyncMode)
+          ? "同步任务已创建并启用调度，可在同步任务列表查看"
+          : isRealtimeSyncMode(reviewSyncMode)
+            ? "实时同步任务已创建并交由实时通道运行，可在同步任务列表持续查看"
+            : "同步任务已创建并提交执行，可在同步任务列表持续查看进度");
       } else {
         message.info("本轮只完成只读工具核对，尚未创建或运行同步任务");
       }
@@ -3816,17 +3909,23 @@ function UserAgentAssistant() {
       ) : null}
 
       {executionAnswer ? (
-        <Card title="执行结论" className="compact-card">
+        <Card
+          title={executionAnswer.status === "SUCCESS" ? "任务已创建并提交" : "执行失败"}
+          className="compact-card"
+        >
           <Alert
             showIcon
-            type={executionAnswer.status === "ERROR"
-              ? "error"
-              : executionAnswer.status === "WARNING" ? "warning" : "success"}
+            type={executionAnswer.status === "ERROR" ? "error" : "success"}
             message={executionAnswer.content}
           />
           <Space wrap style={{ marginTop: 12 }}>
-            <Tag>{executionAnswer.mode}</Tag>
-            <Tag color="gold">{executionAnswer.modelProviderStatus}</Tag>
+            {executionAnswer.taskId ? <Tag color="blue">任务 ID：{executionAnswer.taskId}</Tag> : null}
+            {executionAnswer.executionId ? <Tag>执行 ID：{executionAnswer.executionId}</Tag> : null}
+            {executionAnswer.status === "SUCCESS" ? (
+              <Button type="primary" icon={<DatabaseOutlined />} onClick={() => navigate("/sync")}>
+                查看同步任务列表
+              </Button>
+            ) : null}
           </Space>
         </Card>
       ) : null}

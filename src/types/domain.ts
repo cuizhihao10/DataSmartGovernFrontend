@@ -1324,6 +1324,24 @@ export interface AgentRunConfirmedExecutionResponse {
   assistantReply: string;
   answerMode: string;
   modelProviderStatus: string;
+  continuation?: AgentPostConfirmContinuation;
+}
+
+export interface AgentPostConfirmContinuation {
+  schemaVersion: string;
+  status: string;
+  continued: boolean;
+  requestId?: string;
+  sessionId?: string;
+  sourceRunId?: string;
+  nextRunId?: string;
+  requiresConfirmation: boolean;
+  stoppedReason?: string;
+  assistantReply?: string;
+  modelSecondTurn?: JsonObject;
+  durableLoop?: JsonObject;
+  payloadPolicy?: string;
+  message?: string;
 }
 
 export interface AgentToolExecutionResult {
