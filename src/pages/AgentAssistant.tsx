@@ -68,6 +68,7 @@ import type {
   AgentPlanResponse,
   AgentObservationTimelineItem,
   AgentToolExecutionAudit,
+  AgentToolExecutionFailure,
   AgentToolExecutionResult,
   SyncExecution,
   SyncTaskImportArtifact,
@@ -142,6 +143,10 @@ interface ExecutionAnswer {
   status: "SUCCESS" | "ERROR";
   taskId?: number;
   executionId?: number;
+  failures?: AgentToolExecutionFailure[];
+  recoveryRunId?: string;
+  recoveryRequiresConfirmation?: boolean;
+  continuationStatus?: string;
 }
 
 type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED";
@@ -1730,21 +1735,54 @@ function UserAgentAssistant() {
         .map((item) => findNumericField(item.output, ["executionId"]))
         .find(Boolean);
       if (result.data.failedCount > 0 || taskLifecycleReached) {
+        const recoveryRunId = result.data.failedCount > 0
+          ? result.data.continuation?.nextRunId
+          : undefined;
         setExecutionAnswer({
-          content: result.data.assistantReply || (taskLifecycleReached
-            ? "同步任务已创建并进入业务执行链路。"
-            : "同步任务创建或提交失败，请查看失败节点。"),
-          status: taskLifecycleReached ? "SUCCESS" : "ERROR",
+          content: result.data.assistantReply || (result.data.failedCount > 0
+            ? "同步任务创建或提交失败，Agent 正在根据失败事实继续诊断。"
+            : "同步任务已创建并进入业务执行链路。"),
+          status: result.data.failedCount > 0 ? "ERROR" : "SUCCESS",
           taskId: createdTaskId,
           executionId: createdExecutionId,
+          failures: result.data.failures,
+          recoveryRunId,
+          recoveryRequiresConfirmation: Boolean(result.data.continuation?.requiresConfirmation),
+          continuationStatus: result.data.continuation?.status,
         });
+        if (recoveryRunId && result.data.continuation?.sessionId) {
+          setControlPlane({
+            sessionId: result.data.continuation.sessionId,
+            runId: recoveryRunId,
+          });
+          setConfigurationReviewConfirmed(false);
+        }
       } else {
         // Read-only discovery is an intermediate Agent step, not a task
         // creation conclusion. Keep the review surface available to continue.
         setExecutionAnswer(undefined);
       }
       if (result.data.failedCount > 0) {
-        message.error(`工具执行失败 ${result.data.failedCount} 个；任务未成功创建或运行，请查看失败节点`);
+        const firstFailure = result.data.failures?.[0];
+        message.error(firstFailure
+          ? `${humanReadableToolName(firstFailure.toolCode)}失败：${firstFailure.message}`
+          : `工具执行失败 ${result.data.failedCount} 个，Agent 已进入失败诊断`);
+        const failureContinuation = result.data.continuation;
+        if (failureContinuation?.assistantReply) {
+          setLiveObservationItems((current) => [...current, {
+            id: `failure-diagnosis-${result.data.runId}`,
+            category: "MODEL",
+            stage: "failure_diagnosis_completed",
+            status: failureContinuation.requiresConfirmation ? "WAITING_APPROVAL" : "SUCCEEDED",
+            title: "Agent 已分析失败事实",
+            summary: failureContinuation.assistantReply || "Agent 已完成失败事实分析。",
+            details: {
+              sourceRunId: result.data.runId,
+              recoveryRunId: failureContinuation.nextRunId,
+              stoppedReason: failureContinuation.stoppedReason,
+            },
+          }]);
+        }
       } else if (taskLifecycleReached) {
         message.success(isScheduledSyncMode(reviewSyncMode)
           ? "同步任务已创建并启用调度，可在同步任务列表查看"
@@ -1820,11 +1858,13 @@ function UserAgentAssistant() {
       });
     },
     onError: (error) => {
-      finishAgentProcess("EXECUTION", "FAILED");
       message.error(errorMessage(error));
     },
-    onSettled: () => {
-      finishAgentProcess("EXECUTION", "SUCCEEDED");
+    onSettled: (data, error) => {
+      finishAgentProcess(
+        "EXECUTION",
+        error || (data?.data.failedCount ?? 0) > 0 ? "FAILED" : "SUCCEEDED",
+      );
       setExecutionInProgress(false);
     },
   });
@@ -1960,15 +2000,26 @@ function UserAgentAssistant() {
   const latestDurableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
     .reverse()
     .find((turn) => turn.sessionId && turn.runId);
-  const activeToolNames = latestDurableTurn?.submittedToolNames?.length
+  const failureRecoveryPlanActive = Boolean(
+    executionAnswer?.recoveryRunId
+    && controlPlane?.runId === executionAnswer.recoveryRunId,
+  );
+  const activeToolNames = failureRecoveryPlanActive
+    ? [...new Set(audits.map((audit) => audit.toolCode))]
+    : latestDurableTurn?.submittedToolNames?.length
     ? latestDurableTurn.submittedToolNames
     : planItems.map((item) => item.toolName);
-  const activeRequiresConfirmation = latestDurableTurn
+  const activeRequiresConfirmation = failureRecoveryPlanActive
+    ? Boolean(executionAnswer?.recoveryRequiresConfirmation)
+      && audits.some((audit) => ["WAITING_APPROVAL", "PLANNED"].includes(audit.state))
+    : latestDurableTurn
     ? ["WAITING_APPROVAL", "HUMAN_TAKEOVER_REQUIRED"].includes(
         plan?.agentDurableModelToolLoop?.stoppedReason ?? "",
       )
     : planItems.some((item) => item.requiresHumanApproval);
-  const confirmationButtonLabel = activeToolNames.includes("datasource.schema.repair.apply")
+  const confirmationButtonLabel = failureRecoveryPlanActive
+    ? "确认并执行 Agent 修复方案"
+    : activeToolNames.includes("datasource.schema.repair.apply")
     ? "确认并应用目标表结构修复"
     : activeToolNames.includes("sync.dirty-record.quarantine.apply")
       ? "确认并隔离所选坏行"
@@ -1981,7 +2032,7 @@ function UserAgentAssistant() {
             : activeToolNames.includes("sync.task.import.commit")
               ? "确认正式导入任务"
               : "确认并执行本次计划";
-  const isRecoveryConfirmation = activeToolNames.some((toolName) => [
+  const isRecoveryConfirmation = failureRecoveryPlanActive || activeToolNames.some((toolName) => [
     "datasource.schema.repair.apply",
     "sync.dirty-record.quarantine.apply",
     "sync.execution.failed-objects.retry",
@@ -3678,7 +3729,7 @@ function UserAgentAssistant() {
 
       {controlPlane && activeToolNames.length && activeRequiresConfirmation ? (
         <Card id="agent-execution-plan-card" title="可观测执行计划" className="compact-card">
-          {isSyncTaskCreationReview ? (
+          {isSyncTaskCreationReview && !failureRecoveryPlanActive ? (
             <div className="agent-configuration-review">
               <div className="agent-configuration-review-header">
                 <Space>
@@ -3879,6 +3930,22 @@ function UserAgentAssistant() {
                     })}
                   </Space>
                 ) : null}
+                {failureRecoveryPlanActive ? (
+                  <Collapse
+                    ghost
+                    size="small"
+                    style={{ marginTop: 8 }}
+                    items={[{
+                      key: `${audit.auditId}-repair-arguments`,
+                      label: "查看本次修复动作参数",
+                      children: (
+                        <pre className="agent-configuration-sql">
+                          {JSON.stringify(sanitizeAgentActionPayload(audit.planArguments), null, 2)}
+                        </pre>
+                      ),
+                    }]}
+                  />
+                ) : null}
               </Card>
             );
           })}
@@ -3896,11 +3963,11 @@ function UserAgentAssistant() {
             danger
             icon={<ArrowRightOutlined />}
             loading={executeMutation.isPending}
-            disabled={Boolean(executionAnswer)
+            disabled={(Boolean(executionAnswer) && !failureRecoveryPlanActive)
               || planMutation.isPending
               || showAdvancedClarification
-              || (isSyncTaskCreationReview && !taskConfigurationReady)
-              || (isSyncTaskCreationReview && !configurationReviewConfirmed)}
+              || (isSyncTaskCreationReview && !failureRecoveryPlanActive && !taskConfigurationReady)
+              || (isSyncTaskCreationReview && !failureRecoveryPlanActive && !configurationReviewConfirmed)}
             onClick={() => executeMutation.mutate()}
           >
             {confirmationButtonLabel}
@@ -3916,11 +3983,67 @@ function UserAgentAssistant() {
           <Alert
             showIcon
             type={executionAnswer.status === "ERROR" ? "error" : "success"}
-            message={executionAnswer.content}
+            message={executionAnswer.status === "ERROR" ? "本轮执行未完成" : executionAnswer.content}
+            description={executionAnswer.status === "ERROR" ? (
+              <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
+                {executionAnswer.content}
+              </Typography.Paragraph>
+            ) : undefined}
           />
+          {executionAnswer.failures?.map((failure, index) => (
+            <div
+              key={failure.auditId || `${failure.toolCode}-${index}`}
+              style={{ padding: "14px 0", borderBottom: "1px solid var(--ant-color-border-secondary)" }}
+            >
+              <Space wrap style={{ marginBottom: 8 }}>
+                <Typography.Text strong>{humanReadableToolName(failure.toolCode)}</Typography.Text>
+                <Tag color="red">{failure.errorCode}</Tag>
+                <Typography.Text type="secondary">{failure.toolCode}</Typography.Text>
+              </Space>
+              <Typography.Paragraph style={{ marginBottom: failure.details.length ? 8 : 0 }}>
+                {failure.message}
+              </Typography.Paragraph>
+              {failure.details.length ? (
+                <div style={{ marginBottom: 8 }}>
+                  <Typography.Text strong>具体问题</Typography.Text>
+                  <Space direction="vertical" size={2} style={{ display: "flex", marginTop: 4 }}>
+                    {failure.details.map((detail) => (
+                      <Typography.Text key={detail}>• {detail}</Typography.Text>
+                    ))}
+                  </Space>
+                </div>
+              ) : null}
+              {failure.suggestions.length ? (
+                <div>
+                  <Typography.Text strong>建议解决方法</Typography.Text>
+                  <Space direction="vertical" size={2} style={{ display: "flex", marginTop: 4 }}>
+                    {failure.suggestions.map((suggestion) => (
+                      <Typography.Text key={suggestion}>• {suggestion}</Typography.Text>
+                    ))}
+                  </Space>
+                </div>
+              ) : null}
+            </div>
+          ))}
+          {executionAnswer.status === "ERROR" ? (
+            <Alert
+              showIcon
+              type={executionAnswer.recoveryRunId ? "info" : "warning"}
+              message={executionAnswer.recoveryRunId
+                ? (executionAnswer.recoveryRequiresConfirmation
+                  ? "Agent 已完成只读诊断，并形成需要你确认的修复方案"
+                  : "Agent 已创建后续诊断 Run")
+                : "Agent 已完成失败分析，但尚未形成可执行修复动作"}
+              description={executionAnswer.recoveryRunId
+                ? `后续 Run：${executionAnswer.recoveryRunId}。只读检查可自动执行；修改任务、表结构或数据前仍需你明确确认。`
+                : "失败事实已保留。你可以继续用自然语言补充信息，Agent 会基于当前会话继续排查。"}
+              style={{ marginTop: 12 }}
+            />
+          ) : null}
           <Space wrap style={{ marginTop: 12 }}>
             {executionAnswer.taskId ? <Tag color="blue">任务 ID：{executionAnswer.taskId}</Tag> : null}
             {executionAnswer.executionId ? <Tag>执行 ID：{executionAnswer.executionId}</Tag> : null}
+            {executionAnswer.continuationStatus ? <Tag>诊断状态：{executionAnswer.continuationStatus}</Tag> : null}
             {executionAnswer.status === "SUCCESS" ? (
               <Button type="primary" icon={<DatabaseOutlined />} onClick={() => navigate("/sync")}>
                 查看同步任务列表

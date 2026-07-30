@@ -1320,11 +1320,22 @@ export interface AgentRunConfirmedExecutionResponse {
   succeededCount: number;
   failedCount: number;
   toolResults: AgentToolExecutionResult[];
+  failures: AgentToolExecutionFailure[];
   nextActions: string[];
   assistantReply: string;
   answerMode: string;
   modelProviderStatus: string;
   continuation?: AgentPostConfirmContinuation;
+}
+
+export interface AgentToolExecutionFailure {
+  auditId?: string;
+  toolCode: string;
+  errorCode: string;
+  message: string;
+  outputSummary?: string;
+  details: string[];
+  suggestions: string[];
 }
 
 export interface AgentPostConfirmContinuation {
