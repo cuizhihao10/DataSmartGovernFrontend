@@ -1195,6 +1195,8 @@ export interface AgentResolvedSyncConfiguration {
   targetTableResolution?: string;
   objectMappings: JsonObject[];
   objectMappingSource?: string;
+  fieldMappingSource?: string;
+  mappingDefaultsConfirmed?: boolean;
   autoFilledFields: string[];
   payloadPolicy?: string;
 }

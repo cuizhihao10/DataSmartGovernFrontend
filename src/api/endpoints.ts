@@ -2094,6 +2094,10 @@ function normalizeAgentConversation(value: unknown): AgentConversation | undefin
       targetTableResolution: readOptionalString(resolved.targetTableResolution),
       objectMappings: resolvedMappings,
       objectMappingSource: readOptionalString(resolved.objectMappingSource),
+      fieldMappingSource: readOptionalString(resolved.fieldMappingSource),
+      mappingDefaultsConfirmed: resolved.mappingDefaultsConfirmed === undefined
+        ? undefined
+        : readBoolean(resolved.mappingDefaultsConfirmed),
       autoFilledFields: readStringArray(resolved.autoFilledFields),
       payloadPolicy: readOptionalString(resolved.payloadPolicy),
     },

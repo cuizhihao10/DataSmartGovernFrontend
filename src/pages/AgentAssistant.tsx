@@ -102,6 +102,7 @@ interface ClarificationFormValues {
   customSqlText?: string;
   customSqlConfirmed?: boolean;
   targetTableResolution?: "CREATE_FROM_SOURCE" | "SELECT_EXISTING";
+  mappingDefaultsConfirmed?: boolean;
   objectMappings: ObjectMappingInput[];
 }
 
@@ -113,6 +114,7 @@ interface QuickClarificationValues {
   scheduleCron?: string;
   customSqlConfirmed?: boolean;
   targetTableResolution?: "CREATE_FROM_SOURCE" | "SELECT_EXISTING";
+  mappingDefaultsConfirmed?: boolean;
 }
 
 type AgentScheduleFrequency = "HOURLY" | "DAILY" | "WEEKLY" | "CUSTOM_CRON";
@@ -139,6 +141,7 @@ interface ExecutionAnswer {
   content: string;
   mode: string;
   modelProviderStatus: string;
+  status: "SUCCESS" | "WARNING" | "ERROR";
 }
 
 type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED";
@@ -236,7 +239,9 @@ const syncModeLabels: Record<string, string> = {
 const clarificationParameterLabels: Record<string, string> = {
   sourceDatasourceId: "源端数据源",
   targetDatasourceId: "目标端数据源",
-  objectMappings: "源表到目标表的对象映射、字段映射和可选 WHERE 条件",
+  objectMappings: "源表到目标表的对象映射",
+  fieldMappings: "每条对象映射中至少一个有效字段映射",
+  mappingDefaultsConfirmation: "默认同名字段映射与无 WHERE 范围确认",
   scheduleFrequency: "定期任务执行频率",
   scheduleStartTime: "首次执行时间",
   customSqlConfirmation: "SQL 内容确认",
@@ -850,6 +855,7 @@ function UserAgentAssistant() {
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
   const autoAdvanceTurnRef = useRef<string>();
+  const mappingDefaultsPromptTurnRef = useRef<string>();
   const processStartedAtRef = useRef<number>();
   const streamElapsedMsRef = useRef<number>();
   const processOwnerRef = useRef<"PLAN" | "EXECUTION">();
@@ -906,6 +912,7 @@ function UserAgentAssistant() {
   const clarificationWriteStrategy = Form.useWatch("writeStrategy", clarificationForm);
   const clarificationScheduleConfig = Form.useWatch("scheduleConfig", clarificationForm);
   const clarificationCustomSqlText = Form.useWatch("customSqlText", clarificationForm);
+  const clarificationMappingDefaultsConfirmed = Form.useWatch("mappingDefaultsConfirmed", clarificationForm);
   const watchedClarificationMappings = Form.useWatch("objectMappings", clarificationForm);
   const clarificationMappings = useMemo(
     () => watchedClarificationMappings ?? [],
@@ -991,7 +998,11 @@ function UserAgentAssistant() {
       ...mappings[index],
       ...patch,
     };
-    clarificationForm.setFieldValue("objectMappings", mappings);
+    clarificationForm.setFieldsValue({
+      objectMappings: mappings,
+      mappingDefaultsConfirmed: false,
+    });
+    quickClarificationForm.setFieldValue("mappingDefaultsConfirmed", false);
   };
 
   const selectSourceMappingTable = (index: number, sourceTableKey: string) => {
@@ -1060,6 +1071,7 @@ function UserAgentAssistant() {
           || '{"cron":"0 0 2 * * ?","timezone":"Asia/Shanghai"}'
         : undefined,
       customSqlText: sql ? clarificationForm.getFieldValue("customSqlText") : undefined,
+      mappingDefaultsConfirmed: false,
       objectMappings: sql
         ? [{
             objectKey: "agent-sql-result",
@@ -1301,6 +1313,9 @@ function UserAgentAssistant() {
         if (clarification.targetTableResolution) {
           dataSyncRequest.targetTableResolution = clarification.targetTableResolution;
         }
+        if (clarification.mappingDefaultsConfirmed !== undefined) {
+          dataSyncRequest.mappingDefaultsConfirmed = clarification.mappingDefaultsConfirmed;
+        }
         if (clarification.objectMappings?.length) {
           dataSyncRequest.objectMappings = clarification.objectMappings.map((item, index) => ({
             objectKey: item.objectKey || `agent-mapping-${index + 1}`,
@@ -1453,6 +1468,8 @@ function UserAgentAssistant() {
             || resolved.targetTableResolution === "SELECT_EXISTING"
             ? resolved.targetTableResolution
             : currentValues.targetTableResolution,
+          mappingDefaultsConfirmed: resolved.mappingDefaultsConfirmed
+            ?? currentValues.mappingDefaultsConfirmed,
           objectMappings: resolvedMappings.length
             ? resolvedMappings
             : currentValues.objectMappings?.length
@@ -1486,7 +1503,20 @@ function UserAgentAssistant() {
 
       if (conversation?.phase === "WAITING_CLARIFICATION") {
         setControlPlane(undefined);
-        setShowAdvancedClarification(false);
+        const missing = new Set(conversation.missingParameters);
+        const needsDirectMappingEditor = missing.has("objectMappings") || missing.has("fieldMappings");
+        const hasEarlierProgressiveQuestion = [
+          "sourceDatasourceId",
+          "targetDatasourceId",
+          "scheduleFrequency",
+          "scheduleStartTime",
+          "customSqlText",
+          "customSqlConfirmation",
+          "targetTableResolution",
+          "fieldMappingConversions",
+          "mappingDefaultsConfirmation",
+        ].some((parameter) => missing.has(parameter));
+        setShowAdvancedClarification(needsDirectMappingEditor && !hasEarlierProgressiveQuestion);
         message.info("Agent 已理解目标，请补充执行所需参数");
         return;
       }
@@ -1584,15 +1614,33 @@ function UserAgentAssistant() {
         }));
         return [...merged.values()];
       });
+      const succeededToolCodes = new Set(result.data.toolResults
+        .filter((item) => item.audit.state === "SUCCEEDED")
+        .map((item) => item.audit.toolCode));
+      const taskLifecycleReached = [
+        "sync.task.draft.save",
+        "sync.task.precheck",
+        "sync.task.publish",
+        "sync.task.run",
+        "sync.execution.status",
+      ].some((toolCode) => succeededToolCodes.has(toolCode));
+      const answerStatus: ExecutionAnswer["status"] = result.data.failedCount > 0
+        ? "ERROR"
+        : taskLifecycleReached
+          ? "SUCCESS"
+          : "WARNING";
       setExecutionAnswer({
         content: result.data.assistantReply || "工具执行已经结束，请查看节点状态。",
         mode: result.data.answerMode || "DETERMINISTIC_FALLBACK",
         modelProviderStatus: result.data.modelProviderStatus || "RESERVED_NOT_INVOKED",
+        status: answerStatus,
       });
       if (result.data.failedCount > 0) {
-        message.error(`Agent 计划有 ${result.data.failedCount} 个节点失败，请查看节点详情`);
-      } else {
+        message.error(`工具执行失败 ${result.data.failedCount} 个；任务未成功创建或运行，请查看失败节点`);
+      } else if (taskLifecycleReached) {
         message.success("Agent 控制面节点已执行完成，同步任务已进入真实业务执行链路");
+      } else {
+        message.info("本轮只完成只读工具核对，尚未创建或运行同步任务");
       }
       await auditsQuery.refetch();
       const repairedArtifactRef = result.data.toolResults
@@ -1709,13 +1757,60 @@ function UserAgentAssistant() {
   const needsSourceDatasource = missingParameterSet.has("sourceDatasourceId");
   const needsTargetDatasource = missingParameterSet.has("targetDatasourceId");
   const needsObjectMappings = missingParameterSet.has("objectMappings");
+  const backendNeedsFieldMappings = missingParameterSet.has("fieldMappings");
+  const metadataBackedDefaultMappingsReady = backendNeedsFieldMappings && Boolean(
+    sourceMetadata
+    && targetMetadata
+    && clarificationMappings.length
+    && clarificationMappings.every((mapping) => {
+      const sourceTable = findMetadataTableByName(
+        sourceMetadata,
+        mapping.sourceSchemaName,
+        mapping.sourceObjectName,
+      );
+      const targetTable = findMetadataTableByName(
+        targetMetadata,
+        mapping.targetSchemaName,
+        mapping.targetObjectName,
+      );
+      if (!sourceTable || !targetTable) return false;
+      const sourceFields = new Set(sortedColumns(sourceTable).map((field) => field.fieldName.toLowerCase()));
+      const targetFields = new Set(sortedColumns(targetTable).map((field) => field.fieldName.toLowerCase()));
+      const enabledFields = mapping.fieldMappings.filter(
+        (field) => field.syncEnabled !== false && field.sourceField && field.targetField,
+      );
+      return enabledFields.length > 0 && enabledFields.every((field) => (
+        field.sourceField.toLowerCase() === field.targetField.toLowerCase()
+        && sourceFields.has(field.sourceField.toLowerCase())
+        && targetFields.has(field.targetField.toLowerCase())
+      ));
+    })
+  );
+  const needsFieldMappings = backendNeedsFieldMappings && !metadataBackedDefaultMappingsReady;
+  const needsMappingDefaultsConfirmation = missingParameterSet.has("mappingDefaultsConfirmation")
+    || metadataBackedDefaultMappingsReady;
   const needsScheduleFrequency = missingParameterSet.has("scheduleFrequency");
   const needsScheduleStartTime = missingParameterSet.has("scheduleStartTime");
   const needsSqlConfirmation = missingParameterSet.has("customSqlConfirmation");
   const needsTargetTableResolution = missingParameterSet.has("targetTableResolution");
   const needsFieldMappingConversions = missingParameterSet.has("fieldMappingConversions");
-  const missingParameterLabels = (conversation?.missingParameters ?? [])
+  const effectiveMissingParameters = (conversation?.missingParameters ?? []).map((parameterName) => (
+    parameterName === "fieldMappings" && metadataBackedDefaultMappingsReady
+      ? "mappingDefaultsConfirmation"
+      : parameterName
+  ));
+  const missingParameterLabels = [...new Set(effectiveMissingParameters)]
     .map(clarificationParameterLabel);
+  const metadataDefaultFieldCount = clarificationMappings.reduce(
+    (count, mapping) => count + mapping.fieldMappings.filter(
+      (field) => field.syncEnabled !== false && field.sourceField && field.targetField,
+    ).length,
+    0,
+  );
+  const metadataDefaultsConfirmationMessage = metadataBackedDefaultMappingsReady
+    ? `我已根据两端真实元数据，为 ${clarificationMappings.length} 条表映射预设 ${metadataDefaultFieldCount} 个同名字段；`
+      + "当前每条映射的 WHERE 均为空，表示同步该表的全部数据。请确认采用这些默认值，或打开当前页编辑器调整字段映射和 WHERE 条件。"
+    : conversation?.assistantMessage || "请补充当前任务执行所需的信息。";
   const sourceClarification = conversation?.clarificationQuestions.find(
     (question) => question.parameterName === "sourceDatasourceId",
   );
@@ -1724,6 +1819,9 @@ function UserAgentAssistant() {
   );
   const sqlConfirmationQuestion = conversation?.clarificationQuestions.find(
     (question) => question.parameterName === "customSqlConfirmation",
+  );
+  const mappingDefaultsQuestion = conversation?.clarificationQuestions.find(
+    (question) => question.parameterName === "mappingDefaultsConfirmation",
   );
   const generatedSqlPreview = sqlConfirmationQuestion?.configurationPreview?.customSqlText;
   const quickScheduleFrequency = Form.useWatch("scheduleFrequency", quickClarificationForm);
@@ -1744,7 +1842,8 @@ function UserAgentAssistant() {
     || needsScheduleFrequency
     || needsScheduleStartTime
     || needsSqlConfirmation
-    || needsTargetTableResolution;
+    || needsTargetTableResolution
+    || needsMappingDefaultsConfirmation;
   const planItems = plan?.plan?.toolPlans ?? [];
   const latestDurableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
     .reverse()
@@ -1953,8 +2052,50 @@ function UserAgentAssistant() {
         fieldMappings,
       };
     });
-    if (changed) clarificationForm.setFieldValue("objectMappings", nextMappings);
-  }, [clarificationForm, clarificationMappings, sourceMetadata, targetMetadata]);
+    if (changed) {
+      clarificationForm.setFieldsValue({
+        objectMappings: nextMappings,
+        mappingDefaultsConfirmed: false,
+      });
+      quickClarificationForm.setFieldValue("mappingDefaultsConfirmed", false);
+    }
+  }, [clarificationForm, clarificationMappings, quickClarificationForm, sourceMetadata, targetMetadata]);
+
+  useEffect(() => {
+    if (!metadataBackedDefaultMappingsReady || planMutation.isPending) return;
+    const turnKey = [
+      conversation?.turnId || plan?.plan?.requestId || "mapping-defaults",
+      ...clarificationMappings.map((mapping) => (
+        `${mapping.sourceSchemaName || ""}.${mapping.sourceObjectName}->`
+        + `${mapping.targetSchemaName || ""}.${mapping.targetObjectName}`
+      )),
+    ].join("|");
+    if (mappingDefaultsPromptTurnRef.current === turnKey) return;
+    mappingDefaultsPromptTurnRef.current = turnKey;
+
+    // The backend control-plane summary can intentionally omit column details.
+    // Once the browser has loaded both authorized metadata snapshots, convert the
+    // generic "missing fields" state into the actual user decision: accept the
+    // verified same-name defaults or edit individual fields/WHERE expressions.
+    setShowAdvancedClarification(false);
+    clarificationForm.setFieldValue("mappingDefaultsConfirmed", false);
+    quickClarificationForm.setFieldValue("mappingDefaultsConfirmed", false);
+    const messageId = `agent-mapping-defaults-${turnKey}`;
+    setConversationMessages((current) => (
+      current.some((item) => item.id === messageId)
+        ? current
+        : [...current, { id: messageId, role: "AGENT", content: metadataDefaultsConfirmationMessage }]
+    ));
+  }, [
+    clarificationForm,
+    clarificationMappings,
+    conversation?.turnId,
+    metadataBackedDefaultMappingsReady,
+    metadataDefaultsConfirmationMessage,
+    plan?.plan?.requestId,
+    planMutation.isPending,
+    quickClarificationForm,
+  ]);
 
   useEffect(() => {
     const resolved = conversation?.resolvedConfiguration;
@@ -2044,6 +2185,7 @@ function UserAgentAssistant() {
     setConfigurationReviewConfirmed(false);
     reviewEditSnapshotRef.current = undefined;
     autoAdvanceTurnRef.current = undefined;
+    mappingDefaultsPromptTurnRef.current = undefined;
     clarificationForm.resetFields();
     quickClarificationForm.resetFields();
     setConversationMessages([{
@@ -2180,6 +2322,74 @@ function UserAgentAssistant() {
   const reviewCustomSqlText = clarificationCustomSqlText || resolvedConfiguration?.customSqlText;
   const isSyncTaskCreationReview = conversation?.structuredIntent.intentType === "CREATE_DATA_SYNC_TASK"
     || activeToolNames.includes("sync.task.draft.save");
+  const configurationReadinessIssues: string[] = [];
+  if (isSyncTaskCreationReview) {
+    if (!clarificationSourceDatasourceId) configurationReadinessIssues.push("尚未选择源端数据源");
+    if (!clarificationTargetDatasourceId) configurationReadinessIssues.push("尚未选择目标端数据源");
+    if (sourceMetadataQuery.isLoading || targetMetadataQuery.isLoading) {
+      configurationReadinessIssues.push("两端真实元数据仍在加载，请等待字段核对完成");
+    } else {
+      if (!sourceMetadata) configurationReadinessIssues.push("尚未取得源端真实表和字段元数据");
+      if (!targetMetadata) configurationReadinessIssues.push("尚未取得目标端真实表和字段元数据");
+    }
+    if (!reviewMappings.length) configurationReadinessIssues.push("尚未配置任何源表到目标表映射");
+    reviewMappings.forEach((mapping, index) => {
+      const label = `映射 ${index + 1}`;
+      if (!isSqlSyncMode(reviewSyncMode) && !mapping.sourceObjectName) {
+        configurationReadinessIssues.push(`${label} 尚未选择源表`);
+      }
+      if (!mapping.targetObjectName) configurationReadinessIssues.push(`${label} 尚未选择或填写目标表`);
+      if (!isSqlSyncMode(reviewSyncMode) && !sourceSchemaOptional && !mapping.sourceSchemaName) {
+        configurationReadinessIssues.push(`${label} 缺少源端 schema`);
+      }
+      if (!targetSchemaOptional && !mapping.targetSchemaName) {
+        configurationReadinessIssues.push(`${label} 缺少目标端 schema`);
+      }
+      const sourceTable = isSqlSyncMode(reviewSyncMode)
+        ? undefined
+        : findMetadataTableByName(sourceMetadata, mapping.sourceSchemaName, mapping.sourceObjectName);
+      const targetTable = findMetadataTableByName(
+        targetMetadata,
+        mapping.targetSchemaName,
+        mapping.targetObjectName,
+      );
+      if (!isSqlSyncMode(reviewSyncMode) && mapping.sourceObjectName && !sourceTable) {
+        configurationReadinessIssues.push(`${label} 的源表不在真实元数据中`);
+      }
+      if (mapping.targetObjectName && !targetTable) {
+        configurationReadinessIssues.push(`${label} 的目标表不在真实元数据中`);
+      }
+      const enabledFields = mapping.fieldMappings.filter(
+        (field) => field.syncEnabled !== false && field.sourceField && field.targetField,
+      );
+      if (!enabledFields.length) {
+        configurationReadinessIssues.push(`${label} 没有已确认的有效字段映射`);
+      }
+      const sourceFieldNames = new Set(sortedColumns(sourceTable).map((field) => field.fieldName.toLowerCase()));
+      const targetFieldNames = new Set(sortedColumns(targetTable).map((field) => field.fieldName.toLowerCase()));
+      enabledFields.forEach((field) => {
+        if (!isSqlSyncMode(reviewSyncMode) && !sourceFieldNames.has(field.sourceField.toLowerCase())) {
+          configurationReadinessIssues.push(`${label} 的源字段 ${field.sourceField} 不存在`);
+        }
+        if (!targetFieldNames.has(field.targetField.toLowerCase())) {
+          configurationReadinessIssues.push(`${label} 的目标字段 ${field.targetField} 不存在`);
+        }
+      });
+    });
+    if (isScheduledSyncMode(reviewSyncMode) && !reviewScheduleConfig?.trim()) {
+      configurationReadinessIssues.push("定期任务缺少调度周期和首次执行时间");
+    }
+    if (isSqlSyncMode(reviewSyncMode) && !reviewCustomSqlText?.trim()) {
+      configurationReadinessIssues.push("SQL 语句模式缺少只读 SQL");
+    }
+    const defaultFieldsRequireConfirmation = needsMappingDefaultsConfirmation
+      || resolvedConfiguration?.fieldMappingSource === "VERIFIED_METADATA_SAME_NAME_FIELDS";
+    if (defaultFieldsRequireConfirmation && !clarificationMappingDefaultsConfirmed) {
+      configurationReadinessIssues.push("尚未确认 Agent 默认的同名字段映射与无 WHERE 数据范围");
+    }
+  }
+  const uniqueConfigurationReadinessIssues = [...new Set(configurationReadinessIssues)];
+  const taskConfigurationReady = uniqueConfigurationReadinessIssues.length === 0;
   const editingReadyConfiguration = showAdvancedClarification
     && conversation?.phase !== "WAITING_CLARIFICATION";
 
@@ -2674,7 +2884,11 @@ function UserAgentAssistant() {
       {conversation && (conversation.phase === "WAITING_CLARIFICATION" || showAdvancedClarification) ? (
         <Card
           id="agent-clarification-card"
-          title={editingReadyConfiguration ? "修改 Agent 任务配置" : "高级配置（仅在自动补全失败时使用）"}
+          title={editingReadyConfiguration
+            ? "修改 Agent 任务配置"
+            : showAdvancedClarification
+              ? "高级配置"
+              : "补充与确认任务配置"}
           className="compact-card"
         >
           <Alert
@@ -2688,7 +2902,7 @@ function UserAgentAssistant() {
                 <Typography.Text>
                   {editingReadyConfiguration
                     ? "你可以调整任务名称、模式、数据源、对象映射、字段映射、WHERE、调度或 SQL。旧计划在配置发生变化后立即失效。"
-                    : conversation.assistantMessage}
+                    : metadataDefaultsConfirmationMessage}
                 </Typography.Text>
                 {!editingReadyConfiguration ? (
                   <Space wrap>
@@ -2712,8 +2926,8 @@ function UserAgentAssistant() {
                   ? "只需回答当前缺失或存在歧义的信息"
                   : "Agent 已完成自动核对，但对象映射仍需要你确认"}
                 description={hasQuickClarificationFields
-                  ? `${conversation.assistantMessage} 提交后 Agent 会继续测试连接、读取真实元数据并尝试形成完整任务。`
-                  : `${conversation.assistantMessage} 你可以切换到高级编辑器接管存在冲突的映射；其余内容继续沿用当前会话。`}
+                  ? `${metadataDefaultsConfirmationMessage} 提交后 Agent 会继续测试连接、读取真实元数据并尝试形成完整任务。`
+                  : `${metadataDefaultsConfirmationMessage} 你可以切换到高级编辑器接管存在冲突的映射；其余内容继续沿用当前会话。`}
                 style={{ marginBottom: 16 }}
               />
               {hasQuickClarificationFields ? (
@@ -2725,9 +2939,11 @@ function UserAgentAssistant() {
                       handoffToManualWizard();
                       return;
                     }
+                    const currentConfiguration = clarificationForm.getFieldsValue(true);
                     planMutation.mutate({
                       objective,
                       clarification: {
+                        ...currentConfiguration,
                         ...values,
                         customSqlText: values.customSqlConfirmed ? generatedSqlPreview : undefined,
                       },
@@ -2838,6 +3054,52 @@ function UserAgentAssistant() {
                       ]} />
                     </Form.Item>
                   ) : null}
+                  {needsMappingDefaultsConfirmation ? (
+                    <Card size="small" title="确认 Agent 自动补全的字段与数据范围" style={{ marginBottom: 16 }}>
+                      <Alert
+                        showIcon
+                        type="info"
+                        message="默认映射真实存在于两端的全部同名字段"
+                        description={mappingDefaultsQuestion?.question
+                          || "当前 WHERE 为空，将同步每条对象映射范围内的全部数据。你可以接受默认配置，也可以打开当前页编辑器逐表修改。"}
+                        style={{ marginBottom: 12 }}
+                      />
+                      <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                        {reviewMappings.map((mapping, index) => {
+                          const enabledFields = mapping.fieldMappings.filter(
+                            (field) => field.syncEnabled !== false && field.sourceField && field.targetField,
+                          );
+                          return (
+                            <div key={mapping.objectKey || `default-review-${index}`} className="agent-default-mapping-row">
+                              <Typography.Text strong>
+                                {mapping.sourceObjectName || "未选择源表"} → {mapping.targetSchemaName
+                                  ? `${mapping.targetSchemaName}.${mapping.targetObjectName}`
+                                  : mapping.targetObjectName || "未选择目标表"}
+                              </Typography.Text>
+                              <Space wrap>
+                                <Tag color={enabledFields.length ? "blue" : "red"}>
+                                  {enabledFields.length} 个同名字段
+                                </Tag>
+                                <Tag>{mapping.whereCondition ? `WHERE ${mapping.whereCondition}` : "无 WHERE，默认同步全部数据"}</Tag>
+                              </Space>
+                            </div>
+                          );
+                        })}
+                      </Space>
+                      <Form.Item
+                        name="mappingDefaultsConfirmed"
+                        valuePropName="checked"
+                        rules={[{
+                          validator: async (_, checked?: boolean) => {
+                            if (!checked) throw new Error("请接受默认配置，或打开当前页编辑器修改字段映射/WHERE");
+                          },
+                        }]}
+                        style={{ marginTop: 12, marginBottom: 0 }}
+                      >
+                        <Checkbox>接受以上同名字段映射，并确认当前不设置 WHERE 条件</Checkbox>
+                      </Form.Item>
+                    </Card>
+                  ) : null}
                   <Space wrap>
                     <Button
                       type="primary"
@@ -2876,7 +3138,10 @@ function UserAgentAssistant() {
             onValuesChange={invalidateConfigurationReview}
             onFinish={(values) => planMutation.mutate({
               objective,
-              clarification: values,
+              clarification: {
+                ...values,
+                mappingDefaultsConfirmed: true,
+              },
               preserveTimeline: true,
             })}
           >
@@ -2914,11 +3179,17 @@ function UserAgentAssistant() {
                   options={sourceOptions}
                   loading={sourceQuery.isLoading}
                   placeholder="仅展示 SOURCE 数据源"
-                  onChange={() => clarificationForm.setFieldValue("objectMappings", [{
-                    objectKey: sqlClarificationMode ? "agent-sql-result" : "agent-mapping-1",
-                    targetObjectName: "",
-                    fieldMappings: [],
-                  }])}
+                  onChange={() => {
+                    clarificationForm.setFieldsValue({
+                      mappingDefaultsConfirmed: false,
+                      objectMappings: [{
+                        objectKey: sqlClarificationMode ? "agent-sql-result" : "agent-mapping-1",
+                        targetObjectName: "",
+                        fieldMappings: [],
+                      }],
+                    });
+                    quickClarificationForm.setFieldValue("mappingDefaultsConfirmed", false);
+                  }}
                 />
               </Form.Item>
               <Form.Item name="targetDatasourceId" label="目标端数据源" rules={[{ required: true, message: "请选择目标端数据源" }]}>
@@ -2928,11 +3199,17 @@ function UserAgentAssistant() {
                   options={targetOptions}
                   loading={targetQuery.isLoading}
                   placeholder="仅展示 TARGET 数据源"
-                  onChange={() => clarificationForm.setFieldValue("objectMappings", [{
-                    objectKey: sqlClarificationMode ? "agent-sql-result" : "agent-mapping-1",
-                    targetObjectName: "",
-                    fieldMappings: [],
-                  }])}
+                  onChange={() => {
+                    clarificationForm.setFieldsValue({
+                      mappingDefaultsConfirmed: false,
+                      objectMappings: [{
+                        objectKey: sqlClarificationMode ? "agent-sql-result" : "agent-mapping-1",
+                        targetObjectName: "",
+                        fieldMappings: [],
+                      }],
+                    });
+                    quickClarificationForm.setFieldValue("mappingDefaultsConfirmed", false);
+                  }}
                 />
               </Form.Item>
             </div>
@@ -2951,6 +3228,15 @@ function UserAgentAssistant() {
                 type="error"
                 message="元数据加载失败，暂时不能形成可靠的源表到目标表映射"
                 description="请确认数据源连接及授权后重试。Agent 不会在缺少真实元数据时猜测表名或字段映射。"
+                style={{ marginBottom: 16 }}
+              />
+            ) : null}
+            {needsFieldMappings ? (
+              <Alert
+                showIcon
+                type="warning"
+                message="每条对象映射都必须确认至少一个字段"
+                description="请先选择真实源表和目标表。系统会列出源表字段，并默认启用两端同名字段；你可以关闭不需要同步的字段或修改目标字段。"
                 style={{ marginBottom: 16 }}
               />
             ) : null}
@@ -3103,12 +3389,34 @@ function UserAgentAssistant() {
                           </Form.Item>
                         </div>
                         {!sqlClarificationMode ? (
-                          <Form.Item name={[field.name, "whereCondition"]} label="当前源表的可选 WHERE 条件">
-                            <Input placeholder="例如 status = 'ACTIVE'，由 data-sync 安全解析与预检查" />
+                          <Form.Item
+                            name={[field.name, "whereCondition"]}
+                            label="当前源表的 WHERE 条件（可选）"
+                            extra="留空表示不筛选，将同步该对象映射范围内的全部数据。"
+                          >
+                            <Input placeholder="例如 status = 'ACTIVE'；支持 OR、括号、函数和子查询" />
                           </Form.Item>
+                        ) : null}
+                        {!mapping?.fieldMappings?.some(
+                          (item) => item.syncEnabled !== false && item.sourceField && item.targetField,
+                        ) ? (
+                          <Alert
+                            showIcon
+                            type="error"
+                            message="当前映射没有可同步字段"
+                            description={!mapping?.sourceObjectName
+                              ? "请先选择源端真实表，系统才能读取并展示源字段。"
+                              : !mapping?.targetObjectName
+                                ? "请再选择或填写目标表；目标表存在于真实元数据后，系统会默认映射同名字段。"
+                                : "两端表没有可用同名字段，或目标表尚未匹配真实元数据。请检查目标 schema/表名并手动选择目标字段。"}
+                            style={{ marginBottom: 12 }}
+                          />
                         ) : null}
                         <Collapse
                           size="small"
+                          defaultActiveKey={(needsFieldMappings || !mapping?.fieldMappings?.length)
+                            ? [`fields-${field.key}`]
+                            : undefined}
                           items={[{
                             key: `fields-${field.key}`,
                             label: `字段映射（${mapping?.fieldMappings?.length ?? 0} 个源字段）`,
@@ -3147,6 +3455,11 @@ function UserAgentAssistant() {
                                             </Button>
                                           ) : null}
                                         </Space>
+                                        {mapping?.fieldMappings?.[fieldRow.name]?.compatibilityNote ? (
+                                          <Typography.Text type="secondary">
+                                            {mapping.fieldMappings[fieldRow.name].compatibilityNote}
+                                          </Typography.Text>
+                                        ) : null}
                                       </Card>
                                     ))}
                                     {sqlClarificationMode ? (
@@ -3197,7 +3510,7 @@ function UserAgentAssistant() {
                 htmlType="submit"
                 icon={<ArrowRightOutlined />}
                 loading={planMutation.isPending && Boolean(planMutation.variables?.clarification)}
-                disabled={!hasDatasourceOptions}
+                disabled={!hasDatasourceOptions || sourceMetadataQuery.isLoading || targetMetadataQuery.isLoading}
               >
                 {editingReadyConfiguration ? "保存修改并重新生成审核计划" : "提交补充信息并生成计划"}
               </Button>
@@ -3228,6 +3541,32 @@ function UserAgentAssistant() {
                 description="以下内容是本次写入任务草稿、预检查、发布和运行所使用的最新配置。你可以只修改不认可的部分；任何修改都会使当前执行计划失效并重新生成。"
                 style={{ marginBottom: 16 }}
               />
+              {!taskConfigurationReady ? (
+                <Alert
+                  showIcon
+                  type="error"
+                  message="当前配置不具备创建或执行条件"
+                  description={(
+                    <Space direction="vertical" size={4}>
+                      {uniqueConfigurationReadinessIssues.map((issue) => (
+                        <Typography.Text key={issue}>• {issue}</Typography.Text>
+                      ))}
+                      <Typography.Text type="secondary">
+                        请用对话补充，或在当前页修改设置。所有必填项和真实元数据校验通过后才能确认执行。
+                      </Typography.Text>
+                    </Space>
+                  )}
+                  style={{ marginBottom: 16 }}
+                />
+              ) : (
+                <Alert
+                  showIcon
+                  type="success"
+                  message="任务必填配置与真实元数据核对已通过"
+                  description="对象、字段、数据范围和模式必填项均已形成可审核配置；最终数据库准入仍由真实预检查决定。"
+                  style={{ marginBottom: 16 }}
+                />
+              )}
               <Descriptions
                 size="small"
                 bordered
@@ -3336,7 +3675,7 @@ function UserAgentAssistant() {
                 </Space>
                 <Checkbox
                   checked={configurationReviewConfirmed}
-                  disabled={planMutation.isPending || showAdvancedClarification}
+                  disabled={planMutation.isPending || showAdvancedClarification || !taskConfigurationReady}
                   onChange={(event) => setConfigurationReviewConfirmed(event.target.checked)}
                 >
                   我已审核以上最新任务配置，同意按此配置执行
@@ -3404,6 +3743,7 @@ function UserAgentAssistant() {
             disabled={Boolean(executionAnswer)
               || planMutation.isPending
               || showAdvancedClarification
+              || (isSyncTaskCreationReview && !taskConfigurationReady)
               || (isSyncTaskCreationReview && !configurationReviewConfirmed)}
             onClick={() => executeMutation.mutate()}
           >
@@ -3416,7 +3756,9 @@ function UserAgentAssistant() {
         <Card title="执行结论" className="compact-card">
           <Alert
             showIcon
-            type={executionResults.some((item) => item.audit.state === "FAILED") ? "error" : "success"}
+            type={executionAnswer.status === "ERROR"
+              ? "error"
+              : executionAnswer.status === "WARNING" ? "warning" : "success"}
             message={executionAnswer.content}
           />
           <Space wrap style={{ marginTop: 12 }}>
