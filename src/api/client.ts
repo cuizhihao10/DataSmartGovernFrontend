@@ -305,11 +305,12 @@ export async function streamJsonLines<TFrame>(
   path: string,
   payload: unknown,
   onFrame: (frame: TFrame) => void,
+  options: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const sanitizedPath = sanitizeBusinessPath(path);
   const response = await fetchWithAuthRetry(
     sanitizedPath,
-    { method: "POST", body: JSON.stringify(payload) },
+    { method: "POST", body: JSON.stringify(payload), signal: options.signal },
     "application/x-ndjson, application/json",
     "application/json",
   );

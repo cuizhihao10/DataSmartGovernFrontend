@@ -700,12 +700,21 @@ export interface AgentPlanStreamProgressEvent {
 }
 
 export interface AgentPlanStreamFrame {
-  type: "accepted" | "progress" | "heartbeat" | "result" | "error" | string;
+  type: "accepted" | "progress" | "heartbeat" | "result" | "cancelled" | "error" | string;
   requestId?: string;
   elapsedMs?: number;
   event?: AgentPlanStreamProgressEvent;
   data?: unknown;
+  reason?: string;
+  message?: string;
   error?: { code?: string; message?: string; errorType?: string };
+}
+
+export interface AgentPlanCancellationResponse {
+  requestId: string;
+  state: "ACTIVE" | "CANCELLED" | "COMPLETED" | "NOT_FOUND" | string;
+  cancelled: boolean;
+  reason?: string;
 }
 
 export interface AgentRagQueryPayload {
@@ -2815,6 +2824,7 @@ export const api = {
   createAgentPlanStream: async (
     payload: CreateAgentPlanPayload,
     onFrame: (frame: AgentPlanStreamFrame) => void,
+    options: { signal?: AbortSignal } = {},
   ) => {
     let finalResponse: AgentPlanResponse | undefined;
     await streamJsonLines<AgentPlanStreamFrame>("/agent/plans/stream", payload, (frame) => {
@@ -2825,10 +2835,13 @@ export const api = {
           { reason: frame.error?.code },
         );
       }
+      if (frame.type === "cancelled") {
+        throw new DOMException(frame.message || "用户已停止本轮 Agent 处理。", "AbortError");
+      }
       if (frame.type === "result") {
         finalResponse = normalizeAgentPlanResponse(frame.data);
       }
-    });
+    }, options);
     if (!finalResponse) {
       throw new ApiError("Agent 实时规划已结束，但没有返回最终计划快照。", {
         reason: "AGENT_PLAN_STREAM_RESULT_MISSING",
@@ -2839,6 +2852,10 @@ export const api = {
       meta: { source: "api" as const },
     };
   },
+  cancelAgentPlan: (payload: CreateAgentPlanPayload) => postJson<AgentPlanCancellationResponse>(
+    "/agent/plans/cancel",
+    payload,
+  ),
   queryAgentRag: async (payload: AgentRagQueryPayload) => {
     const result = await postJson<unknown>("/agent/rag/query", payload);
     return {

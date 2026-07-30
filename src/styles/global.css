@@ -382,6 +382,10 @@ select {
   color: #b42318;
 }
 
+.agent-process-cancelled {
+  color: #b54708;
+}
+
 .agent-process-body {
   min-width: 0;
   padding-top: 4px;

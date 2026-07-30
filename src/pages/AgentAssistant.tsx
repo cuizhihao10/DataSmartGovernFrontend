@@ -14,6 +14,7 @@ import {
   ReadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
+  StopOutlined,
   ToolOutlined,
   UploadOutlined,
 } from "@ant-design/icons";
@@ -149,7 +150,7 @@ interface ExecutionAnswer {
   continuationStatus?: string;
 }
 
-type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED";
+type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 
 type AgentActionKind =
   | "MODEL_OUTPUT"
@@ -323,10 +324,14 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "请求失败，请查看详细错误后重试";
 }
 
+function isAgentPlanAbort(error: unknown) {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function observationColor(status: string) {
   if (["SUCCEEDED", "READY", "LOADED", "CACHED"].includes(status)) return "green";
   if (status === "FAILED" || status === "BLOCKED") return "red";
-  if (["FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED"].includes(status)) return "orange";
+  if (["FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED", "CANCELLED"].includes(status)) return "orange";
   if (["PLANNED", "EXECUTING", "TOOL_CALLING", "RUNNING", "QUEUED", "PENDING"].includes(status)) return "blue";
   return "gray";
 }
@@ -371,6 +376,7 @@ function observationStatus(status: string) {
     WAITING_APPROVAL: "等待确认",
     WAITING_HUMAN: "等待人工处理",
     PAUSED: "已安全暂停",
+    CANCELLED: "已停止",
     BLOCKED: "已阻止",
     FAILED: "失败",
     FALLBACK: "已降级",
@@ -864,6 +870,14 @@ function UserAgentAssistant() {
   const processStartedAtRef = useRef<number>();
   const streamElapsedMsRef = useRef<number>();
   const processOwnerRef = useRef<"PLAN" | "EXECUTION">();
+  const activePlanAbortControllerRef = useRef<AbortController>();
+  const activePlanRequestRef = useRef<{
+    tenantId: string;
+    projectId: string;
+    actorId: string;
+    requestId: string;
+  }>();
+  const planStopRequestedRef = useRef(false);
   const reviewEditSnapshotRef = useRef<{
     values: Partial<ClarificationFormValues>;
     controlPlane?: { sessionId: string; runId: string };
@@ -902,6 +916,11 @@ function UserAgentAssistant() {
     const timer = window.setInterval(updateElapsed, 250);
     return () => window.clearInterval(timer);
   }, [processStartedAt, processStatus]);
+
+  useEffect(() => () => {
+    // 页面切换同样属于当前流的生命周期结束。服务端还会根据 NDJSON 断连取消工作线程，避免后台继续计费。
+    activePlanAbortControllerRef.current?.abort();
+  }, []);
 
   const sessionQuery = useQuery({
     queryKey: ["agent-assistant-session"],
@@ -1384,6 +1403,14 @@ function UserAgentAssistant() {
         variables.recoveryExecutionId = submission.recoveryExecutionId;
       }
       const requestId = crypto.randomUUID();
+      const abortController = new AbortController();
+      activePlanAbortControllerRef.current = abortController;
+      activePlanRequestRef.current = {
+        tenantId: String(session.tenantId),
+        projectId: String(projectId),
+        actorId: String(session.actorId),
+        requestId,
+      };
       return api.createAgentPlanStream({
         tenant_id: String(session.tenantId),
         project_id: String(projectId),
@@ -1393,9 +1420,10 @@ function UserAgentAssistant() {
         preferred_workload: "agent_reasoning",
         locale: "zh-CN",
         variables,
-      }, consumePlanStreamFrame);
+      }, consumePlanStreamFrame, { signal: abortController.signal });
     },
     onMutate: (submission) => {
+      planStopRequestedRef.current = false;
       beginAgentProcess("PLAN");
       // A new natural-language turn or form submission may change the task
       // definition. The previous control-plane confirmation must never remain
@@ -1590,6 +1618,31 @@ function UserAgentAssistant() {
           : "Agent 已生成可审计执行计划，请确认后执行");
     },
     onError: (error) => {
+      if (planStopRequestedRef.current || isAgentPlanAbort(error)) {
+        finishAgentProcess("PLAN", "CANCELLED");
+        setControlPlane(undefined);
+        setConversationMessages((current) => [...current, {
+          id: `agent-cancelled-${crypto.randomUUID()}`,
+          role: "AGENT",
+          content: "已停止本轮处理。已经展示的过程会保留，尚未提交的计划不会继续执行；已启动的同步任务不会被自动撤销。",
+        }]);
+        setLiveObservationItems((current) => [
+          ...current.map((item) => item.status === "RUNNING"
+            ? { ...item, status: "CANCELLED", summary: "用户已停止本轮 Agent 处理。" }
+            : item),
+          {
+            id: `live-plan-cancelled-${activePlanRequestRef.current?.requestId || crypto.randomUUID()}`,
+            category: "USER_ACTION",
+            stage: "agent_plan_cancelled",
+            status: "CANCELLED",
+            title: "已停止模型思考",
+            summary: "当前模型请求和后续 Agent 推理已停止；已提交的业务操作需在对应任务页面单独管理。",
+            details: { requestId: activePlanRequestRef.current?.requestId || liveRequestId },
+          },
+        ]);
+        message.info("已停止本轮 Agent 处理");
+        return;
+      }
       finishAgentProcess("PLAN", "FAILED");
       const summary = errorMessage(error);
       setConversationMessages((current) => [...current, {
@@ -1611,7 +1664,34 @@ function UserAgentAssistant() {
       ]);
       message.error(summary);
     },
+    onSettled: () => {
+      activePlanAbortControllerRef.current = undefined;
+      activePlanRequestRef.current = undefined;
+      planStopRequestedRef.current = false;
+    },
   });
+
+  const stopCurrentAgentPlan = () => {
+    const activeRequest = activePlanRequestRef.current;
+    const abortController = activePlanAbortControllerRef.current;
+    if (!planMutation.isPending || !activeRequest || !abortController) return;
+
+    planStopRequestedRef.current = true;
+    const cancellation = api.cancelAgentPlan({
+      tenant_id: activeRequest.tenantId,
+      project_id: activeRequest.projectId,
+      actor_id: activeRequest.actorId,
+      request_id: activeRequest.requestId,
+      objective: "停止当前 Agent 规划",
+      preferred_workload: "agent_reasoning",
+      locale: "zh-CN",
+    });
+    // 本地读取必须立即停止，不等待取消 API 往返；服务端还会把连接断开作为第二重取消信号。
+    abortController.abort();
+    void cancellation.catch(() => {
+      message.warning("页面已停止等待；服务端取消确认暂未返回，连接断开保护会继续终止当前模型请求");
+    });
+  };
 
   const artifactUploadMutation = useMutation({
     mutationFn: (file: File) => api.uploadSyncTaskImportArtifact(file),
@@ -2588,8 +2668,19 @@ function UserAgentAssistant() {
               ) : null}
             </div>
           ) : (
-            <Typography.Text strong className={processStatus === "FAILED" ? "agent-process-failed" : undefined}>
-              {processStatus === "FAILED" ? "处理失败" : "已处理"} {formatAgentProcessElapsed(processElapsedMs)}
+            <Typography.Text
+              strong
+              className={processStatus === "FAILED"
+                ? "agent-process-failed"
+                : processStatus === "CANCELLED"
+                  ? "agent-process-cancelled"
+                  : undefined}
+            >
+              {processStatus === "FAILED"
+                ? "处理失败"
+                : processStatus === "CANCELLED"
+                  ? "已停止"
+                  : "已处理"} {formatAgentProcessElapsed(processElapsedMs)}
             </Typography.Text>
           ),
           children: (
@@ -2784,15 +2875,25 @@ function UserAgentAssistant() {
           </Form.Item>
           <Tooltip title={!projectId ? projectUnavailableMessage : undefined}>
             <span>
-              <Button
-                type="primary"
-                htmlType="submit"
-                icon={<RobotOutlined />}
-                loading={planMutation.isPending && !planMutation.variables?.clarification}
-                disabled={!projectId}
-              >
-                发送给 Agent
-              </Button>
+              {planMutation.isPending ? (
+                <Button
+                  danger
+                  htmlType="button"
+                  icon={<StopOutlined />}
+                  onClick={stopCurrentAgentPlan}
+                >
+                  停止思考
+                </Button>
+              ) : (
+                <Button
+                  type="primary"
+                  htmlType="submit"
+                  icon={<RobotOutlined />}
+                  disabled={!projectId}
+                >
+                  发送给 Agent
+                </Button>
+              )}
             </span>
           </Tooltip>
         </Form>
@@ -2951,15 +3052,26 @@ function UserAgentAssistant() {
               <Typography.Text type="secondary">
                 后续消息会沿用当前会话，Agent 将重新理解并自动更新已解析配置。
               </Typography.Text>
-              <Button
-                type="primary"
-                icon={<ArrowRightOutlined />}
-                onClick={continueConversation}
-                loading={planMutation.isPending && Boolean(planMutation.variables?.followUpMessage)}
-                disabled={!followUpMessage.trim() || executionInProgress}
-              >
-                发送
-              </Button>
+              {planMutation.isPending ? (
+                <Tooltip title="停止当前模型请求和后续 Agent 推理，不会撤销已启动的同步任务">
+                  <Button
+                    danger
+                    icon={<StopOutlined />}
+                    onClick={stopCurrentAgentPlan}
+                  >
+                    停止思考
+                  </Button>
+                </Tooltip>
+              ) : (
+                <Button
+                  type="primary"
+                  icon={<ArrowRightOutlined />}
+                  onClick={continueConversation}
+                  disabled={!followUpMessage.trim() || executionInProgress}
+                >
+                  发送
+                </Button>
+              )}
             </div>
           </div>
         </Card>
