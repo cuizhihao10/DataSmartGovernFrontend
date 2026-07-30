@@ -2222,6 +2222,8 @@ function normalizeAgentToolExecutionAudit(value: unknown, index: number): AgentT
     approvalOperatorId: readOptionalString(record.approvalOperatorId),
     approvalComment: readOptionalString(record.approvalComment),
     approvalTime: readOptionalString(record.approvalTime),
+    executionStartTime: readOptionalString(record.executionStartTime),
+    executionFinishTime: readOptionalString(record.executionFinishTime),
     outputSummary: readOptionalString(record.outputSummary),
     errorCode: readOptionalString(record.errorCode),
     createTime: readOptionalString(record.createTime),

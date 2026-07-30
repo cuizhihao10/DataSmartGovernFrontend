@@ -143,6 +143,31 @@ interface ExecutionAnswer {
 
 type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED";
 
+type AgentActionKind =
+  | "MODEL_OUTPUT"
+  | "API_CALL"
+  | "CONFIG_CHANGE"
+  | "RESULT"
+  | "USER_INPUT"
+  | "APPROVAL";
+
+interface AgentActionItem {
+  id: string;
+  kind: AgentActionKind;
+  status: string;
+  title: string;
+  summary: string;
+  operation?: string;
+  targetService?: string;
+  safeInput?: unknown;
+  safeOutput?: unknown;
+  changedFields?: string[];
+  evidence?: Record<string, unknown>;
+  startedAt?: string;
+  completedAt?: string;
+  elapsedMs?: number;
+}
+
 const defaultObjective = "将 MySQL 中的 fs_test_customer_source 和 fs_test_customer_target 全量同步到 PostgreSQL public schema 的同名表。";
 const taskImportObjective = "检查这个任务文件，先试运行；若失败则检索产品文档和历史案例，提出可执行修复方案，经我确认后修复、重新校验并导入。";
 
@@ -288,14 +313,6 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "请求失败，请查看详细错误后重试";
 }
 
-function statusColor(state?: string) {
-  if (state === "SUCCEEDED") return "green";
-  if (state === "FAILED") return "red";
-  if (state === "WAITING_APPROVAL" || state === "WAITING_HUMAN") return "gold";
-  if (state === "EXECUTING" || state === "TOOL_CALLING") return "blue";
-  return "default";
-}
-
 function observationColor(status: string) {
   if (["SUCCEEDED", "READY", "LOADED", "CACHED"].includes(status)) return "green";
   if (status === "FAILED" || status === "BLOCKED") return "red";
@@ -366,6 +383,7 @@ function streamEventPresentation(event: AgentPlanStreamProgressEvent) {
     skill_admission_evaluated: { category: "SKILL", title: "加载并校验 Skill" },
     model_query_started: { category: "MODEL", title: "调用真实模型", status: "RUNNING" },
     model_query_executed: { category: "MODEL", title: "真实模型调用完成" },
+    model_public_output_stream_updated: { category: "MODEL", title: "模型正在回复", status: "RUNNING" },
     model_public_output_ready: { category: "MODEL", title: "模型公开输出" },
     model_tool_call_proposed: { category: "TOOL", title: "模型提出工具调用" },
     model_tool_call_accepted: { category: "TOOL", title: "工具建议通过治理" },
@@ -406,8 +424,11 @@ function streamEventToObservation(event: AgentPlanStreamProgressEvent): AgentObs
   const publicContent = typeof event.attributes?.publicContent === "string"
     ? event.attributes.publicContent
     : undefined;
+  const stableStreamId = event.eventType === "model_public_output_stream_updated"
+    ? `${event.eventType}-${event.stage}-${String(event.attributes?.turn || "CURRENT")}`
+    : `${event.eventType}-${event.sequence ?? event.stage}`;
   return {
-    id: `live-${requestScope}-${event.eventType}-${event.sequence ?? event.stage}`,
+    id: `live-${requestScope}-${stableStreamId}`,
     category: presentation.category,
     stage: event.stage,
     status: eventFailed ? "FAILED" : presentation.status || (eventWarning ? "FALLBACK" : "SUCCEEDED"),
@@ -427,22 +448,152 @@ function formatAgentProcessElapsed(elapsedMs: number) {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
-function agentProcessActionSummaries(items: AgentObservationTimelineItem[]) {
-  const modelCount = items.filter((item) => (
-    item.category === "MODEL"
-    && ["model-invocation", "model_public_output_ready", "model_second_turn_completed"].some((marker) => (
-      item.id.includes(marker) || item.stage.includes(marker)
-    ))
-  )).length;
-  const skillCount = items.filter((item) => item.category === "SKILL").length;
-  const toolCount = items.filter((item) => item.category === "TOOL").length;
-  const commandCount = items.filter((item) => item.category === "COMMAND").length;
+function agentProcessActionSummaries(items: AgentActionItem[]) {
+  const modelCount = items.filter((item) => item.kind === "MODEL_OUTPUT").length;
+  const toolCount = items.filter((item) => ["API_CALL", "CONFIG_CHANGE"].includes(item.kind)).length;
+  const completedCount = items.filter((item) => ["SUCCEEDED", "FAILED"].includes(item.status)).length;
+  const waitingCount = items.filter((item) => ["WAITING_INPUT", "WAITING_APPROVAL"].includes(item.status)).length;
   return [
-    modelCount ? `完成 ${modelCount} 个模型步骤` : undefined,
-    skillCount ? `加载 ${skillCount} 个 Skill` : undefined,
-    toolCount ? `记录 ${toolCount} 个工具步骤` : undefined,
-    commandCount ? `执行 ${commandCount} 个命令或 API` : undefined,
+    modelCount ? `${modelCount} 次模型公开回复` : undefined,
+    toolCount ? `${toolCount} 个受控工具动作` : undefined,
+    completedCount ? `${completedCount} 项已有结果` : undefined,
+    waitingCount ? `${waitingCount} 项等待你处理` : undefined,
   ].filter((item): item is string => Boolean(item));
+}
+
+const actionHiddenKey = /(password|secret|token|credential|authorization|cookie|rawpayload|rawrow|sampledata)/i;
+const actionReviewedConfigKey = /(sql|wherecondition|filtercondition)/i;
+
+function sanitizeAgentActionPayload(value: unknown, key = "", depth = 0): unknown {
+  if (actionHiddenKey.test(key)) return "[已隐藏]";
+  if (actionReviewedConfigKey.test(key)) return "[请在任务配置审核中查看]";
+  if (value === null || value === undefined || typeof value === "boolean" || typeof value === "number") {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.length > 500 ? `${value.slice(0, 500)}…` : value;
+  }
+  if (depth >= 5) return "[内容已折叠]";
+  if (Array.isArray(value)) {
+    const visible = value.slice(0, 20).map((item) => sanitizeAgentActionPayload(item, key, depth + 1));
+    return value.length > visible.length ? [...visible, `其余 ${value.length - visible.length} 项已折叠`] : visible;
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => (
+        [childKey, sanitizeAgentActionPayload(childValue, childKey, depth + 1)]
+      )),
+    );
+  }
+  return String(value);
+}
+
+function agentToolHttpMethod(toolCode: string) {
+  if ([
+    "datasource.source.catalog.search",
+    "datasource.target.catalog.search",
+    "sync.execution.status",
+  ].includes(toolCode)) return "GET";
+  return "POST";
+}
+
+function resolvedAgentEndpoint(endpoint: string | undefined, argumentsValue: Record<string, unknown>) {
+  if (!endpoint) return undefined;
+  return Object.entries(argumentsValue).reduce((current, [key, value]) => (
+    ["string", "number"].includes(typeof value)
+      ? current.split(`{${key}}`).join(encodeURIComponent(String(value)))
+      : current
+  ), endpoint);
+}
+
+function agentActionElapsedMs(startedAt?: string, completedAt?: string) {
+  if (!startedAt || !completedAt) return undefined;
+  const value = new Date(completedAt).getTime() - new Date(startedAt).getTime();
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function agentActionStatus(state: string) {
+  return {
+    EXECUTING: "RUNNING",
+    PLANNED: "PENDING",
+  }[state] || state;
+}
+
+function agentActionKind(audit: AgentToolExecutionAudit): AgentActionKind {
+  if (audit.state === "WAITING_APPROVAL") return "APPROVAL";
+  if (audit.toolCode === "sync.task.draft.save" || audit.toolCode.endsWith(".repair.apply")) {
+    return "CONFIG_CHANGE";
+  }
+  return "API_CALL";
+}
+
+function agentToolActionTitle(audit: AgentToolExecutionAudit) {
+  const baseName = humanReadableToolName(audit.toolCode);
+  if (audit.state === "WAITING_APPROVAL") return `等待确认：${baseName}`;
+  if (audit.state === "PLANNED") return `准备调用：${baseName}`;
+  if (audit.state === "EXECUTING") return `正在执行：${baseName}`;
+  if (audit.state === "FAILED") return `执行失败：${baseName}`;
+  if (audit.state === "SKIPPED") return `未执行：${baseName}`;
+  return `已完成：${baseName}`;
+}
+
+function auditToAgentAction(
+  audit: AgentToolExecutionAudit,
+  result?: AgentToolExecutionResult,
+): AgentActionItem {
+  const endpoint = resolvedAgentEndpoint(audit.targetEndpoint, audit.planArguments);
+  const changedFields = agentActionKind(audit) === "CONFIG_CHANGE"
+    ? Object.keys(audit.planArguments).filter((key) => !actionHiddenKey.test(key))
+    : undefined;
+  return {
+    id: `action-${audit.auditId}`,
+    kind: agentActionKind(audit),
+    status: agentActionStatus(audit.state),
+    title: agentToolActionTitle(audit),
+    summary: audit.outputSummary || audit.message || audit.planReason || "工具已进入受控执行链路。",
+    operation: endpoint ? `${agentToolHttpMethod(audit.toolCode)} ${endpoint}` : audit.toolCode,
+    targetService: audit.targetService,
+    safeInput: sanitizeAgentActionPayload(audit.planArguments),
+    safeOutput: result ? sanitizeAgentActionPayload(result.output) : undefined,
+    changedFields,
+    evidence: {
+      auditId: audit.auditId,
+      traceId: audit.traceId,
+      toolCode: audit.toolCode,
+      executionMode: audit.executionMode,
+      readOnly: audit.readOnly,
+      idempotent: audit.idempotent,
+      errorCode: audit.errorCode,
+    },
+    startedAt: audit.executionStartTime || audit.createTime,
+    completedAt: audit.executionFinishTime,
+    elapsedMs: agentActionElapsedMs(audit.executionStartTime, audit.executionFinishTime),
+  };
+}
+
+function agentActionIcon(kind: AgentActionKind) {
+  if (kind === "MODEL_OUTPUT") return <RobotOutlined />;
+  if (kind === "API_CALL") return <ApiOutlined />;
+  if (kind === "CONFIG_CHANGE") return <EditOutlined />;
+  if (kind === "APPROVAL") return <SafetyCertificateOutlined />;
+  if (kind === "USER_INPUT") return <QuestionCircleOutlined />;
+  return <CheckCircleOutlined />;
+}
+
+function agentActionKindLabel(kind: AgentActionKind) {
+  return {
+    MODEL_OUTPUT: "模型输出",
+    API_CALL: "工具 / API",
+    CONFIG_CHANGE: "配置变更",
+    RESULT: "执行结果",
+    USER_INPUT: "需要补充",
+    APPROVAL: "等待确认",
+  }[kind];
+}
+
+function actionPayloadText(value: unknown) {
+  if (value === undefined) return undefined;
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
 function observationDetailLabel(key: string) {
@@ -641,6 +792,19 @@ function syncExecutionSummary(execution: SyncExecution) {
 
 function humanReadableToolName(toolName: string) {
   return {
+    "datasource.source.catalog.search": "检索可用源端数据源",
+    "datasource.target.catalog.search": "检索可用目标端数据源",
+    "datasource.source.connection.test": "测试源端数据源连接",
+    "datasource.target.connection.test": "测试目标端数据源连接",
+    "datasource.source.metadata.read": "读取源端表结构",
+    "datasource.target.metadata.read": "读取目标端表结构",
+    "datasource.target-table.create.preview": "预览目标表创建方案",
+    "datasource.target-table.create.apply": "创建目标表",
+    "sync.task.draft.save": "保存同步任务草稿",
+    "sync.task.precheck": "运行同步任务预检查",
+    "sync.task.publish": "发布同步任务",
+    "sync.task.execute": "启动同步任务",
+    "sync.cdc.readiness.check": "检查实时同步条件",
     "sync.task.import.dry-run": "任务文件试运行",
     "sync.task.import.rag.lookup": "检索修复案例与产品文档",
     "sync.task.import.repair.apply": "应用模型提出的修复补丁",
@@ -906,13 +1070,26 @@ function UserAgentAssistant() {
     });
   };
 
+  const observedControlPlane = useMemo(() => {
+    if (controlPlane) return controlPlane;
+    const durableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
+      .reverse()
+      .find((turn) => turn.sessionId && turn.runId);
+    const ingestion = plan?.controlPlaneIngestion;
+    const sessionId = durableTurn?.sessionId || textField(ingestion, "sessionId");
+    const runId = durableTurn?.runId || textField(ingestion, "runId");
+    return sessionId && runId ? { sessionId, runId } : undefined;
+  }, [controlPlane, plan]);
+
   const auditsQuery = useQuery({
-    queryKey: ["agent-assistant-audits", controlPlane?.sessionId, controlPlane?.runId],
-    queryFn: () => api.listAgentToolExecutions(controlPlane!.sessionId, controlPlane!.runId),
-    enabled: Boolean(controlPlane?.sessionId && controlPlane?.runId),
+    queryKey: ["agent-assistant-audits", observedControlPlane?.sessionId, observedControlPlane?.runId],
+    queryFn: () => api.listAgentToolExecutions(observedControlPlane!.sessionId, observedControlPlane!.runId),
+    enabled: Boolean(observedControlPlane?.sessionId && observedControlPlane?.runId),
     // 用户确认执行后按 1 秒刷新真实工具审计，让正在执行和刚完成的节点及时进入时间线。
     // 未开始执行时保留较低频率，避免等待确认阶段产生无意义的控制面压力。
-    refetchInterval: controlPlane && !executionAnswer ? (executionInProgress ? 1000 : 3000) : false,
+    refetchInterval: observedControlPlane && !executionAnswer
+      ? (executionInProgress || processStatus === "RUNNING" ? 1000 : 3000)
+      : false,
   });
   const audits = useMemo(() => auditsQuery.data?.data ?? [], [auditsQuery.data?.data]);
 
@@ -1073,9 +1250,9 @@ function UserAgentAssistant() {
           role: item.role === "USER" ? "user" : "assistant",
           content: item.content,
         })),
-        // NDJSON 只流式传输可审计的阶段事实；模型 token 流保持关闭，以便查询引擎完整治理
-        // 限流、重试、fallback 和用量，同时避免向用户暴露原始模型推理。
-        streamModelIntent: false,
+        // Responses/Chat SSE 只传输经过累计脱敏的公开 assistant 文本。隐藏推理、系统提示词、
+        // Provider 原始事件和未闭合工具参数不会进入浏览器，完整工具调用仍需聚合后通过治理才能执行。
+        streamModelIntent: true,
       };
       if (latestUserMessage) {
         variables.latestUserMessage = latestUserMessage;
@@ -1645,6 +1822,93 @@ function UserAgentAssistant() {
     return [...retainedLiveItems, ...planningItems, ...executionItems];
   }, [audits, liveObservationItems, plan?.agentObservationTimeline?.items]);
 
+  const agentActions = useMemo<AgentActionItem[]>(() => {
+    const resultByAuditId = new Map(
+      executionResults.map((item) => [item.audit.auditId, item]),
+    );
+    const actions: AgentActionItem[] = [];
+    const liveModelOutput = [...observationItems].reverse().find((item) => (
+      item.id.includes("model_public_output_stream_updated")
+    ));
+    const finalModelOutput = [...observationItems].reverse().find((item) => (
+      item.id.includes("model_public_output_ready")
+    )) || observationItems.find((item) => item.id === "model-invocation");
+    const modelStarted = [...observationItems].reverse().find((item) => (
+      item.id.includes("model_query_started")
+    ));
+    const activeLiveModelOutput = liveModelOutput
+      && ["RUNNING", "PENDING"].includes(liveModelOutput.status)
+      ? liveModelOutput
+      : undefined;
+    const modelItem = activeLiveModelOutput || finalModelOutput || liveModelOutput || modelStarted;
+    if (modelItem) {
+      const details = modelItem.details;
+      const actualModel = details.actualModelName || details.model || details.selectedModelName;
+      const provider = details.provider || details.selectedProviderName;
+      const responseSource = details.responseSource;
+      const modelIsRunning = Boolean(activeLiveModelOutput)
+        || (!finalModelOutput && ["RUNNING", "PENDING"].includes(modelItem.status));
+      actions.push({
+        id: `action-model-${String(details.turn || modelItem.stage)}`,
+        kind: "MODEL_OUTPUT",
+        status: modelIsRunning ? "RUNNING" : modelItem.status,
+        title: modelIsRunning
+          ? liveModelOutput
+            ? "模型正在生成公开回复"
+            : "模型正在理解目标并选择工具"
+          : responseSource === "DATASMART_RESULT_CACHE"
+            ? "从会话缓存取得模型公开回复"
+            : "模型已完成目标理解与工具决策",
+        summary: modelItem.summary || "正在等待模型返回公开内容。",
+        operation: `${responseSource === "DATASMART_RESULT_CACHE" ? "DataSmart response cache" : "Responses API"}`
+          + `${actualModel ? ` · ${String(actualModel)}` : ""}`,
+        targetService: provider ? String(provider) : "model-gateway",
+        safeInput: sanitizeAgentActionPayload({
+          objective: details.modelRequestObjective,
+          instructionSummary: details.modelInstructionSummary,
+          visibleTools: details.modelVisibleToolNames,
+          structuredBaseline: details.modelStructuredBaseline,
+        }),
+        safeOutput: sanitizeAgentActionPayload(modelItem.summary),
+        evidence: {
+          requestId: liveRequestId,
+          responseSource,
+          cacheHit: details.cacheHit,
+          providerCachedPromptTokens: details.cachedPromptTokens,
+          promptTokens: details.promptTokens,
+          completionTokens: details.completionTokens,
+          totalTokens: details.totalTokens,
+          latencyMs: details.latencyMs,
+        },
+      });
+    }
+
+    audits.forEach((audit) => {
+      actions.push(auditToAgentAction(audit, resultByAuditId.get(audit.auditId)));
+    });
+
+    const waitingItems = observationItems.filter((item) => (
+      item.category === "USER_ACTION"
+      || (item.id === "human-confirmation" && item.status === "WAITING_APPROVAL")
+    ));
+    waitingItems.forEach((item) => {
+      actions.push({
+        id: `action-waiting-${item.id}`,
+        kind: item.category === "USER_ACTION" ? "USER_INPUT" : "APPROVAL",
+        status: item.status,
+        title: item.title,
+        summary: item.summary,
+        safeInput: sanitizeAgentActionPayload(item.details),
+      });
+    });
+    return actions;
+  }, [audits, executionResults, liveRequestId, observationItems]);
+
+  const diagnosticItems = useMemo(() => observationItems.filter((item) => (
+    !item.id.startsWith("execution-")
+    && !item.id.includes("model_public_output_stream_updated")
+  )), [observationItems]);
+
   useEffect(() => {
     if (!sourceMetadata || !targetMetadata || !clarificationMappings.length) return;
     let changed = false;
@@ -1933,9 +2197,10 @@ function UserAgentAssistant() {
   const conversationHistoryMessages = conversationMessages.filter(
     (_, index) => index !== currentTurnAgentMessageIndex,
   );
-  const processActionSummaries = agentProcessActionSummaries(observationItems);
-  const currentProcessItem = observationItems[observationItems.length - 1];
-  const processPanel = processStartedAt || observationItems.length ? (
+  const processActionSummaries = agentProcessActionSummaries(agentActions);
+  const currentProcessItem = [...agentActions].reverse().find((item) => item.status === "RUNNING")
+    || agentActions[agentActions.length - 1];
+  const processPanel = processStartedAt || agentActions.length ? (
     <div className={`agent-process-shell is-${processStatus.toLowerCase()}`}>
       <Collapse
         ghost
@@ -1966,28 +2231,41 @@ function UserAgentAssistant() {
               <div className="agent-process-summary">
                 {processActionSummaries.map((summary) => <Tag key={summary}>{summary}</Tag>)}
                 {liveRequestId ? <Tag>请求 {liveRequestId.slice(0, 8)}</Tag> : null}
-                <Typography.Text type="secondary">公开过程，不展示隐藏推理</Typography.Text>
+                <Typography.Text type="secondary">实际动作与公开模型输出，敏感参数已隐藏</Typography.Text>
               </div>
               <Timeline
                 className="agent-process-timeline"
-                items={observationItems.map((item) => {
-                  const detailEntries = Object.entries(item.details).filter(([key]) => key !== "sequence");
-                  const needsInput = item.category === "USER_ACTION"
-                    || (item.category === "PERMISSION" && item.status === "WAITING_INPUT");
-                  const needsConfirmation = item.category === "PERMISSION" && item.status === "WAITING_APPROVAL";
+                items={agentActions.map((item) => {
+                  const safeInputText = actionPayloadText(item.safeInput);
+                  const safeOutputText = actionPayloadText(item.safeOutput);
+                  const evidenceEntries = Object.entries(item.evidence ?? {}).filter(([, value]) => (
+                    value !== undefined && value !== null && value !== ""
+                  ));
+                  const needsInput = item.kind === "USER_INPUT";
+                  const needsConfirmation = item.kind === "APPROVAL";
                   return {
                     color: observationColor(item.status),
-                    dot: item.status === "RUNNING" ? <Spin size="small" /> : observationIcon(item.category),
+                    dot: item.status === "RUNNING" ? <Spin size="small" /> : agentActionIcon(item.kind),
                     children: (
-                      <div className="agent-process-step">
+                      <div className={`agent-process-step agent-action-step is-${item.kind.toLowerCase()}`}>
                         <Space wrap>
                           <Typography.Text strong>{item.title}</Typography.Text>
-                          <Tag color="blue">{observationCategory(item.category)}</Tag>
+                          <Tag color="blue">{agentActionKindLabel(item.kind)}</Tag>
                           <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
+                          {item.elapsedMs !== undefined ? (
+                            <Typography.Text type="secondary">{formatAgentProcessElapsed(item.elapsedMs)}</Typography.Text>
+                          ) : null}
                         </Space>
                         <Typography.Paragraph className="agent-process-step-summary">
                           {item.summary}
                         </Typography.Paragraph>
+                        {item.operation ? (
+                          <div className="agent-action-operation">
+                            <CodeOutlined />
+                            <Typography.Text code>{item.operation}</Typography.Text>
+                            {item.targetService ? <Tag>{item.targetService}</Tag> : null}
+                          </div>
+                        ) : null}
                         {needsInput ? (
                           <Button type="link" size="small" onClick={() => scrollToAgentSection("agent-clarification-card")}>
                             补充执行信息
@@ -1998,23 +2276,47 @@ function UserAgentAssistant() {
                             查看并确认执行
                           </Button>
                         ) : null}
-                        {detailEntries.length ? (
+                        {safeInputText || safeOutputText || item.changedFields?.length || evidenceEntries.length ? (
                           <Collapse
                             ghost
                             size="small"
                             items={[{
                               key: `${item.id}-details`,
-                              label: observationDetailsTitle(item.category),
+                              label: "查看调用参数、结果与证据",
                               children: (
-                                <Descriptions
-                                  size="small"
-                                  column={{ xs: 1, sm: 2, lg: 3 }}
-                                  items={detailEntries.map(([key, value]) => ({
-                                    key,
-                                    label: observationDetailLabel(key),
-                                    children: formatObservationValue(value, key),
-                                  }))}
-                                />
+                                <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                                  {item.changedFields?.length ? (
+                                    <div>
+                                      <Typography.Text type="secondary">本次配置字段</Typography.Text>
+                                      <div className="agent-action-tags">
+                                        {item.changedFields.map((field) => <Tag key={field}>{field}</Tag>)}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {safeInputText ? (
+                                    <div>
+                                      <Typography.Text type="secondary">脱敏调用参数</Typography.Text>
+                                      <pre className="agent-action-payload">{safeInputText}</pre>
+                                    </div>
+                                  ) : null}
+                                  {safeOutputText ? (
+                                    <div>
+                                      <Typography.Text type="secondary">实际返回结果</Typography.Text>
+                                      <pre className="agent-action-payload">{safeOutputText}</pre>
+                                    </div>
+                                  ) : null}
+                                  {evidenceEntries.length ? (
+                                    <Descriptions
+                                      size="small"
+                                      column={{ xs: 1, sm: 2, lg: 3 }}
+                                      items={evidenceEntries.map(([key, value]) => ({
+                                        key,
+                                        label: observationDetailLabel(key),
+                                        children: formatObservationValue(value, key),
+                                      }))}
+                                    />
+                                  ) : null}
+                                </Space>
                               ),
                             }]}
                           />
@@ -2294,6 +2596,67 @@ function UserAgentAssistant() {
               </Button>
             </div>
           </div>
+        </Card>
+      ) : null}
+
+      {diagnosticItems.length ? (
+        <Card
+          title="运行诊断"
+          className="compact-card agent-diagnostics-card"
+          extra={<Tag>{diagnosticItems.length} 个编排与治理事件</Tag>}
+        >
+          <Collapse
+            ghost
+            items={[{
+              key: "agent-runtime-diagnostics",
+              label: "查看 LangGraph 编排、模型治理、Skill 与权限诊断",
+              children: (
+                <Timeline
+                  className="agent-diagnostics-timeline"
+                  items={diagnosticItems.map((item) => {
+                    const detailEntries = Object.entries(item.details).filter(([key]) => key !== "sequence");
+                    return {
+                      color: observationColor(item.status),
+                      dot: item.status === "RUNNING" ? <Spin size="small" /> : observationIcon(item.category),
+                      children: (
+                        <div className="agent-diagnostic-step">
+                          <Space wrap>
+                            <Typography.Text strong>{item.title}</Typography.Text>
+                            <Tag color="blue">{observationCategory(item.category)}</Tag>
+                            <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
+                          </Space>
+                          <Typography.Paragraph type="secondary" className="agent-process-step-summary">
+                            {item.summary}
+                          </Typography.Paragraph>
+                          {detailEntries.length ? (
+                            <Collapse
+                              ghost
+                              size="small"
+                              items={[{
+                                key: `${item.id}-diagnostic-details`,
+                                label: observationDetailsTitle(item.category),
+                                children: (
+                                  <Descriptions
+                                    size="small"
+                                    column={{ xs: 1, sm: 2, lg: 3 }}
+                                    items={detailEntries.map(([key, value]) => ({
+                                      key,
+                                      label: observationDetailLabel(key),
+                                      children: formatObservationValue(value, key),
+                                    }))}
+                                  />
+                                ),
+                              }]}
+                            />
+                          ) : null}
+                        </div>
+                      ),
+                    };
+                  })}
+                />
+              ),
+            }]}
+          />
         </Card>
       ) : null}
 
@@ -3050,7 +3413,7 @@ function UserAgentAssistant() {
       ) : null}
 
       {executionAnswer ? (
-        <Card title="Agent 二轮回答" className="compact-card">
+        <Card title="执行结论" className="compact-card">
           <Alert
             showIcon
             type={executionResults.some((item) => item.audit.state === "FAILED") ? "error" : "success"}
@@ -3059,69 +3422,6 @@ function UserAgentAssistant() {
           <Space wrap style={{ marginTop: 12 }}>
             <Tag>{executionAnswer.mode}</Tag>
             <Tag color="gold">{executionAnswer.modelProviderStatus}</Tag>
-          </Space>
-        </Card>
-      ) : null}
-
-      {audits.length ? (
-        <Card title="节点执行状态" className="compact-card">
-          <Space direction="vertical" style={{ width: "100%" }}>
-            {audits.map((audit: AgentToolExecutionAudit) => (
-              <Card key={audit.auditId} size="small">
-                <div className="split-row">
-                  <Space>
-                    {audit.state === "SUCCEEDED" ? <CheckCircleOutlined style={{ color: "#16a34a" }} /> : <RobotOutlined />}
-                    <Typography.Text strong>{humanReadableToolName(audit.toolCode)}</Typography.Text>
-                    <Tag color={statusColor(audit.state)}>{audit.state}</Tag>
-                  </Space>
-                  <Typography.Text type="secondary">{audit.message || audit.planReason || "等待执行"}</Typography.Text>
-                </div>
-              </Card>
-            ))}
-          </Space>
-        </Card>
-      ) : null}
-
-      {executionResults.length ? (
-        <Card title="Agent 工具结果与恢复证据" className="compact-card">
-          <Alert
-            showIcon
-            type="info"
-            message="这里展示工具实际返回的低敏事实，而不是模型猜测"
-            description="可展开查看执行 ID、根因编码、RAG 引用、修复预览摘要、重试/重放结果和验证状态。数据库凭据、原始坏行、隐藏推理和未经治理的内部参数不会展示。"
-            style={{ marginBottom: 16 }}
-          />
-          <Space direction="vertical" style={{ width: "100%" }}>
-            {executionResults.map((item) => (
-              <Card
-                key={item.audit.auditId}
-                size="small"
-                title={(
-                  <Space wrap>
-                    <Typography.Text strong>{humanReadableToolName(item.audit.toolCode)}</Typography.Text>
-                    <Tag color={statusColor(item.audit.state)}>{item.audit.state}</Tag>
-                    <Tag>{item.audit.targetService || "Agent Runtime"}</Tag>
-                  </Space>
-                )}
-              >
-                <Typography.Paragraph style={{ marginBottom: 8 }}>
-                  {item.audit.message || item.audit.outputSummary || "工具已返回受治理结果。"}
-                </Typography.Paragraph>
-                <Collapse
-                  ghost
-                  size="small"
-                  items={[{
-                    key: `${item.audit.auditId}-result`,
-                    label: "查看结构化结果与证据",
-                    children: (
-                      <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                        {JSON.stringify(item.output, null, 2)}
-                      </pre>
-                    ),
-                  }]}
-                />
-              </Card>
-            ))}
           </Space>
         </Card>
       ) : null}

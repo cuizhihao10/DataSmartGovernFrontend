@@ -1302,6 +1302,8 @@ export interface AgentToolExecutionAudit {
   approvalOperatorId?: string;
   approvalComment?: string;
   approvalTime?: string;
+  executionStartTime?: string;
+  executionFinishTime?: string;
   outputSummary?: string;
   errorCode?: string;
   createTime?: string;

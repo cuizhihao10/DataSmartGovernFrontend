@@ -416,6 +416,79 @@ select {
   overflow-wrap: anywhere;
 }
 
+.agent-action-step {
+  border-bottom: 1px solid #edf0f3;
+}
+
+.agent-action-step.is-model_output .agent-process-step-summary {
+  color: #202b36;
+  line-height: 1.75;
+}
+
+.agent-action-operation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid #697887;
+  background: #f4f6f8;
+}
+
+.agent-action-operation .ant-typography {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.agent-action-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.agent-action-payload {
+  max-width: 100%;
+  max-height: 320px;
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid #dce3ea;
+  border-radius: 4px;
+  background: #f8fafb;
+  color: #23313f;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-diagnostics-card .ant-card-body {
+  padding-top: 4px;
+}
+
+.agent-diagnostics-card > .ant-card-body > .ant-collapse > .ant-collapse-item > .ant-collapse-header {
+  padding-inline: 0;
+}
+
+.agent-diagnostics-timeline {
+  margin-top: 12px;
+}
+
+.agent-diagnostic-step {
+  min-width: 0;
+  padding-bottom: 8px;
+}
+
+.agent-diagnostic-step .ant-descriptions-view,
+.agent-diagnostic-step .ant-descriptions-item-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .agent-resolution-strip {
   width: 100%;
   padding: 12px 0;
