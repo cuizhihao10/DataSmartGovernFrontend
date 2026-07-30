@@ -905,19 +905,38 @@ function UserAgentAssistant() {
   });
   const session = sessionQuery.data?.data;
   const projectId = selectedProjectId ? Number(selectedProjectId) : undefined;
-  const clarificationSourceDatasourceId = Form.useWatch("sourceDatasourceId", clarificationForm);
-  const clarificationTargetDatasourceId = Form.useWatch("targetDatasourceId", clarificationForm);
-  const clarificationSyncMode = Form.useWatch("syncMode", clarificationForm);
-  const clarificationTaskName = Form.useWatch("taskName", clarificationForm);
-  const clarificationWriteStrategy = Form.useWatch("writeStrategy", clarificationForm);
-  const clarificationScheduleConfig = Form.useWatch("scheduleConfig", clarificationForm);
-  const clarificationCustomSqlText = Form.useWatch("customSqlText", clarificationForm);
-  const clarificationMappingDefaultsConfirmed = Form.useWatch("mappingDefaultsConfirmed", clarificationForm);
-  const watchedClarificationMappings = Form.useWatch("objectMappings", clarificationForm);
+  const clarificationWatchOptions = { form: clarificationForm, preserve: true } as const;
+  const clarificationSourceDatasourceId = Form.useWatch("sourceDatasourceId", clarificationWatchOptions);
+  const clarificationTargetDatasourceId = Form.useWatch("targetDatasourceId", clarificationWatchOptions);
+  const clarificationSyncMode = Form.useWatch("syncMode", clarificationWatchOptions);
+  const clarificationTaskName = Form.useWatch("taskName", clarificationWatchOptions);
+  const clarificationWriteStrategy = Form.useWatch("writeStrategy", clarificationWatchOptions);
+  const clarificationScheduleConfig = Form.useWatch("scheduleConfig", clarificationWatchOptions);
+  const clarificationCustomSqlText = Form.useWatch("customSqlText", clarificationWatchOptions);
+  const clarificationMappingDefaultsConfirmed = Form.useWatch("mappingDefaultsConfirmed", clarificationWatchOptions);
+  const watchedClarificationMappings = Form.useWatch("objectMappings", clarificationWatchOptions);
   const clarificationMappings = useMemo(
     () => watchedClarificationMappings ?? [],
     [watchedClarificationMappings],
   );
+  const latestResolvedConfiguration = plan?.agentConversation?.resolvedConfiguration;
+  const latestDraftArguments = plan?.plan?.toolPlans.find(
+    (item) => item.toolName === "sync.task.draft.save",
+  )?.arguments;
+  const latestSourceMetadataArguments = plan?.plan?.toolPlans.find(
+    (item) => item.toolName === "datasource.source.metadata.read",
+  )?.arguments;
+  const latestTargetMetadataArguments = plan?.plan?.toolPlans.find(
+    (item) => item.toolName === "datasource.target.metadata.read",
+  )?.arguments;
+  const effectiveSourceDatasourceId = clarificationSourceDatasourceId
+    ?? latestResolvedConfiguration?.sourceDatasourceId
+    ?? numberField(latestDraftArguments, "sourceDatasourceId")
+    ?? numberField(latestSourceMetadataArguments, "datasourceId");
+  const effectiveTargetDatasourceId = clarificationTargetDatasourceId
+    ?? latestResolvedConfiguration?.targetDatasourceId
+    ?? numberField(latestDraftArguments, "targetDatasourceId")
+    ?? numberField(latestTargetMetadataArguments, "datasourceId");
   const sourceQuery = useQuery({
     queryKey: ["agent-assistant-source-datasources", projectId],
     queryFn: () => api.listDataSources({ current: 1, size: 100, projectId, usagePurpose: "SOURCE", status: "ENABLED" }),
@@ -951,15 +970,15 @@ function UserAgentAssistant() {
     [targetDatasources],
   );
   const selectedSourceDatasource = sourceDatasources.find(
-    (item) => Number(item.id) === Number(clarificationSourceDatasourceId),
+    (item) => Number(item.id) === Number(effectiveSourceDatasourceId),
   );
   const selectedTargetDatasource = targetDatasources.find(
-    (item) => Number(item.id) === Number(clarificationTargetDatasourceId),
+    (item) => Number(item.id) === Number(effectiveTargetDatasourceId),
   );
   const sourceMetadataQuery = useQuery({
-    queryKey: ["agent-assistant-source-metadata", projectId, clarificationSourceDatasourceId],
+    queryKey: ["agent-assistant-source-metadata", projectId, effectiveSourceDatasourceId],
     queryFn: () => api.discoverSyncTaskMetadata({
-      datasourceId: Number(clarificationSourceDatasourceId),
+      datasourceId: Number(effectiveSourceDatasourceId),
       side: "SOURCE",
       connectorType: selectedSourceDatasource?.type,
       filterMode: "ALL",
@@ -968,13 +987,13 @@ function UserAgentAssistant() {
       maxTables: 500,
       maxColumnsPerTable: 160,
     }),
-    enabled: Boolean(projectId && clarificationSourceDatasourceId),
+    enabled: Boolean(projectId && effectiveSourceDatasourceId),
     staleTime: 30_000,
   });
   const targetMetadataQuery = useQuery({
-    queryKey: ["agent-assistant-target-metadata", projectId, clarificationTargetDatasourceId],
+    queryKey: ["agent-assistant-target-metadata", projectId, effectiveTargetDatasourceId],
     queryFn: () => api.discoverSyncTaskMetadata({
-      datasourceId: Number(clarificationTargetDatasourceId),
+      datasourceId: Number(effectiveTargetDatasourceId),
       side: "TARGET",
       connectorType: selectedTargetDatasource?.type,
       filterMode: "ALL",
@@ -983,7 +1002,7 @@ function UserAgentAssistant() {
       maxTables: 500,
       maxColumnsPerTable: 160,
     }),
-    enabled: Boolean(projectId && clarificationTargetDatasourceId),
+    enabled: Boolean(projectId && effectiveTargetDatasourceId),
     staleTime: 30_000,
   });
   const sourceMetadata = sourceMetadataQuery.data?.data;
@@ -2128,8 +2147,8 @@ function UserAgentAssistant() {
       !phaseAllowsMetadataContinuation
       || !hasOnlyMappingClarification
       || !["VERIFIED_METADATA_SAME_NAME_MATCH", "USER_STATED_SAME_NAME_MAPPING"].includes(mappingSource || "")
-      || !clarificationSourceDatasourceId
-      || !clarificationTargetDatasourceId
+      || !effectiveSourceDatasourceId
+      || !effectiveTargetDatasourceId
       || !mappingsExistInMetadata
       || planMutation.isPending
     ) {
@@ -2137,8 +2156,8 @@ function UserAgentAssistant() {
     }
     const turnKey = [
       conversation?.turnId,
-      clarificationSourceDatasourceId,
-      clarificationTargetDatasourceId,
+      effectiveSourceDatasourceId,
+      effectiveTargetDatasourceId,
       ...clarificationMappings.map((item) => (
         `${item.sourceSchemaName || ""}.${item.sourceObjectName}->`
         + `${item.targetSchemaName || ""}.${item.targetObjectName}`
@@ -2159,9 +2178,9 @@ function UserAgentAssistant() {
   }, [
     clarificationForm,
     clarificationMappings,
-    clarificationSourceDatasourceId,
-    clarificationTargetDatasourceId,
     conversation,
+    effectiveSourceDatasourceId,
+    effectiveTargetDatasourceId,
     objective,
     planMutation,
     sourceMetadata,
@@ -2217,24 +2236,14 @@ function UserAgentAssistant() {
     const draftArguments = plan?.plan?.toolPlans.find(
       (item) => item.toolName === "sync.task.draft.save",
     )?.arguments;
-    const sourceMetadataArguments = plan?.plan?.toolPlans.find(
-      (item) => item.toolName === "datasource.source.metadata.read",
-    )?.arguments;
-    const targetMetadataArguments = plan?.plan?.toolPlans.find(
-      (item) => item.toolName === "datasource.target.metadata.read",
-    )?.arguments;
     const formValues = clarificationForm.getFieldsValue(true);
     const mode = normalizeUserSyncMode(
       formValues.syncMode
       || textField(draftArguments, "syncMode")
       || conversation?.structuredIntent.syncMode,
     );
-    const sourceDatasourceId = formValues.sourceDatasourceId
-      || numberField(draftArguments, "sourceDatasourceId")
-      || numberField(sourceMetadataArguments, "datasourceId");
-    const targetDatasourceId = formValues.targetDatasourceId
-      || numberField(draftArguments, "targetDatasourceId")
-      || numberField(targetMetadataArguments, "datasourceId");
+    const sourceDatasourceId = formValues.sourceDatasourceId || effectiveSourceDatasourceId;
+    const targetDatasourceId = formValues.targetDatasourceId || effectiveTargetDatasourceId;
     const objectMappings = formValues.objectMappings?.length
       ? formValues.objectMappings
       : Array.isArray(draftArguments?.objectMappings)
@@ -2291,7 +2300,7 @@ function UserAgentAssistant() {
     setConfigurationReviewConfirmed(false);
   };
 
-  const resolvedConfiguration = conversation?.resolvedConfiguration;
+  const resolvedConfiguration = latestResolvedConfiguration;
   const reviewSyncMode = normalizeUserSyncMode(
     clarificationSyncMode || resolvedConfiguration?.syncMode || conversation?.structuredIntent.syncMode,
   );
@@ -2324,8 +2333,8 @@ function UserAgentAssistant() {
     || activeToolNames.includes("sync.task.draft.save");
   const configurationReadinessIssues: string[] = [];
   if (isSyncTaskCreationReview) {
-    if (!clarificationSourceDatasourceId) configurationReadinessIssues.push("尚未选择源端数据源");
-    if (!clarificationTargetDatasourceId) configurationReadinessIssues.push("尚未选择目标端数据源");
+    if (!effectiveSourceDatasourceId) configurationReadinessIssues.push("尚未选择源端数据源");
+    if (!effectiveTargetDatasourceId) configurationReadinessIssues.push("尚未选择目标端数据源");
     if (sourceMetadataQuery.isLoading || targetMetadataQuery.isLoading) {
       configurationReadinessIssues.push("两端真实元数据仍在加载，请等待字段核对完成");
     } else {
@@ -2384,7 +2393,10 @@ function UserAgentAssistant() {
     }
     const defaultFieldsRequireConfirmation = needsMappingDefaultsConfirmation
       || resolvedConfiguration?.fieldMappingSource === "VERIFIED_METADATA_SAME_NAME_FIELDS";
-    if (defaultFieldsRequireConfirmation && !clarificationMappingDefaultsConfirmed) {
+    const mappingDefaultsConfirmed = clarificationMappingDefaultsConfirmed
+      ?? resolvedConfiguration?.mappingDefaultsConfirmed
+      ?? false;
+    if (defaultFieldsRequireConfirmation && !mappingDefaultsConfirmed) {
       configurationReadinessIssues.push("尚未确认 Agent 默认的同名字段映射与无 WHERE 数据范围");
     }
   }
@@ -3414,9 +3426,7 @@ function UserAgentAssistant() {
                         ) : null}
                         <Collapse
                           size="small"
-                          defaultActiveKey={(needsFieldMappings || !mapping?.fieldMappings?.length)
-                            ? [`fields-${field.key}`]
-                            : undefined}
+                          defaultActiveKey={[`fields-${field.key}`]}
                           items={[{
                             key: `fields-${field.key}`,
                             label: `字段映射（${mapping?.fieldMappings?.length ?? 0} 个源字段）`,
@@ -3600,6 +3610,9 @@ function UserAgentAssistant() {
                 {reviewMappings.length ? (
                   <Collapse
                     className="agent-configuration-mapping-collapse"
+                    defaultActiveKey={reviewMappings.map((mapping, mappingIndex) => (
+                      mapping.objectKey || `review-mapping-${mappingIndex + 1}`
+                    ))}
                     items={reviewMappings.map((mapping, mappingIndex) => {
                       const enabledFields = mapping.fieldMappings.filter((field) => field.syncEnabled !== false);
                       const disabledFieldCount = mapping.fieldMappings.length - enabledFields.length;
