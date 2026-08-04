@@ -896,6 +896,10 @@ function UserAgentAssistant() {
   }>();
   const historyProjectRef = useRef(selectedProjectId);
 
+  /**
+   * 项目是会话、数据源和任务的可见性边界。切换项目时必须停止旧请求并清空所有运行态，不能让旧项目的
+   * sessionId、对话消息或执行结果被带入新项目；新的自然语言请求会生成全新的浏览器会话编号。
+   */
   useEffect(() => {
     if (historyProjectRef.current === selectedProjectId) return;
     historyProjectRef.current = selectedProjectId;
@@ -957,6 +961,10 @@ function UserAgentAssistant() {
   });
   const session = sessionQuery.data?.data;
   const projectId = selectedProjectId ? Number(selectedProjectId) : undefined;
+  /**
+   * 历史查询键同时包含项目和归档分区，使 React Query 不会把项目 A 或已归档列表缓存展示到项目 B 的
+   * 活跃列表。后端会再次按 tenant/project/actor 做对象级过滤。
+   */
   const sessionHistoryQuery = useQuery({
     queryKey: ["agent-assistant-session-history", projectId, showArchivedSessions],
     queryFn: () => api.listAgentSessions({ archived: showArchivedSessions, limit: 100 }),
@@ -964,6 +972,10 @@ function UserAgentAssistant() {
     retry: false,
   });
   const sessionHistory = sessionHistoryQuery.data?.data ?? [];
+  /**
+   * 恢复完整持久会话，而不是只把标题填回输入框。成功后同步恢复消息、目标和 runtime sessionId，
+   * 清空上一次临时计划与执行结果，确保下一次追问创建新 Run 但仍归属于所选历史会话。
+   */
   const loadSessionMutation = useMutation({
     mutationFn: (sessionId: string) => api.getAgentSession(sessionId),
     onSuccess: (result) => {
@@ -989,6 +1001,7 @@ function UserAgentAssistant() {
     },
     onError: (error) => message.error(errorMessage(error)),
   });
+  /** 修改置顶后使当前项目的两个历史分区缓存同时失效，以便服务端排序立即生效。 */
   const pinSessionMutation = useMutation({
     mutationFn: ({ sessionId, enabled }: { sessionId: string; enabled: boolean }) => (
       api.setAgentSessionPinned(sessionId, enabled)
@@ -998,6 +1011,9 @@ function UserAgentAssistant() {
     },
     onError: (error) => message.error(errorMessage(error)),
   });
+  /**
+   * 归档或恢复后刷新历史列表；若操作的是当前会话，还要同步编辑区只读状态，防止归档会话继续执行。
+   */
   const archiveSessionMutation = useMutation({
     mutationFn: ({ sessionId, enabled }: { sessionId: string; enabled: boolean }) => (
       api.setAgentSessionArchived(sessionId, enabled)
@@ -1363,6 +1379,12 @@ function UserAgentAssistant() {
     });
   };
 
+  /**
+   * 提交一个自然语言回合并驱动流式 Agent 规划。
+   *
+   * startNewSession 明确区分“新目标”和“继续历史”：新目标不携带旧 runtime sessionId；追问优先复用
+   * Java 控制面 sessionId，让持久消息、委托、Run 和审计都追加在同一聚合中。
+   */
   const planMutation = useMutation({
     mutationFn: async (submission: PlanSubmission) => {
       if (!session?.tenantId || !projectId || !session.actorId) {
@@ -1387,6 +1409,7 @@ function UserAgentAssistant() {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
         sessionId: agentConversationSessionId,
+        // 新会话禁止复用旧控制面状态；历史追问则优先使用最近一次 ingestion 返回的真实 runtime sessionId。
         agentRuntimeSessionId: submission.startNewSession
           ? undefined
           : controlPlane?.sessionId ?? activeAgentRuntimeSessionId,
@@ -2048,6 +2071,12 @@ function UserAgentAssistant() {
 
   const conversation = plan?.agentConversation;
 
+  /**
+   * 把用户纠偏或补充作为同一会话的新一轮输入。
+   *
+   * 这里会合并当前表单中已确认的结构化参数，并只在自然语言明确提到源端或目标端时清除对应旧选择，
+   * 既允许用户说“把目标改成 X”，又不会因普通追问丢失此前已确认配置。
+   */
   const continueConversation = () => {
     const latestMessage = followUpMessage.trim();
     if (!latestMessage || planMutation.isPending) return;
@@ -2516,6 +2545,10 @@ function UserAgentAssistant() {
     ? "登录或项目上下文加载失败，请刷新页面后重试"
     : "请先在页面顶部选择一个项目";
 
+  /**
+   * 从目标输入框开始全新会话。先重置浏览器和控制面会话标识，再清理旧计划、审批、执行和消息状态，
+   * 避免“新建任务”错误续接到此前历史会话。
+   */
   const submitObjective = (values: ObjectiveFormValues) => {
     const browserSessionId = crypto.randomUUID();
     setAgentConversationSessionId(browserSessionId);
@@ -2544,6 +2577,9 @@ function UserAgentAssistant() {
     planMutation.mutate({ objective: values.objective, startNewSession: true });
   };
 
+  /**
+   * 仅重置当前协作工作台，不删除或归档服务端历史。正在进行的流式请求会先被取消，随后恢复默认输入态。
+   */
   const startNewConversation = () => {
     activePlanAbortControllerRef.current?.abort();
     const browserSessionId = crypto.randomUUID();

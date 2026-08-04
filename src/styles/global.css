@@ -925,6 +925,10 @@ select {
     grid-template-columns: 1fr;
   }
 }
+/*
+ * Agent 历史会话工作台：桌面端使用独立、可滚动且吸顶的历史栏，主协作区保持自身宽度；
+ * 小屏幕下历史栏回到普通文档流并改为卡片网格，避免侧栏挤压模型输出和配置审核表单。
+ */
 .agent-assistant-shell {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr);

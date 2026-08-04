@@ -256,6 +256,7 @@ export function AgentConsole() {
     queryKey: ["agent-tools"],
     queryFn: api.listAgentTools,
   });
+  // 管理控制台使用 API 的默认活跃会话范围；用户历史页另行传 archived 参数切换归档分区。
   const sessionsQuery = useQuery({
     queryKey: ["agent-sessions"],
     queryFn: () => api.listAgentSessions(),

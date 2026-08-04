@@ -1941,6 +1941,12 @@ function normalizeAgentRun(value: unknown, index: number): AgentRun {
   };
 }
 
+/**
+ * 将后端不可信 JSON 规范化为前端稳定的 AgentSession。
+ *
+ * 历史数据或滚动升级期间可能缺少 delegation/messages 等新字段，因此这里统一补空集合和布尔默认值；
+ * 同时只接受可识别的 USER/AGENT 角色，避免组件到处重复做空值判断。该函数只做结构兼容，不推导权限。
+ */
 function normalizeAgentSession(value: unknown, index: number): AgentSession {
   const record = isRecord(value) ? value : {};
   const workspace = isRecord(record.workspace) ? record.workspace : undefined;
@@ -2439,6 +2445,12 @@ function putJson<T>(path: string, body?: unknown) {
   });
 }
 
+/**
+ * 发送 JSON Merge 风格的局部状态修改请求。
+ *
+ * 当前用于置顶和归档等不会替换完整资源的动作；认证、项目 Header、刷新 token 与全局错误展开仍由
+ * request() 统一处理，避免每个 API 重复实现安全链路。
+ */
 function patchJson<T>(path: string, body?: unknown) {
   return request<T>(path, {
     method: "PATCH",
@@ -2812,18 +2824,22 @@ export const api = {
       data: normalizeSyncConnectorCompatibility(result.data),
     };
   },
+  /** 查询当前项目范围内可访问的 Agent 会话历史，可切换活跃/归档集合。 */
   listAgentSessions: (params?: { archived?: boolean; limit?: number; actorId?: string }) => {
     const query = compactQueryString(params);
     return arrayEndpoint<AgentSession>(`/agent/sessions${query ? `?${query}` : ""}`, [], normalizeAgentSession);
   },
+  /** 加载完整会话聚合，用于恢复消息并在同一 session 中继续追问。 */
   getAgentSession: async (sessionId: string) => {
     const result = await request<unknown>(`/agent/sessions/${sessionId}`);
     return { ...result, data: normalizeAgentSession(result.data, 0) };
   },
+  /** 修改会话置顶状态；后端仍会校验当前用户是会话所有者。 */
   setAgentSessionPinned: async (sessionId: string, enabled: boolean) => {
     const result = await patchJson<unknown>(`/agent/sessions/${sessionId}/pin`, { enabled });
     return { ...result, data: normalizeAgentSession(result.data, 0) };
   },
+  /** 归档或恢复会话，操作不会删除消息、运行记录和审计证据。 */
   setAgentSessionArchived: async (sessionId: string, enabled: boolean) => {
     const result = await patchJson<unknown>(`/agent/sessions/${sessionId}/archive`, { enabled });
     return { ...result, data: normalizeAgentSession(result.data, 0) };

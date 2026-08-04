@@ -1087,9 +1087,18 @@ export interface AgentRun {
   message?: string;
 }
 
+/**
+ * 用户授予 Agent 的最小权限快照。
+ *
+ * 该结构用于向用户解释 Agent 被允许调用哪些工具和资源，不表示前端可以自行授权；实际执行仍由后端
+ * 校验有效期、撤销状态、用户权限和下游资源归属。
+ */
 export interface AgentDelegation {
+  /** 委托审计编号，用于关联 user + agent + session + run。 */
   delegationId: string;
+  /** 被委托执行的 Agent 主体。 */
   agentId: string;
+  /** 授权来源用户，Agent 权限不能超过该用户。 */
   userActorId: string;
   tenantId?: number;
   projectId?: number;
@@ -1102,6 +1111,7 @@ export interface AgentDelegation {
   revokedAt?: string;
 }
 
+/** 一条持久化对话消息，runId 用于关联产生该轮消息的具体 Agent 运行。 */
 export interface AgentConversationMessage {
   messageId: string;
   runId?: string;
@@ -1112,6 +1122,7 @@ export interface AgentConversationMessage {
 
 export interface AgentSession {
   sessionId: string;
+  /** 与 actorId 并列的执行主体，实现用户与 Agent 双主体审计。 */
   agentId?: string;
   tenantId?: number;
   projectId?: number;
@@ -1123,9 +1134,13 @@ export interface AgentSession {
   workspace?: AgentWorkspace;
   toolBindings: AgentToolBinding[];
   runs: AgentRun[];
+  /** 本会话当前生效或已失效的委托快照。 */
   delegation?: AgentDelegation;
+  /** 按时间顺序恢复的多轮对话上下文。 */
   messages: AgentConversationMessage[];
+  /** 仅影响用户历史列表顺序。 */
   pinned: boolean;
+  /** 归档仅隐藏到历史分区，不删除记录。 */
   archived: boolean;
   archivedAt?: string;
   lastMessageAt?: string;
