@@ -1946,6 +1946,7 @@ function normalizeAgentSession(value: unknown, index: number): AgentSession {
   const workspace = isRecord(record.workspace) ? record.workspace : undefined;
   return {
     sessionId: readString(record.sessionId, `session-${index + 1}`),
+    agentId: readOptionalString(record.agentId),
     tenantId: readOptionalNumber(record.tenantId),
     projectId: readOptionalNumber(record.projectId),
     workspaceId: readOptionalNumber(record.workspaceId),
@@ -1958,6 +1959,35 @@ function normalizeAgentSession(value: unknown, index: number): AgentSession {
       ? record.toolBindings.map(normalizeAgentToolBinding)
       : [],
     runs: Array.isArray(record.runs) ? record.runs.map(normalizeAgentRun) : [],
+    delegation: isRecord(record.delegation) ? {
+      delegationId: readString(record.delegation.delegationId),
+      agentId: readString(record.delegation.agentId),
+      userActorId: readString(record.delegation.userActorId),
+      tenantId: readOptionalNumber(record.delegation.tenantId),
+      projectId: readOptionalNumber(record.delegation.projectId),
+      toolCodes: readStringArray(record.delegation.toolCodes),
+      actions: readStringArray(record.delegation.actions),
+      resourceScopes: readStringArray(record.delegation.resourceScopes),
+      status: readString(record.delegation.status, "UNKNOWN"),
+      issuedAt: readOptionalString(record.delegation.issuedAt),
+      expiresAt: readOptionalString(record.delegation.expiresAt),
+      revokedAt: readOptionalString(record.delegation.revokedAt),
+    } : undefined,
+    messages: Array.isArray(record.messages) ? record.messages.map((item, messageIndex) => {
+      const messageRecord = isRecord(item) ? item : {};
+      const role = readString(messageRecord.role, "AGENT").toUpperCase();
+      return {
+        messageId: readString(messageRecord.messageId, `message-${messageIndex + 1}`),
+        runId: readOptionalString(messageRecord.runId),
+        role: role === "USER" ? "USER" as const : "AGENT" as const,
+        content: readString(messageRecord.content),
+        createTime: readOptionalString(messageRecord.createTime),
+      };
+    }) : [],
+    pinned: readBoolean(record.pinned),
+    archived: readBoolean(record.archived),
+    archivedAt: readOptionalString(record.archivedAt),
+    lastMessageAt: readOptionalString(record.lastMessageAt),
     createTime: readOptionalString(record.createTime),
     updateTime: readOptionalString(record.updateTime),
   };
@@ -2409,6 +2439,13 @@ function putJson<T>(path: string, body?: unknown) {
   });
 }
 
+function patchJson<T>(path: string, body?: unknown) {
+  return request<T>(path, {
+    method: "PATCH",
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+}
+
 function deleteJson<T>(path: string) {
   return request<T>(path, { method: "DELETE" });
 }
@@ -2775,7 +2812,22 @@ export const api = {
       data: normalizeSyncConnectorCompatibility(result.data),
     };
   },
-  listAgentSessions: () => arrayEndpoint<AgentSession>("/agent/sessions", [], normalizeAgentSession),
+  listAgentSessions: (params?: { archived?: boolean; limit?: number; actorId?: string }) => {
+    const query = compactQueryString(params);
+    return arrayEndpoint<AgentSession>(`/agent/sessions${query ? `?${query}` : ""}`, [], normalizeAgentSession);
+  },
+  getAgentSession: async (sessionId: string) => {
+    const result = await request<unknown>(`/agent/sessions/${sessionId}`);
+    return { ...result, data: normalizeAgentSession(result.data, 0) };
+  },
+  setAgentSessionPinned: async (sessionId: string, enabled: boolean) => {
+    const result = await patchJson<unknown>(`/agent/sessions/${sessionId}/pin`, { enabled });
+    return { ...result, data: normalizeAgentSession(result.data, 0) };
+  },
+  setAgentSessionArchived: async (sessionId: string, enabled: boolean) => {
+    const result = await patchJson<unknown>(`/agent/sessions/${sessionId}/archive`, { enabled });
+    return { ...result, data: normalizeAgentSession(result.data, 0) };
+  },
   createAgentSession: async (payload: CreateAgentSessionPayload) => {
     const result = await postJson<unknown>("/agent/sessions", payload);
     return {

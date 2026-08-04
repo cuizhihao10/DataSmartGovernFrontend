@@ -1087,8 +1087,32 @@ export interface AgentRun {
   message?: string;
 }
 
+export interface AgentDelegation {
+  delegationId: string;
+  agentId: string;
+  userActorId: string;
+  tenantId?: number;
+  projectId?: number;
+  toolCodes: string[];
+  actions: string[];
+  resourceScopes: string[];
+  status: string;
+  issuedAt?: string;
+  expiresAt?: string;
+  revokedAt?: string;
+}
+
+export interface AgentConversationMessage {
+  messageId: string;
+  runId?: string;
+  role: "USER" | "AGENT";
+  content: string;
+  createTime?: string;
+}
+
 export interface AgentSession {
   sessionId: string;
+  agentId?: string;
   tenantId?: number;
   projectId?: number;
   workspaceId?: number;
@@ -1099,6 +1123,12 @@ export interface AgentSession {
   workspace?: AgentWorkspace;
   toolBindings: AgentToolBinding[];
   runs: AgentRun[];
+  delegation?: AgentDelegation;
+  messages: AgentConversationMessage[];
+  pinned: boolean;
+  archived: boolean;
+  archivedAt?: string;
+  lastMessageAt?: string;
   createTime?: string;
   updateTime?: string;
 }

@@ -9,7 +9,11 @@ import {
   EditOutlined,
   EyeOutlined,
   FileExcelOutlined,
+  HistoryOutlined,
+  InboxOutlined,
   PlusOutlined,
+  PushpinFilled,
+  PushpinOutlined,
   QuestionCircleOutlined,
   ReadOutlined,
   RobotOutlined,
@@ -18,7 +22,7 @@ import {
   ToolOutlined,
   UploadOutlined,
 } from "@ant-design/icons";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
   AutoComplete,
@@ -132,6 +136,7 @@ interface PlanSubmission {
   recoveryTaskId?: number;
   recoveryExecutionId?: number;
   preserveTimeline?: boolean;
+  startNewSession?: boolean;
 }
 
 interface AgentChatMessage {
@@ -842,6 +847,7 @@ function humanReadableToolName(toolName: string) {
 
 function UserAgentAssistant() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [objectiveForm] = Form.useForm<ObjectiveFormValues>();
   const [clarificationForm] = Form.useForm<ClarificationFormValues>();
   const [quickClarificationForm] = Form.useForm<QuickClarificationValues>();
@@ -849,7 +855,10 @@ function UserAgentAssistant() {
   const [objective, setObjective] = useState(defaultObjective);
   // 同一个助手页面生命周期内复用稳定会话 ID，使 SESSION_ONLY 模型响应缓存具备安全命中条件。
   // 缓存 key 仍包含租户、项目、模型、工具集合和完整消息摘要，不会把不同问题误命中为同一响应。
-  const [agentConversationSessionId] = useState(() => crypto.randomUUID());
+  const [agentConversationSessionId, setAgentConversationSessionId] = useState<string>(() => crypto.randomUUID());
+  const [activeAgentRuntimeSessionId, setActiveAgentRuntimeSessionId] = useState<string>();
+  const [activeSessionArchived, setActiveSessionArchived] = useState(false);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
   const [controlPlane, setControlPlane] = useState<{ sessionId: string; runId: string }>();
   const [plan, setPlan] = useState<AgentPlanResponse>();
   const [liveObservationItems, setLiveObservationItems] = useState<AgentObservationTimelineItem[]>([]);
@@ -885,6 +894,23 @@ function UserAgentAssistant() {
     controlPlane?: { sessionId: string; runId: string };
     reviewConfirmed: boolean;
   }>();
+  const historyProjectRef = useRef(selectedProjectId);
+
+  useEffect(() => {
+    if (historyProjectRef.current === selectedProjectId) return;
+    historyProjectRef.current = selectedProjectId;
+    activePlanAbortControllerRef.current?.abort();
+    setAgentConversationSessionId(crypto.randomUUID());
+    setActiveAgentRuntimeSessionId(undefined);
+    setActiveSessionArchived(false);
+    setConversationMessages([]);
+    setPlan(undefined);
+    setControlPlane(undefined);
+    setLiveObservationItems([]);
+    setExecutionResults([]);
+    setExecutionAnswer(undefined);
+    setFollowUpMessage("");
+  }, [selectedProjectId]);
 
   const beginAgentProcess = (owner: "PLAN" | "EXECUTION") => {
     const startedAt = Date.now();
@@ -931,6 +957,59 @@ function UserAgentAssistant() {
   });
   const session = sessionQuery.data?.data;
   const projectId = selectedProjectId ? Number(selectedProjectId) : undefined;
+  const sessionHistoryQuery = useQuery({
+    queryKey: ["agent-assistant-session-history", projectId, showArchivedSessions],
+    queryFn: () => api.listAgentSessions({ archived: showArchivedSessions, limit: 100 }),
+    enabled: Boolean(projectId && session?.actorId),
+    retry: false,
+  });
+  const sessionHistory = sessionHistoryQuery.data?.data ?? [];
+  const loadSessionMutation = useMutation({
+    mutationFn: (sessionId: string) => api.getAgentSession(sessionId),
+    onSuccess: (result) => {
+      const historicalSession = result.data;
+      setActiveAgentRuntimeSessionId(historicalSession.sessionId);
+      setAgentConversationSessionId(historicalSession.sessionId);
+      setActiveSessionArchived(historicalSession.archived);
+      setObjective(historicalSession.objective);
+      objectiveForm.setFieldsValue({ objective: historicalSession.objective });
+      setConversationMessages(historicalSession.messages.map((item) => ({
+        id: item.messageId,
+        role: item.role,
+        content: item.content,
+      })));
+      setPlan(undefined);
+      setControlPlane(undefined);
+      setExecutionResults([]);
+      setExecutionAnswer(undefined);
+      setLiveObservationItems([]);
+      setFollowUpMessage("");
+      setConfigurationReviewConfirmed(false);
+      setShowAdvancedClarification(false);
+    },
+    onError: (error) => message.error(errorMessage(error)),
+  });
+  const pinSessionMutation = useMutation({
+    mutationFn: ({ sessionId, enabled }: { sessionId: string; enabled: boolean }) => (
+      api.setAgentSessionPinned(sessionId, enabled)
+    ),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
+    },
+    onError: (error) => message.error(errorMessage(error)),
+  });
+  const archiveSessionMutation = useMutation({
+    mutationFn: ({ sessionId, enabled }: { sessionId: string; enabled: boolean }) => (
+      api.setAgentSessionArchived(sessionId, enabled)
+    ),
+    onSuccess: (result) => {
+      if (result.data.sessionId === activeAgentRuntimeSessionId) {
+        setActiveSessionArchived(result.data.archived);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
+    },
+    onError: (error) => message.error(errorMessage(error)),
+  });
   const clarificationWatchOptions = { form: clarificationForm, preserve: true } as const;
   const clarificationSourceDatasourceId = Form.useWatch("sourceDatasourceId", clarificationWatchOptions);
   const clarificationTargetDatasourceId = Form.useWatch("targetDatasourceId", clarificationWatchOptions);
@@ -1308,6 +1387,9 @@ function UserAgentAssistant() {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
         sessionId: agentConversationSessionId,
+        agentRuntimeSessionId: submission.startNewSession
+          ? undefined
+          : controlPlane?.sessionId ?? activeAgentRuntimeSessionId,
         cacheKeyScope: "session_only",
         conversationMessages: completeConversation.slice(-12).map((item) => ({
           role: item.role === "USER" ? "user" : "assistant",
@@ -1483,6 +1565,11 @@ function UserAgentAssistant() {
         });
       }
       setPlan(nextPlan);
+      const ingestedRuntimeSessionId = textField(nextPlan.controlPlaneIngestion, "sessionId");
+      if (ingestedRuntimeSessionId) {
+        setActiveAgentRuntimeSessionId(ingestedRuntimeSessionId);
+        setActiveSessionArchived(false);
+      }
       setLiveObservationItems((current) => current.map((item) => (
         item.id.startsWith("live-") && item.status === "RUNNING"
           ? {
@@ -1611,6 +1698,10 @@ function UserAgentAssistant() {
         return;
       }
       setControlPlane({ sessionId, runId });
+      setActiveAgentRuntimeSessionId(sessionId);
+      setAgentConversationSessionId(sessionId);
+      setActiveSessionArchived(false);
+      void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
       setShowAdvancedClarification(false);
       reviewEditSnapshotRef.current = undefined;
       message.success(hasCompleteLifecyclePlan
@@ -2426,6 +2517,10 @@ function UserAgentAssistant() {
     : "请先在页面顶部选择一个项目";
 
   const submitObjective = (values: ObjectiveFormValues) => {
+    const browserSessionId = crypto.randomUUID();
+    setAgentConversationSessionId(browserSessionId);
+    setActiveAgentRuntimeSessionId(undefined);
+    setActiveSessionArchived(false);
     setObjective(values.objective);
     setPlan(undefined);
     setLiveObservationItems([]);
@@ -2446,7 +2541,28 @@ function UserAgentAssistant() {
       role: "USER",
       content: values.objective,
     }]);
-    planMutation.mutate({ objective: values.objective });
+    planMutation.mutate({ objective: values.objective, startNewSession: true });
+  };
+
+  const startNewConversation = () => {
+    activePlanAbortControllerRef.current?.abort();
+    const browserSessionId = crypto.randomUUID();
+    setAgentConversationSessionId(browserSessionId);
+    setActiveAgentRuntimeSessionId(undefined);
+    setActiveSessionArchived(false);
+    setObjective(defaultObjective);
+    objectiveForm.setFieldsValue({ objective: defaultObjective });
+    setConversationMessages([]);
+    setPlan(undefined);
+    setControlPlane(undefined);
+    setExecutionResults([]);
+    setExecutionAnswer(undefined);
+    setLiveObservationItems([]);
+    setFollowUpMessage("");
+    setShowAdvancedClarification(false);
+    setConfigurationReviewConfirmed(false);
+    clarificationForm.resetFields();
+    quickClarificationForm.resetFields();
   };
 
   const submitTaskImportArtifact = () => {
@@ -2455,6 +2571,9 @@ function UserAgentAssistant() {
       return;
     }
     setObjective(taskImportObjective);
+    setAgentConversationSessionId(crypto.randomUUID());
+    setActiveAgentRuntimeSessionId(undefined);
+    setActiveSessionArchived(false);
     setPlan(undefined);
     setControlPlane(undefined);
     setExecutionResults([]);
@@ -2463,6 +2582,7 @@ function UserAgentAssistant() {
       objective: taskImportObjective,
       taskImportArtifactRef: taskImportArtifact.artifactRef,
       taskImportRunImmediately,
+      startNewSession: true,
     });
   };
 
@@ -2801,7 +2921,90 @@ function UserAgentAssistant() {
   ) : null;
 
   return (
-    <div className="page-stack">
+    <div className="agent-assistant-shell">
+      <aside className="agent-session-sidebar">
+        <div className="agent-session-sidebar-header">
+          <div>
+            <Typography.Text strong>历史会话</Typography.Text>
+            <Typography.Text type="secondary" className="agent-session-sidebar-caption">
+              当前项目内的个人 Agent 记录
+            </Typography.Text>
+          </div>
+          <Tooltip title="新建会话">
+            <Button type="text" icon={<PlusOutlined />} onClick={startNewConversation} />
+          </Tooltip>
+        </div>
+        <Button
+          block
+          icon={showArchivedSessions ? <HistoryOutlined /> : <InboxOutlined />}
+          onClick={() => setShowArchivedSessions((current) => !current)}
+        >
+          {showArchivedSessions ? "返回进行中会话" : "查看已归档"}
+        </Button>
+        <div className="agent-session-list">
+          {sessionHistoryQuery.isLoading ? <Spin size="small" /> : null}
+          {!sessionHistoryQuery.isLoading && !sessionHistory.length ? (
+            <Typography.Text type="secondary" className="agent-session-empty">
+              {showArchivedSessions ? "暂无已归档会话" : "暂无历史会话"}
+            </Typography.Text>
+          ) : null}
+          {sessionHistory.map((item) => (
+            <div
+              key={item.sessionId}
+              role="button"
+              tabIndex={0}
+              className={`agent-session-item${activeAgentRuntimeSessionId === item.sessionId ? " is-active" : ""}`}
+              onClick={() => loadSessionMutation.mutate(item.sessionId)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  loadSessionMutation.mutate(item.sessionId);
+                }
+              }}
+            >
+              <div className="agent-session-item-title">
+                {item.pinned ? <PushpinFilled /> : null}
+                <Typography.Text ellipsis>{item.objective || "未命名会话"}</Typography.Text>
+              </div>
+              <Typography.Text type="secondary" className="agent-session-item-time">
+                {item.lastMessageAt || item.updateTime
+                  ? new Date(item.lastMessageAt || item.updateTime || "").toLocaleString("zh-CN", {
+                      month: "2-digit",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })
+                  : "刚刚"}
+              </Typography.Text>
+              <div className="agent-session-item-actions">
+                <Tooltip title={item.pinned ? "取消置顶" : "置顶"}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={item.pinned ? <PushpinFilled /> : <PushpinOutlined />}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      pinSessionMutation.mutate({ sessionId: item.sessionId, enabled: !item.pinned });
+                    }}
+                  />
+                </Tooltip>
+                <Tooltip title={item.archived ? "恢复会话" : "归档"}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={item.archived ? <HistoryOutlined /> : <InboxOutlined />}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      archiveSessionMutation.mutate({ sessionId: item.sessionId, enabled: !item.archived });
+                    }}
+                  />
+                </Tooltip>
+              </div>
+            </div>
+          ))}
+        </div>
+      </aside>
+      <div className="page-stack agent-assistant-main">
       <PageHeader
         title="智能助手"
         subtitle="从自然语言理解、缺参追问到真实工具执行的受控 Agent"
@@ -2869,6 +3072,70 @@ function UserAgentAssistant() {
           />
         ) : null}
       </Card>
+
+      {!conversation && activeAgentRuntimeSessionId && conversationMessages.length ? (
+        <Card
+          title="继续历史会话"
+          className="compact-card agent-conversation-card"
+          extra={<Tag color={activeSessionArchived ? "default" : "blue"}>
+            {activeSessionArchived ? "已归档" : "可继续追问"}
+          </Tag>}
+        >
+          {activeSessionArchived ? (
+            <Alert
+              showIcon
+              type="info"
+              message="这是已归档会话"
+              description="历史内容保持只读。点击左侧恢复按钮后，可以在同一个会话中继续追问。"
+              style={{ marginBottom: 16 }}
+            />
+          ) : null}
+          <div className="agent-message-list">
+            {conversationMessages.map((item) => (
+              <div
+                key={item.id}
+                className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}
+              >
+                <div className="agent-message-meta">{item.role === "USER" ? "你" : "Agent"}</div>
+                <div className="agent-message-bubble">
+                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
+                    {item.content}
+                  </Typography.Paragraph>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="agent-composer">
+            <Input.TextArea
+              value={followUpMessage}
+              onChange={(event) => setFollowUpMessage(event.target.value)}
+              onPressEnter={(event) => {
+                if (!event.shiftKey) {
+                  event.preventDefault();
+                  continueConversation();
+                }
+              }}
+              autoSize={{ minRows: 2, maxRows: 6 }}
+              placeholder="继续补充、追问或纠正 Agent。Enter 发送，Shift + Enter 换行"
+              disabled={activeSessionArchived || executionInProgress}
+            />
+            <div className="agent-composer-footer">
+              <Typography.Text type="secondary">
+                后续消息会创建新的 Run，但仍归属于当前历史会话。
+              </Typography.Text>
+              <Button
+                type="primary"
+                icon={<ArrowRightOutlined />}
+                onClick={continueConversation}
+                disabled={activeSessionArchived || !followUpMessage.trim() || executionInProgress}
+                loading={planMutation.isPending}
+              >
+                发送
+              </Button>
+            </div>
+          </div>
+        </Card>
+      ) : null}
 
       <Card title="告诉 Agent 你想完成什么" className="compact-card">
         <Form<ObjectiveFormValues>
@@ -4234,6 +4501,7 @@ function UserAgentAssistant() {
           </Space>
         </Card>
       ) : null}
+      </div>
     </div>
   );
 }

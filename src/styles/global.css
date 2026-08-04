@@ -925,3 +925,130 @@ select {
     grid-template-columns: 1fr;
   }
 }
+.agent-assistant-shell {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.agent-assistant-main {
+  min-width: 0;
+}
+
+.agent-session-sidebar {
+  position: sticky;
+  top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 112px);
+  padding: 16px;
+  overflow: hidden;
+  border: 1px solid #dfe4e8;
+  border-radius: 16px;
+  background:
+    linear-gradient(145deg, rgb(242 247 245 / 96%), rgb(252 250 244 / 96%)),
+    repeating-linear-gradient(135deg, transparent 0 12px, rgb(23 88 73 / 3%) 12px 13px);
+  box-shadow: 0 12px 32px rgb(36 55 49 / 8%);
+}
+
+.agent-session-sidebar-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agent-session-sidebar-caption {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.agent-session-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 80px;
+  padding-right: 2px;
+  overflow-y: auto;
+}
+
+.agent-session-empty {
+  padding: 24px 8px;
+  text-align: center;
+}
+
+.agent-session-item {
+  position: relative;
+  padding: 11px 38px 11px 12px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: rgb(255 255 255 / 64%);
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.agent-session-item:hover,
+.agent-session-item:focus-visible {
+  border-color: #9bbbae;
+  background: #fff;
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.agent-session-item.is-active {
+  border-color: #367c68;
+  background: #e8f2ee;
+}
+
+.agent-session-item-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-session-item-title .ant-typography {
+  max-width: 155px;
+}
+
+.agent-session-item-time {
+  display: block;
+  margin-top: 5px;
+  font-size: 11px;
+}
+
+.agent-session-item-actions {
+  position: absolute;
+  top: 6px;
+  right: 4px;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.agent-session-item:hover .agent-session-item-actions,
+.agent-session-item:focus-within .agent-session-item-actions,
+.agent-session-item.is-active .agent-session-item-actions {
+  opacity: 1;
+}
+
+@media (max-width: 960px) {
+  .agent-assistant-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-session-sidebar {
+    position: static;
+    max-height: 320px;
+  }
+
+  .agent-session-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  }
+}

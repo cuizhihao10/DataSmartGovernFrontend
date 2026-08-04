@@ -258,7 +258,7 @@ export function AgentConsole() {
   });
   const sessionsQuery = useQuery({
     queryKey: ["agent-sessions"],
-    queryFn: api.listAgentSessions,
+    queryFn: () => api.listAgentSessions(),
   });
   const routesQuery = useQuery({
     queryKey: ["agent-model-routes"],
