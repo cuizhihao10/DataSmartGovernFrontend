@@ -707,7 +707,13 @@ export interface AgentPlanStreamFrame {
   data?: unknown;
   reason?: string;
   message?: string;
-  error?: { code?: string; message?: string; errorType?: string };
+  error?: {
+    code?: string;
+    message?: string;
+    errorType?: string;
+    recoverable?: boolean;
+    suggestions?: string[];
+  };
 }
 
 export interface AgentPlanCancellationResponse {
@@ -2900,7 +2906,11 @@ export const api = {
       if (frame.type === "error") {
         throw new ApiError(
           frame.error?.message || "Agent 规划未能完成，请查看最后一个进度节点后重试。",
-          { reason: frame.error?.code },
+          {
+            reason: frame.error?.code,
+            recoverable: frame.error?.recoverable,
+            suggestions: frame.error?.suggestions,
+          },
         );
       }
       if (frame.type === "cancelled") {

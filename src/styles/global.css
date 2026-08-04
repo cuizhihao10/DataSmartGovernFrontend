@@ -278,6 +278,18 @@ select {
     linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%);
 }
 
+.agent-plan-recovery {
+  margin: 14px 0;
+  border-color: #e4a29c;
+  background:
+    linear-gradient(90deg, rgba(181, 55, 43, 0.06), transparent 58%),
+    #fffafa;
+}
+
+.agent-plan-recovery .ant-alert-description {
+  width: 100%;
+}
+
 .agent-message-list {
   display: flex;
   flex-direction: column;

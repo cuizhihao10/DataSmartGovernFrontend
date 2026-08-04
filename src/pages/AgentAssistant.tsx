@@ -46,6 +46,7 @@ import {
 } from "antd";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import type { AgentPlanStreamFrame, AgentPlanStreamProgressEvent } from "@/api/endpoints";
 import { PageHeader } from "@/components/PageHeader";
@@ -155,6 +156,19 @@ interface ExecutionAnswer {
   recoveryRequiresConfirmation?: boolean;
   continuationStatus?: string;
   repairProposal?: AgentRepairProposal;
+}
+
+/**
+ * 一次 Agent 规划失败后保留在页面上的恢复上下文。
+ *
+ * 与 toast 不同，该对象会持续存在到用户重试、切换项目或开始新目标，确保用户能看到具体原因、系统是否允许
+ * 原地恢复以及服务端建议。结构中不保存数据源密码、SQL 凭据或 Provider 原始响应。
+ */
+interface AgentPlanFailure {
+  message: string;
+  code?: string;
+  recoverable: boolean;
+  suggestions: string[];
 }
 
 type AgentProcessStatus = "IDLE" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
@@ -329,6 +343,23 @@ function definedFormValues<T extends object>(values: T): Partial<T> {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "请求失败，请查看详细错误后重试";
+}
+
+/** 将 API/流式异常转换成页面可持久展示的低敏恢复信息。 */
+function agentPlanFailure(error: unknown): AgentPlanFailure {
+  if (error instanceof ApiError) {
+    return {
+      message: error.message,
+      code: error.reason,
+      recoverable: error.recoverable !== false,
+      suggestions: error.suggestions ?? [],
+    };
+  }
+  return {
+    message: errorMessage(error),
+    recoverable: true,
+    suggestions: [],
+  };
 }
 
 function isAgentPlanAbort(error: unknown) {
@@ -870,6 +901,7 @@ function UserAgentAssistant() {
   const [executionInProgress, setExecutionInProgress] = useState(false);
   const [executionResults, setExecutionResults] = useState<AgentToolExecutionResult[]>([]);
   const [executionAnswer, setExecutionAnswer] = useState<ExecutionAnswer>();
+  const [planFailure, setPlanFailure] = useState<AgentPlanFailure>();
   const [taskImportArtifact, setTaskImportArtifact] = useState<SyncTaskImportArtifact>();
   const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
   const [showAdvancedClarification, setShowAdvancedClarification] = useState(false);
@@ -913,6 +945,7 @@ function UserAgentAssistant() {
     setLiveObservationItems([]);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
+    setPlanFailure(undefined);
     setFollowUpMessage("");
   }, [selectedProjectId]);
 
@@ -994,6 +1027,7 @@ function UserAgentAssistant() {
       setControlPlane(undefined);
       setExecutionResults([]);
       setExecutionAnswer(undefined);
+      setPlanFailure(undefined);
       setLiveObservationItems([]);
       setFollowUpMessage("");
       setConfigurationReviewConfirmed(false);
@@ -1537,6 +1571,7 @@ function UserAgentAssistant() {
       // executable while the latest configuration is being resolved.
       setControlPlane(undefined);
       setConfigurationReviewConfirmed(false);
+      setPlanFailure(undefined);
       if (!submission.preserveTimeline) {
         setLiveObservationItems([]);
         setLiveRequestId(undefined);
@@ -1761,6 +1796,7 @@ function UserAgentAssistant() {
       }
       finishAgentProcess("PLAN", "FAILED");
       const summary = errorMessage(error);
+      setPlanFailure(agentPlanFailure(error));
       setConversationMessages((current) => [...current, {
         id: `agent-error-${crypto.randomUUID()}`,
         role: "AGENT",
@@ -2110,6 +2146,37 @@ function UserAgentAssistant() {
       conversationContext: nextConversationMessages,
       preserveTimeline: true,
     });
+  };
+
+  /**
+   * 用当前浏览器表单中的最新配置重新发起核对。
+   *
+   * 失败后不能从旧 conversation.resolvedConfiguration 重建请求，因为它正是上一轮“目标端/映射缺失”的历史
+   * 快照。这里直接读取两个表单并合并，让用户刚选择的数据源、两条对象映射、字段映射、WHERE 与确认标志完整
+   * 进入 variables.dataSyncRequest。startNewSession 只决定是否复用 Java 控制面会话，不会清空当前配置。
+   */
+  const retryPlanWithCurrentConfiguration = (startNewSession = false) => {
+    if (planMutation.isPending) return;
+    const clarification: Partial<ClarificationFormValues> = {
+      ...clarificationForm.getFieldsValue(true),
+      ...definedFormValues(quickClarificationForm.getFieldsValue(true)),
+    };
+    if (startNewSession) {
+      setAgentConversationSessionId(crypto.randomUUID());
+      setActiveAgentRuntimeSessionId(undefined);
+    }
+    planMutation.mutate({
+      objective,
+      clarification,
+      preserveTimeline: true,
+      startNewSession,
+    });
+  };
+
+  /** 打开当前页高级配置并滚动到真实元数据驱动的表单，不丢弃已有选择。 */
+  const openRetainedAdvancedConfiguration = () => {
+    setShowAdvancedClarification(true);
+    window.setTimeout(() => scrollToAgentSection("agent-clarification-card"), 0);
   };
   const missingParameterSet = new Set(conversation?.missingParameters ?? []);
   const needsSourceDatasource = missingParameterSet.has("sourceDatasourceId");
@@ -2561,6 +2628,7 @@ function UserAgentAssistant() {
     setControlPlane(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
+    setPlanFailure(undefined);
     setFollowUpMessage("");
     setShowAdvancedClarification(false);
     setConfigurationReviewConfirmed(false);
@@ -2593,6 +2661,7 @@ function UserAgentAssistant() {
     setControlPlane(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
+    setPlanFailure(undefined);
     setLiveObservationItems([]);
     setFollowUpMessage("");
     setShowAdvancedClarification(false);
@@ -2956,6 +3025,51 @@ function UserAgentAssistant() {
     </div>
   ) : null;
 
+  /**
+   * 规划失败后的常驻恢复区。它使用 useWatch 得到的当前表单值计算保留摘要，因此即使 plan 仍是上一次成功响应，
+   * 页面也不会再把旧缺参状态误说成“用户没有填写”。
+   */
+  const planFailurePanel = planFailure ? (
+    <Alert
+      showIcon
+      type="error"
+      className="agent-plan-recovery"
+      message="本轮计划未接入控制面，当前配置已保留"
+      description={(
+        <Space direction="vertical" size={10} style={{ width: "100%" }}>
+          <Typography.Text>{planFailure.message}</Typography.Text>
+          <Space wrap>
+            {effectiveSourceDatasourceId ? <Tag color="green">源端 #{effectiveSourceDatasourceId}</Tag> : <Tag>源端未选择</Tag>}
+            {effectiveTargetDatasourceId ? <Tag color="green">目标端 #{effectiveTargetDatasourceId}</Tag> : <Tag>目标端未选择</Tag>}
+            <Tag color={clarificationMappings.length ? "green" : "default"}>
+              已保留 {clarificationMappings.length} 条对象映射
+            </Tag>
+            <Tag color={metadataDefaultFieldCount ? "green" : "default"}>
+              已保留 {metadataDefaultFieldCount} 个同步字段
+            </Tag>
+            {planFailure.code ? <Tag color="red">{planFailure.code}</Tag> : null}
+          </Space>
+          <Typography.Text type="secondary">
+            下方上一轮“待补充”内容只是最后一次成功返回的历史快照，不代表当前表单；重试会提交以上已保留配置。
+          </Typography.Text>
+          {planFailure.suggestions.length ? (
+            <Typography.Text type="secondary">建议：{planFailure.suggestions.join("；")}</Typography.Text>
+          ) : null}
+          <Space wrap>
+            <Button type="primary" onClick={() => retryPlanWithCurrentConfiguration(false)}>
+              使用当前配置重试
+            </Button>
+            <Button onClick={() => scrollToAgentSection("agent-conversation-composer")}>
+              继续补充或纠偏
+            </Button>
+            <Button onClick={openRetainedAdvancedConfiguration}>打开高级配置</Button>
+            <Button onClick={() => retryPlanWithCurrentConfiguration(true)}>新会话重试</Button>
+          </Space>
+        </Space>
+      )}
+    />
+  ) : null;
+
   return (
     <div className="agent-assistant-shell">
       <aside className="agent-session-sidebar">
@@ -3218,6 +3332,10 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
+      {!conversation && planFailurePanel ? (
+        <Card className="compact-card">{planFailurePanel}</Card>
+      ) : null}
+
       {conversation ? (
         <Card
           title="与 Agent 协作"
@@ -3259,6 +3377,7 @@ function UserAgentAssistant() {
               </div>
             ) : null}
           </div>
+          {planFailurePanel}
           <Space wrap className="agent-resolution-strip">
             <Tag color="blue">{conversation.structuredIntent.intentType}</Tag>
             {conversation.structuredIntent.syncMode ? (
@@ -3317,7 +3436,7 @@ function UserAgentAssistant() {
               description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
             />
           ) : null}
-          {conversation.phase === "WAITING_CLARIFICATION" ? (
+          {conversation.phase === "WAITING_CLARIFICATION" && !planFailure ? (
             <Alert
               showIcon
               type="warning"

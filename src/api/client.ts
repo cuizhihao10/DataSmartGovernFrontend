@@ -217,13 +217,29 @@ export class ApiError extends Error {
   readonly status?: number;
   readonly reason?: string;
   readonly traceId?: string;
+  readonly recoverable?: boolean;
+  readonly suggestions?: string[];
 
-  constructor(message: string, options: { status?: number; reason?: string; traceId?: string } = {}) {
+  /**
+   * 统一 API 错误除了 HTTP 状态和链路标识，还可以携带服务端给出的可恢复语义。
+   *
+   * 流式 Agent 请求的业务失败发生在响应建立之后，无法再依赖 HTTP status 表达“当前配置可重试”；
+   * recoverable/suggestions 因此作为低敏结构化信息保留下来，页面可以渲染常驻恢复动作，而不是只弹 toast。
+   */
+  constructor(message: string, options: {
+    status?: number;
+    reason?: string;
+    traceId?: string;
+    recoverable?: boolean;
+    suggestions?: string[];
+  } = {}) {
     super(message);
     this.name = "ApiError";
     this.status = options.status;
     this.reason = options.reason;
     this.traceId = options.traceId;
+    this.recoverable = options.recoverable;
+    this.suggestions = options.suggestions;
   }
 }
 
