@@ -57,3 +57,15 @@ OIDC 模式使用 Authorization Code + PKCE，登录后前端只把 `Authorizati
 - `src/pages`: 产品页面
 - `src/store`: 轻量 UI 状态
 - `src/types`: 领域类型
+
+## Agent 历史会话能力（2026-08-05）
+
+智能助手页面已经接入后端 durable Agent session：
+
+- 左侧会话栏只展示当前项目、当前用户可访问的历史会话，并区分进行中与已归档会话。
+- 用户可以置顶、取消置顶、归档、恢复会话；这些操作更新后端会话事实，不只保存在浏览器状态中。
+- 打开历史会话时恢复用户可见消息；继续追问会沿用原 session，并在该 session 下创建新的 Run。
+- 切换项目时主动清空当前会话、执行结果和补充输入，避免前一个项目的会话状态残留到新项目。
+- 前端不会显示或保存模型隐藏推理，只展示经过治理、允许用户查看的 Agent 公共回复和工具执行摘要。
+
+本轮验证已通过 `npm run lint` 与 `npm run build`。Vite 仍提示主 JavaScript bundle 大于 `500kB`，后续应按页面和大型依赖做路由级拆包，但该 warning 不阻断当前功能交付。
