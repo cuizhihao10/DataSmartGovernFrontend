@@ -156,6 +156,11 @@ interface ExecutionAnswer {
   recoveryRequiresConfirmation?: boolean;
   continuationStatus?: string;
   repairProposal?: AgentRepairProposal;
+  /**
+   * 后续修复建议仍然有效，但承载该建议的 Durable Run 已不存在时记录原因。
+   * 页面据此隐藏失效的确认按钮，并提供重新生成审核计划的持久入口。
+   */
+  recoveryRunUnavailableReason?: string;
 }
 
 /**
@@ -343,6 +348,17 @@ function definedFormValues<T extends object>(values: T): Partial<T> {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "请求失败，请查看详细错误后重试";
+}
+
+/**
+ * 判断确认请求是否命中了已经失效的 Agent Run。
+ *
+ * 历史版本曾在追加助手消息时用旧会话快照覆盖整个聚合，导致 Python 刚生成的修复 Run 被删除。后端修复后
+ * 新请求不会再产生该状态，但用户浏览器和数据库中仍可能保留旧 Run ID，因此页面必须提供一次性迁移恢复入口。
+ */
+function isMissingAgentRunError(error: unknown) {
+  const message = errorMessage(error);
+  return /Agent Run 不存在|runId=.*不存在|NEXT_RUN_NOT_DURABLE/i.test(message);
 }
 
 /** 将 API/流式异常转换成页面可持久展示的低敏恢复信息。 */
@@ -1985,6 +2001,9 @@ function UserAgentAssistant() {
           recoveryRequiresConfirmation: Boolean(result.data.continuation?.requiresConfirmation),
           continuationStatus: result.data.continuation?.status,
           repairProposal: result.data.continuation?.repairProposal,
+          recoveryRunUnavailableReason: result.data.continuation?.stoppedReason === "NEXT_RUN_NOT_DURABLE"
+            ? result.data.continuation.message || result.data.continuation.assistantReply
+            : undefined,
         });
         if (recoveryRunId && result.data.continuation?.sessionId) {
           setControlPlane({
@@ -2094,6 +2113,22 @@ function UserAgentAssistant() {
       });
     },
     onError: (error) => {
+      if (isMissingAgentRunError(error)) {
+        const reason = errorMessage(error);
+        // 旧页面状态中的 recoveryRunId 已经无法执行。立即撤销控制面确认入口，但保留 repairProposal 和
+        // 当前高级配置；用户随后点击“重新生成”只会形成一份新审核计划，不会绕过授权直接保存任务。
+        setControlPlane(undefined);
+        setConfigurationReviewConfirmed(false);
+        setExecutionAnswer((current) => current ? {
+          ...current,
+          recoveryRunId: undefined,
+          recoveryRequiresConfirmation: false,
+          continuationStatus: "RECOVERY_RUN_UNAVAILABLE",
+          recoveryRunUnavailableReason: reason,
+        } : current);
+        message.error("更名修复计划已失效，任务配置和建议名称仍已保留，请重新生成审核计划");
+        return;
+      }
       message.error(errorMessage(error));
     },
     onSettled: (data, error) => {
@@ -2170,6 +2205,29 @@ function UserAgentAssistant() {
       clarification,
       preserveTimeline: true,
       startNewSession,
+    });
+  };
+
+  /**
+   * 使用 Agent 已建议的新名称和当前页面保留的完整配置重新生成受治理计划。
+   *
+   * 该动作只修复“历史 recovery Run 已丢失”的控制面引用，不自动保存、发布或执行同步任务。新计划仍会重新
+   * 展示数据源、对象映射、字段映射和 WHERE，并要求用户再次确认，从而同时满足可恢复性与高风险写操作授权边界。
+   */
+  const regenerateTaskNameRepairPlan = () => {
+    const proposedTaskName = executionAnswer?.repairProposal?.proposedTaskName?.trim();
+    if (!proposedTaskName || planMutation.isPending) return;
+    clarificationForm.setFieldValue("taskName", proposedTaskName);
+    const clarification: Partial<ClarificationFormValues> = {
+      ...clarificationForm.getFieldsValue(true),
+      ...definedFormValues(quickClarificationForm.getFieldsValue(true)),
+      taskName: proposedTaskName,
+    };
+    planMutation.mutate({
+      objective,
+      clarification,
+      followUpMessage: `采用 Agent 建议，将任务名称改为“${proposedTaskName}”，使用当前已审核配置重新生成计划；不要直接执行。`,
+      preserveTimeline: true,
     });
   };
 
@@ -2279,6 +2337,11 @@ function UserAgentAssistant() {
   );
   const taskNameRepairActive = failureRecoveryPlanActive
     && executionAnswer?.repairProposal?.kind === "DUPLICATE_TASK_NAME";
+  const taskNameRepairNeedsRegeneration = Boolean(
+    executionAnswer?.repairProposal?.kind === "DUPLICATE_TASK_NAME"
+    && !executionAnswer.recoveryRunId
+    && executionAnswer.recoveryRunUnavailableReason,
+  );
   const activeToolNames = failureRecoveryPlanActive
     ? [...new Set(audits.map((audit) => audit.toolCode))]
     : latestDurableTurn?.submittedToolNames?.length
@@ -4629,18 +4692,31 @@ function UserAgentAssistant() {
             <Alert
               showIcon
               type={executionAnswer.recoveryRunId ? "info" : "warning"}
-              message={executionAnswer.recoveryRunId
+              message={taskNameRepairNeedsRegeneration
+                ? "上一次更名修复 Run 已失效，请重新生成审核计划"
+                : executionAnswer.recoveryRunId
                 ? (executionAnswer.repairProposal?.kind === "DUPLICATE_TASK_NAME"
                   ? "等待你确认任务名称修改"
                   : executionAnswer.recoveryRequiresConfirmation
                   ? "Agent 已完成只读诊断，并形成需要你确认的修复方案"
                   : "Agent 已创建后续诊断 Run")
                 : "Agent 已完成失败分析，但尚未形成可执行修复动作"}
-              description={executionAnswer.recoveryRunId
+              description={taskNameRepairNeedsRegeneration
+                ? `${executionAnswer.recoveryRunUnavailableReason} 建议名称与当前完整任务配置均已保留；重新生成后仍需你审核确认，系统不会直接保存或执行。`
+                : executionAnswer.recoveryRunId
                 ? executionAnswer.repairProposal?.kind === "DUPLICATE_TASK_NAME"
                   ? `后续 Run：${executionAnswer.recoveryRunId}。请在上方核对精确名称变更并确认；确认前不会重新保存或执行任务。`
                   : `后续 Run：${executionAnswer.recoveryRunId}。只读检查可自动执行；修改任务、表结构或数据前仍需你明确确认。`
                 : "失败事实已保留。你可以继续用自然语言补充信息，Agent 会基于当前会话继续排查。"}
+              action={taskNameRepairNeedsRegeneration ? (
+                <Button
+                  type="primary"
+                  loading={planMutation.isPending}
+                  onClick={regenerateTaskNameRepairPlan}
+                >
+                  重新生成更名修复计划
+                </Button>
+              ) : undefined}
               style={{ marginTop: 12 }}
             />
           ) : null}
