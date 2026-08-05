@@ -313,13 +313,18 @@ const syncModeLabels: Record<string, string> = {
 };
 
 const clarificationParameterLabels: Record<string, string> = {
+  taskName: "任务名称",
   sourceDatasourceId: "源端数据源",
   targetDatasourceId: "目标端数据源",
+  syncMode: "同步模式",
+  writeStrategy: "写入方式",
   objectMappings: "源表到目标表的对象映射",
   fieldMappings: "每条对象映射中至少一个有效字段映射",
   mappingDefaultsConfirmation: "默认同名字段映射与无 WHERE 范围确认",
+  scheduleConfig: "定期任务调度配置",
   scheduleFrequency: "定期任务执行频率",
   scheduleStartTime: "首次执行时间",
+  customSqlText: "SQL 语句",
   customSqlConfirmation: "SQL 内容确认",
   targetTableResolution: "目标表不存在时的处理方式",
   fieldMappingConversions: "字段类型冲突的转换或映射方案",
@@ -993,11 +998,24 @@ function buildHistoricalConversationTranscript(
     process.run.runId,
     textField(process.run.variables, "interactionOrigin") as AgentInteractionOrigin | undefined,
   ]));
+  const latestUserMessageByRunId = new Map(processes.map((process) => [
+    process.run.runId,
+    textField(process.run.variables, "latestUserMessage"),
+  ]));
   let initialObjectiveMessageSeen = false;
   const visibleMessages = messages.filter((message) => {
     if (message.role !== "USER" || message.content.trim() !== objective.trim()) return true;
     const origin = message.runId ? originByRunId.get(message.runId) : undefined;
     if (origin === "USER_MESSAGE") {
+      const latestUserMessage = message.runId
+        ? latestUserMessageByRunId.get(message.runId)
+        : undefined;
+      // Before interactionOrigin became a strict protocol, some form retries were
+      // persisted as USER_MESSAGE and copied the session objective without recording
+      // latestUserMessage. Keep the first objective, but hide later copies that have
+      // no durable evidence of a user-authored turn. A genuine repeated question from
+      // the current implementation carries latestUserMessage and remains visible.
+      if (initialObjectiveMessageSeen && !latestUserMessage) return false;
       initialObjectiveMessageSeen = true;
       return true;
     }
@@ -1032,6 +1050,380 @@ function buildHistoricalConversationTranscript(
   return {
     entries,
     currentMessages: visibleMessages.filter((message) => !message.runId || !processRunIds.has(message.runId)),
+  };
+}
+
+interface HistoricalAgentRecoverySnapshot {
+  plan: AgentPlanResponse;
+  formValues: Partial<ClarificationFormValues>;
+  controlPlane?: { sessionId: string; runId: string };
+  failure?: AgentPlanFailure;
+  openAdvancedEditor: boolean;
+}
+
+/**
+ * Convert a persisted JSON value into a positive resource ID.
+ *
+ * Historical Run variables can come from Java/Jackson, PostgreSQL JSON or an older
+ * frontend version, so the same identifier may be a number or a numeric string.
+ * Null, zero and negative values are deliberately rejected; restoring them would
+ * recreate the original ``datasourceId=null`` execution bug.
+ */
+function positiveHistoricalId(value: unknown) {
+  const normalized = typeof value === "number" ? value : Number(String(value ?? "").trim());
+  return Number.isInteger(normalized) && normalized > 0 ? normalized : undefined;
+}
+
+/** Read the latest audited arguments for one tool across all Runs in a session. */
+function latestHistoricalToolArguments(
+  processes: HistoricalAgentRunProcess[],
+  toolCode: string,
+) {
+  for (const process of [...processes].reverse()) {
+    const audit = [...process.audits].reverse().find((item) => item.toolCode === toolCode);
+    if (audit) return audit.planArguments;
+    const compactPlans = Array.isArray(process.run.variables.toolPlans)
+      ? process.run.variables.toolPlans
+      : [];
+    for (const rawPlan of [...compactPlans].reverse()) {
+      if (!rawPlan || typeof rawPlan !== "object" || Array.isArray(rawPlan)) continue;
+      const compactPlan = rawPlan as Record<string, unknown>;
+      if (textField(compactPlan, "toolCode") !== toolCode) continue;
+      return recordField(compactPlan, "arguments") ?? {};
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Recover a datasource ID from successful catalog output when no later draft saved it.
+ * Only the platform's exact-match output is trusted; candidate arrays and model text are
+ * never converted into an identity automatically.
+ */
+function exactHistoricalCatalogDatasourceId(
+  processes: HistoricalAgentRunProcess[],
+  toolCode: string,
+) {
+  for (const process of [...processes].reverse()) {
+    for (const result of [...process.results].reverse()) {
+      if (result.audit.toolCode !== toolCode || result.audit.state !== "SUCCEEDED") continue;
+      const output = result.output as Record<string, unknown>;
+      if (textField(output, "matchStatus")?.toUpperCase() !== "EXACT") continue;
+      const resolved = positiveHistoricalId(output.resolvedDatasourceId);
+      if (resolved) return resolved;
+    }
+  }
+  return undefined;
+}
+
+/** Build the minimal question contract used by the existing progressive form renderer. */
+function historicalClarificationQuestion(parameterName: string) {
+  const definitions: Record<string, { inputType: string; fieldPath: string; question: string }> = {
+    sourceDatasourceId: {
+      inputType: "SOURCE_DATASOURCE_SELECT",
+      fieldPath: "dataSyncRequest.sourceDatasourceId",
+      question: "请选择当前项目中已授权、可作为源端的数据源。",
+    },
+    targetDatasourceId: {
+      inputType: "TARGET_DATASOURCE_SELECT",
+      fieldPath: "dataSyncRequest.targetDatasourceId",
+      question: "请选择当前项目中已授权、可作为目标端的数据源。",
+    },
+    taskName: {
+      inputType: "TEXT",
+      fieldPath: "dataSyncRequest.taskName",
+      question: "请修改任务名称后重新核对。",
+    },
+    objectMappings: {
+      inputType: "OBJECT_MAPPING_EDITOR",
+      fieldPath: "dataSyncRequest.objectMappings",
+      question: "请补充真实的源表到目标表对象映射。",
+    },
+    fieldMappings: {
+      inputType: "FIELD_MAPPING_EDITOR",
+      fieldPath: "dataSyncRequest.objectMappings[].fieldMappings",
+      question: "请为每条对象映射确认至少一个源字段到目标字段。",
+    },
+  };
+  const definition = definitions[parameterName] ?? {
+    inputType: "TEXT",
+    fieldPath: `dataSyncRequest.${parameterName}`,
+    question: `请补充${clarificationParameterLabel(parameterName)}。`,
+  };
+  return {
+    parameterName,
+    fieldPath: definition.fieldPath,
+    label: clarificationParameterLabel(parameterName),
+    question: definition.question,
+    inputType: definition.inputType,
+    required: true,
+    sensitive: false,
+    allowsNaturalLanguageCorrection: true,
+  };
+}
+
+/**
+ * Convert a backend validation path into the field name understood by the page form.
+ *
+ * Tool adapters from different generations may report either ``datasourceId``, a
+ * top-level business field or a complete path such as
+ * ``dataSyncRequest.objectMappings[].fieldMappings``.  Keeping this compatibility
+ * at the history boundary lets the form use one stable set of parameter names while
+ * preserving source/target semantics from the tool code.
+ */
+function historicalMissingParameter(toolCode: string, rawField: unknown) {
+  const fieldPath = String(rawField ?? "").trim();
+  if (!fieldPath) return undefined;
+  const leaf = fieldPath.split(".").pop()?.replace(/\[\]/g, "") || fieldPath;
+  if (leaf === "datasourceId" && toolCode.includes(".source.")) return "sourceDatasourceId";
+  if (leaf === "datasourceId" && toolCode.includes(".target.")) return "targetDatasourceId";
+  if (/fieldMappings/i.test(fieldPath)) return "fieldMappings";
+  if (/objectMappings/i.test(fieldPath)) return "objectMappings";
+  return leaf;
+}
+
+/**
+ * Turn a historical failure into user-facing recovery advice without pretending
+ * that a business conflict is an unfilled form field.  Exact repair execution is
+ * still delegated to the next Agent Run and remains subject to preview/approval.
+ */
+function historicalFailureSuggestions(
+  failureText: string,
+  missingParameters: string[],
+) {
+  if (missingParameters.length) {
+    return missingParameters.map((parameter) => `补充或修正${clarificationParameterLabel(parameter)}`);
+  }
+  if (/(目标表).*(非空|已有数据|存在数据)|target table.*(not empty|contains data)/i.test(failureText)) {
+    return [
+      "让 Agent 读取预检查证据并给出清空目标表、改用 UPDATE/MERGE 或调整映射的可审核方案",
+      "打开高级配置人工修改写入方式或对象映射后重新预检查",
+    ];
+  }
+  if (/(权限|无权|forbidden|permission|403)/i.test(failureText)) {
+    return ["核对当前项目成员角色和数据源授权，再让 Agent 在同一会话中重试"];
+  }
+  if (/(连接|connection|timeout|超时|认证|credential)/i.test(failureText)) {
+    return ["测试对应数据源连接并修正连接配置，或重新选择当前项目内已授权的数据源"];
+  }
+  return [
+    "让 Agent 根据失败工具、错误详情和运行证据继续诊断",
+    "打开高级配置人工修正后，在当前会话重新生成并审核执行计划",
+  ];
+}
+
+/**
+ * Rebuild an actionable Agent turn from durable history.
+ *
+ * Historical loading previously restored only chat bubbles and diagnostic timelines;
+ * the live ``agentConversation`` contract, form values and control-plane pointer were
+ * cleared.  That made a failed Run visually explainable but operationally dead.  This
+ * reducer reconstructs only verifiable facts from tool audits/results and then feeds
+ * them back into the same progressive form and approval components used by a new task.
+ */
+function buildHistoricalRecoverySnapshot(
+  processes: HistoricalAgentRunProcess[],
+  objective: string,
+): HistoricalAgentRecoverySnapshot | undefined {
+  const latestProcess = processes[processes.length - 1];
+  if (!latestProcess) return undefined;
+
+  const draftArguments = latestHistoricalToolArguments(processes, "sync.task.draft.save") ?? {};
+  const sourceDatasourceId = positiveHistoricalId(draftArguments.sourceDatasourceId)
+    ?? positiveHistoricalId(
+      latestHistoricalToolArguments(processes, "datasource.source.connection.test")?.datasourceId,
+    )
+    ?? positiveHistoricalId(
+      latestHistoricalToolArguments(processes, "datasource.source.metadata.read")?.datasourceId,
+    )
+    ?? exactHistoricalCatalogDatasourceId(processes, "datasource.source.catalog.search");
+  const targetDatasourceId = positiveHistoricalId(draftArguments.targetDatasourceId)
+    ?? positiveHistoricalId(
+      latestHistoricalToolArguments(processes, "datasource.target.connection.test")?.datasourceId,
+    )
+    ?? positiveHistoricalId(
+      latestHistoricalToolArguments(processes, "datasource.target.metadata.read")?.datasourceId,
+    )
+    ?? exactHistoricalCatalogDatasourceId(processes, "datasource.target.catalog.search");
+  const rawObjectMappings = Array.isArray(draftArguments.objectMappings)
+    ? draftArguments.objectMappings.filter((item): item is Record<string, unknown> => (
+        Boolean(item && typeof item === "object" && !Array.isArray(item))
+      ))
+    : [];
+  const objectMappings = resolvedObjectMappings(rawObjectMappings);
+  const objectiveMode = /(实时|cdc|binlog|wal)/i.test(objective)
+    ? "CDC_STREAMING"
+    : /(sql\s*语句|自定义\s*sql)/i.test(objective)
+      ? "CUSTOM_SQL_QUERY"
+      : /(定期|定时|周期)/i.test(objective)
+        ? "SCHEDULED_FULL"
+        : "FULL";
+  const syncMode = normalizeUserSyncMode(textField(draftArguments, "syncMode") || objectiveMode);
+  const writeStrategy = textField(draftArguments, "writeStrategy") === "UPDATE" ? "UPDATE" : "INSERT";
+  const taskName = textField(draftArguments, "taskName");
+  const scheduleConfig = textField(draftArguments, "scheduleConfig");
+  const customSqlText = textField(draftArguments, "customSqlText");
+  const customSqlConfirmed = booleanField(draftArguments, "customSqlConfirmed");
+  const targetTableResolution = textField(draftArguments, "targetTableResolution");
+  const mappingDefaultsConfirmed = booleanField(draftArguments, "mappingDefaultsConfirmed");
+  const missing = new Set<string>();
+  let duplicateTaskNameFailure = false;
+
+  latestProcess.audits.forEach((audit) => {
+    const missingFields = Array.isArray(audit.parameterValidation.missingFields)
+      ? audit.parameterValidation.missingFields
+      : [];
+    missingFields.forEach((rawField) => {
+      const parameter = historicalMissingParameter(audit.toolCode, rawField);
+      if (parameter) missing.add(parameter);
+    });
+    if (audit.state !== "FAILED") return;
+    const failureText = `${audit.errorCode || ""} ${audit.message || ""}`;
+    if (audit.toolCode === "sync.task.draft.save" && /(重名|重复|duplicate|already exists)/i.test(failureText)) {
+      duplicateTaskNameFailure = true;
+      missing.add("taskName");
+    }
+  });
+
+  // Reconcile stale validation facts against the newest durable configuration.
+  // A failed probe with datasourceId=null must not override a valid ID recovered
+  // from an earlier exact catalog result or a later saved draft in this session.
+  if (sourceDatasourceId) missing.delete("sourceDatasourceId");
+  else missing.add("sourceDatasourceId");
+  if (targetDatasourceId) missing.delete("targetDatasourceId");
+  else missing.add("targetDatasourceId");
+  if (taskName && !duplicateTaskNameFailure) missing.delete("taskName");
+  if (scheduleConfig) {
+    missing.delete("scheduleConfig");
+    missing.delete("scheduleFrequency");
+    missing.delete("scheduleStartTime");
+  }
+  if (customSqlText) missing.delete("customSqlText");
+  if (customSqlConfirmed) missing.delete("customSqlConfirmation");
+  if (targetTableResolution) missing.delete("targetTableResolution");
+  if (mappingDefaultsConfirmed) missing.delete("mappingDefaultsConfirmation");
+
+  if (objectMappings.length) missing.delete("objectMappings");
+  else if (sourceDatasourceId && targetDatasourceId) missing.add("objectMappings");
+  const hasIncompleteFieldMappings = objectMappings.length > 0 && objectMappings.some(
+    (mapping) => !mapping.fieldMappings.some((field) => (
+      field.syncEnabled !== false && field.sourceField && field.targetField
+    )),
+  );
+  if (objectMappings.length && !hasIncompleteFieldMappings) missing.delete("fieldMappings");
+  else if (hasIncompleteFieldMappings) missing.add("fieldMappings");
+
+  const failedAudit = [...latestProcess.audits].reverse().find((audit) => audit.state === "FAILED");
+  const waitingForApproval = latestProcess.audits.some((audit) => audit.state === "WAITING_APPROVAL");
+  const hasFailure = latestProcess.run.state === "FAILED" || Boolean(failedAudit);
+  const missingParameters = [...missing];
+  const failureText = `${failedAudit?.errorCode || ""} ${failedAudit?.message || latestProcess.run.message || ""}`;
+  const assistantMessage = hasFailure
+    ? missingParameters.length
+      ? `${failedAudit?.message || latestProcess.run.message || "上一轮工具执行失败。"} 已保留能够恢复的任务配置，请补充列出的真实缺项后继续。`
+      : `${failedAudit?.message || latestProcess.run.message || "上一轮工具执行失败。"} 任务配置已完整恢复；请让 Agent 依据失败证据继续诊断，或打开高级配置人工调整。`
+    : waitingForApproval
+      ? "上一轮计划正在等待你的审核。请预览配置后确认执行、修改设置或拒绝本次方案。"
+      : "历史会话已恢复，可以继续补充、纠偏或提交当前配置。";
+  const toolPlans = latestProcess.audits.map((audit) => ({
+    toolName: audit.toolCode,
+    reason: audit.planReason,
+    arguments: audit.planArguments,
+    riskLevel: audit.riskLevel,
+    executionMode: audit.executionMode,
+    requiresHumanApproval: audit.requiresApproval,
+    parameterValidation: audit.parameterValidation,
+    governanceHints: audit.governanceHints,
+  }));
+  const resolvedTaskName = taskName || "Agent 创建的数据同步任务";
+  const phase = missingParameters.length ? "WAITING_CLARIFICATION" : "READY_FOR_CONFIRMATION";
+  const resolvedConfiguration = {
+    taskName: resolvedTaskName,
+    syncMode,
+    writeStrategy,
+    sourceDatasourceId,
+    targetDatasourceId,
+    scheduleConfig,
+    customSqlText,
+    customSqlConfirmed,
+    targetTableResolution,
+    objectMappings: rawObjectMappings,
+    objectMappingSource: "HISTORICAL_TOOL_AUDIT",
+    fieldMappingSource: "HISTORICAL_TOOL_AUDIT",
+    mappingDefaultsConfirmed,
+    autoFilledFields: [],
+    payloadPolicy: "LOW_SENSITIVE_HISTORICAL_RECOVERY",
+  };
+
+  return {
+    plan: {
+      plan: {
+        requestId: latestProcess.run.runId,
+        stateTrace: ["historical_session_restored", hasFailure ? "waiting_recovery" : "waiting_user_action"],
+        toolPlans,
+        requiresHumanApproval: waitingForApproval,
+        responseSummary: assistantMessage,
+        nextActions: latestProcess.run.nextActions,
+      },
+      agentConversation: {
+        schemaVersion: "1.0-history-recovery",
+        turnId: latestProcess.run.runId,
+        phase,
+        assistantMessage,
+        structuredIntent: {
+          intentType: "CREATE_DATA_SYNC_TASK",
+          domains: ["DATA_SYNC"],
+          candidateTools: toolPlans.map((item) => item.toolName),
+          riskTags: [],
+          confidence: 0,
+          syncMode,
+          writeStrategy,
+          sourceDatasourceSelected: Boolean(sourceDatasourceId),
+          targetDatasourceSelected: Boolean(targetDatasourceId),
+          objectMappingCount: objectMappings.length,
+        },
+        resolvedConfiguration,
+        missingParameters,
+        clarificationQuestions: missingParameters.map(historicalClarificationQuestion),
+        canExecute: waitingForApproval && !missingParameters.length,
+        controlPlaneIngested: true,
+        nextAction: missingParameters.length ? "ANSWER_CLARIFICATIONS" : "CONFIRM_AND_EXECUTE",
+        intentResolver: {
+          mode: "HISTORICAL_DURABLE_RECOVERY",
+          providerInvokedForCurrentTurn: false,
+          providerSucceededForCurrentTurn: false,
+        },
+        payloadPolicy: "LOW_SENSITIVE_HISTORICAL_RECOVERY",
+      },
+      raw: { restoredFromRunId: latestProcess.run.runId },
+    },
+    formValues: {
+      taskName: resolvedTaskName,
+      syncMode,
+      writeStrategy,
+      sourceDatasourceId,
+      targetDatasourceId,
+      scheduleConfig,
+      customSqlText,
+      customSqlConfirmed,
+      targetTableResolution: targetTableResolution as ClarificationFormValues["targetTableResolution"],
+      mappingDefaultsConfirmed,
+      objectMappings: objectMappings.length ? objectMappings : [{
+        objectKey: "historical-recovery-mapping-1",
+        targetObjectName: "",
+        fieldMappings: [],
+      }],
+    },
+    controlPlane: waitingForApproval && !hasFailure
+      ? { sessionId: latestProcess.run.sessionId, runId: latestProcess.run.runId }
+      : undefined,
+    failure: hasFailure ? {
+      message: failedAudit?.message || latestProcess.run.message || "上一轮 Agent 执行失败。",
+      code: failedAudit?.errorCode,
+      recoverable: true,
+      suggestions: historicalFailureSuggestions(failureText, missingParameters),
+    } : undefined,
+    openAdvancedEditor: missing.has("objectMappings") || missing.has("fieldMappings") || missing.has("taskName"),
   };
 }
 
@@ -1432,6 +1824,10 @@ function UserAgentAssistant() {
     },
     onSuccess: (result) => {
       const historicalSession = result.sessionResult.data;
+      const recoverySnapshot = buildHistoricalRecoverySnapshot(
+        result.processes,
+        historicalSession.objective,
+      );
       setActiveAgentRuntimeSessionId(historicalSession.sessionId);
       setAgentConversationSessionId(historicalSession.sessionId);
       setActiveSessionArchived(historicalSession.archived);
@@ -1448,23 +1844,32 @@ function UserAgentAssistant() {
       setHistoryPlaybackWarning(result.failedRunCount
         ? `有 ${result.failedRunCount} 个旧 Run 的部分过程事实暂时无法读取，消息与其余过程已正常恢复。`
         : undefined);
-      setPlan(undefined);
-      setControlPlane(undefined);
+      // History is not a read-only transcript. Rehydrate the newest durable tool
+      // contract so failed parameter collection and waiting approvals use exactly
+      // the same forms/actions as a live Run in this session.
+      setPlan(recoverySnapshot?.plan);
+      setControlPlane(recoverySnapshot?.controlPlane);
       setExecutionResults([]);
       setExecutionAnswer(undefined);
-      setPlanFailure(undefined);
+      setPlanFailure(recoverySnapshot?.failure);
       setLiveObservationItems([]);
       setLiveRequestId(undefined);
       setFollowUpMessage("");
       setProcessStatus("IDLE");
+      setExecutionInProgress(false);
       setProcessStartedAt(undefined);
       setProcessElapsedMs(0);
       setProcessExpanded(false);
       setConfigurationReviewConfirmed(false);
-      setShowAdvancedClarification(false);
-      // 历史会话依靠其持久消息、Run 与 Agent memory 继续推理，不能夹带刚才另一个会话的临时表单值。
+      setShowAdvancedClarification(Boolean(recoverySnapshot?.openAdvancedEditor));
+      // Only verifiable values recovered from this session are restored. Values
+      // from the previously open session are discarded before hydration.
       clarificationForm.resetFields();
       quickClarificationForm.resetFields();
+      if (recoverySnapshot?.formValues) {
+        clarificationForm.setFieldsValue(recoverySnapshot.formValues);
+        quickClarificationForm.setFieldsValue(recoverySnapshot.formValues);
+      }
     },
     onError: (error) => message.error(errorMessage(error)),
   });
@@ -1489,6 +1894,30 @@ function UserAgentAssistant() {
       if (result.data.sessionId === activeAgentRuntimeSessionId) {
         setActiveSessionArchived(result.data.archived);
       }
+      void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
+    },
+    onError: (error) => message.error(errorMessage(error)),
+  });
+  /**
+   * Reject the currently restored approval scope without deleting conversation history.
+   * A rejection is a process decision, not a new chat message; afterwards the same
+   * session remains open for natural-language correction or a newly generated plan.
+   */
+  const rejectAgentRunMutation = useMutation({
+    mutationFn: async () => {
+      if (!controlPlane) throw new Error("当前没有可拒绝的 Agent 计划");
+      return api.cancelAgentRun(controlPlane.sessionId, controlPlane.runId);
+    },
+    onSuccess: (result) => {
+      setControlPlane(undefined);
+      setConfigurationReviewConfirmed(false);
+      setConversationMessages((current) => [...current, {
+        id: `agent-rejected-${crypto.randomUUID()}`,
+        role: "AGENT",
+        content: "已拒绝本次待执行方案，没有继续调用写入工具。当前会话和已填写配置仍保留，你可以直接修改后重新生成计划。",
+        runId: result.data.runId,
+      }]);
+      message.info("已拒绝本次方案，当前会话仍可继续修改");
       void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
     },
     onError: (error) => message.error(errorMessage(error)),
@@ -2673,6 +3102,26 @@ function UserAgentAssistant() {
   };
 
   /**
+   * Ask the model to interpret the latest durable failure while preserving all known
+   * form values. This is an internal recovery turn, so it creates a Run and visible
+   * Agent process but never fabricates a USER bubble.
+   */
+  const continueAgentDiagnosis = () => {
+    if (planMutation.isPending) return;
+    const clarification: Partial<ClarificationFormValues> = {
+      ...clarificationForm.getFieldsValue(true),
+      ...definedFormValues(quickClarificationForm.getFieldsValue(true)),
+    };
+    planMutation.mutate({
+      objective,
+      clarification,
+      followUpMessage: "请依据当前会话上一轮失败工具、错误码和已保留任务配置继续诊断；能安全自动补全的只读信息直接补全，涉及写入、删除、改表或执行任务时先展示方案并等待确认。",
+      preserveTimeline: true,
+      interactionOrigin: "SYSTEM_RECOVERY",
+    });
+  };
+
+  /**
    * 使用 Agent 已建议的新名称和当前页面保留的完整配置重新生成受治理计划。
    *
    * 该动作只修复“历史 recovery Run 已丢失”的控制面引用，不自动保存、发布或执行同步任务。新计划仍会重新
@@ -3584,7 +4033,7 @@ function UserAgentAssistant() {
       showIcon
       type="error"
       className="agent-plan-recovery"
-      message="本轮计划未接入控制面，当前配置已保留"
+      message="本轮处理未完成，当前会话和配置已保留"
       description={(
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
           <Typography.Text>{planFailure.message}</Typography.Text>
@@ -3600,20 +4049,34 @@ function UserAgentAssistant() {
             {planFailure.code ? <Tag color="red">{planFailure.code}</Tag> : null}
           </Space>
           <Typography.Text type="secondary">
-            下方上一轮“待补充”内容只是最后一次成功返回的历史快照，不代表当前表单；重试会提交以上已保留配置。
+            {missingParameterLabels.length
+              ? "你可以补齐列出的真实缺项后继续，也可以让 Agent 诊断或进入高级配置人工接管；所有操作都沿用当前历史会话。"
+              : "当前任务配置已恢复完整。你可以让 Agent 根据失败证据自我诊断，或进入高级配置人工调整；所有操作都沿用当前历史会话。"}
           </Typography.Text>
           {planFailure.suggestions.length ? (
             <Typography.Text type="secondary">建议：{planFailure.suggestions.join("；")}</Typography.Text>
           ) : null}
           <Space wrap>
-            <Button type="primary" onClick={() => retryPlanWithCurrentConfiguration(false)}>
-              使用当前配置重试
+            <Button
+              type={missingParameterLabels.length ? "primary" : "default"}
+              onClick={() => retryPlanWithCurrentConfiguration(false)}
+            >
+              {missingParameterLabels.length ? "提交当前补充并继续" : "使用当前配置重新核对"}
+            </Button>
+            <Button
+              type={missingParameterLabels.length ? "default" : "primary"}
+              icon={<RobotOutlined />}
+              onClick={continueAgentDiagnosis}
+            >
+              让 Agent 继续诊断
             </Button>
             <Button onClick={() => scrollToAgentSection("agent-conversation-composer")}>
               继续补充或纠偏
             </Button>
             <Button onClick={openRetainedAdvancedConfiguration}>打开高级配置</Button>
-            <Button onClick={() => retryPlanWithCurrentConfiguration(true)}>新会话重试</Button>
+            {(!effectiveSourceDatasourceId || !effectiveTargetDatasourceId) ? (
+              <Button onClick={() => navigate("/datasources")}>前往数据源管理</Button>
+            ) : null}
           </Space>
         </Space>
       )}
@@ -3834,7 +4297,7 @@ function UserAgentAssistant() {
               }}
               autoSize={{ minRows: 2, maxRows: 6 }}
               placeholder="继续补充、追问或纠正 Agent。Enter 发送，Shift + Enter 换行"
-              disabled={activeSessionArchived || executionInProgress || planMutation.isPending}
+              disabled={activeSessionArchived || planMutation.isPending}
             />
             <div className="agent-composer-footer">
               <Typography.Text type="secondary">
@@ -4040,7 +4503,7 @@ function UserAgentAssistant() {
               }}
               autoSize={{ minRows: 2, maxRows: 6 }}
               placeholder="继续告诉 Agent 需要补充、修改或纠正什么。Enter 发送，Shift + Enter 换行"
-              disabled={executionInProgress || planMutation.isPending}
+              disabled={activeSessionArchived || planMutation.isPending}
             />
             <div className="agent-composer-footer">
               <Typography.Text type="secondary">
@@ -4061,7 +4524,7 @@ function UserAgentAssistant() {
                   type="primary"
                   icon={<ArrowRightOutlined />}
                   onClick={continueConversation}
-                  disabled={!followUpMessage.trim() || executionInProgress}
+                  disabled={activeSessionArchived || !followUpMessage.trim() || executionInProgress}
                 >
                   发送
                 </Button>
@@ -5104,6 +5567,14 @@ function UserAgentAssistant() {
             onClick={() => executeMutation.mutate()}
           >
             {confirmationButtonLabel}
+          </Button>
+          <Button
+            icon={<StopOutlined />}
+            loading={rejectAgentRunMutation.isPending}
+            disabled={executeMutation.isPending || rejectAgentRunMutation.isPending}
+            onClick={() => rejectAgentRunMutation.mutate()}
+          >
+            拒绝本次方案
           </Button>
         </Card>
       ) : null}
