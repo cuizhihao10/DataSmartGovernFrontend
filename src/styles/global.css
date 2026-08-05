@@ -294,7 +294,8 @@ select {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  max-height: 480px;
+  /* 单一协作窗口需要承担完整历史、实时过程和最终回答，避免旧版两个聊天框各自挤占页面高度。 */
+  max-height: min(68vh, 760px);
   padding: 4px 2px 18px;
   overflow-y: auto;
 }
@@ -368,6 +369,10 @@ select {
 
 .agent-process-message-row .agent-process-shell {
   align-self: flex-start;
+}
+
+.agent-history-process {
+  background: #fbfcfd;
 }
 
 .agent-process-shell > .ant-collapse > .ant-collapse-item > .ant-collapse-header {

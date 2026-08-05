@@ -25,6 +25,7 @@ import type {
   AgentTool,
   AgentToolBinding,
   AgentToolExecutionAudit,
+  AgentToolExecutionResult,
   AgentToolInputField,
   AgentToolPlan,
   AuthorizationSubjectCandidate,
@@ -2286,6 +2287,21 @@ function normalizeAgentToolExecutionAudit(value: unknown, index: number): AgentT
   };
 }
 
+/**
+ * 规范化历史工具结果快照。
+ *
+ * 历史会话回放不能只展示工具审计状态，因为审计中的 outputSummary 只是一句话摘要；真正用于解释
+ * “Agent 调用了什么、得到了什么”的低敏结构化结果保存在 output 中。这里继续复用统一审计规范化，
+ * 并把未知或滚动升级期间缺失的 output 安全收口为空对象，避免页面因单个旧结果损坏而无法打开会话。
+ */
+function normalizeAgentToolExecutionResult(value: unknown, index: number): AgentToolExecutionResult {
+  const record = isRecord(value) ? value : {};
+  return {
+    audit: normalizeAgentToolExecutionAudit(record.audit, index),
+    output: readRecord(record.output),
+  };
+}
+
 function normalizeAgentRagResult(value: unknown): AgentRagQueryResult {
   const record = readRecord(value);
   const citations = Array.isArray(record.citations)
@@ -2876,6 +2892,16 @@ export const api = {
       `/agent/sessions/${sessionId}/runs/${runId}/tool-executions`,
       [],
       normalizeAgentToolExecutionAudit,
+    ),
+  /**
+   * 批量读取一个 Run 的低敏工具结果，供历史会话按回合恢复真实执行过程。
+   * 使用后端批量路由而不是逐 audit 查询，可避免多工具 Run 产生 N+1 请求。
+   */
+  listAgentToolExecutionResults: (sessionId: string, runId: string) =>
+    arrayEndpoint<AgentToolExecutionResult>(
+      `/agent/sessions/${sessionId}/runs/${runId}/tool-executions/results`,
+      [],
+      normalizeAgentToolExecutionResult,
     ),
   getAgentToolExecutionPolicy: (sessionId: string, runId: string) =>
     request<Record<string, unknown>>(`/agent/sessions/${sessionId}/runs/${runId}/tool-executions/execution-policy`),

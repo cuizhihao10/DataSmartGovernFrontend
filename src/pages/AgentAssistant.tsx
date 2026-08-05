@@ -73,6 +73,7 @@ import { useUiStore } from "@/store/uiStore";
 import type {
   AgentPlanResponse,
   AgentObservationTimelineItem,
+  AgentRun,
   AgentToolExecutionAudit,
   AgentToolExecutionFailure,
   AgentRepairProposal,
@@ -144,7 +145,27 @@ interface AgentChatMessage {
   id: string;
   role: "USER" | "AGENT";
   content: string;
+  /** 关联该消息所属的 Durable Run；历史回放据此把过程折叠条放在用户问题与最终回答之间。 */
+  runId?: string;
+  /** 服务端消息时间用于稳定恢复同一 Run 内多条阶段性回答的顺序。 */
+  createTime?: string;
 }
+
+/**
+ * 一个历史 Run 的完整可回放事实。
+ *
+ * run 保存模型路由、计划摘要和状态；audits 保存每个工具动作；results 保存工具返回的低敏结构化结果。
+ * 三者组合后，页面才能像 Codex 一样展示“做了什么、怎么做、结果如何”，而不是只留下最终一句回答。
+ */
+interface HistoricalAgentRunProcess {
+  run: AgentRun;
+  audits: AgentToolExecutionAudit[];
+  results: AgentToolExecutionResult[];
+}
+
+type HistoricalTranscriptEntry =
+  | { key: string; kind: "MESSAGE"; message: AgentChatMessage }
+  | { key: string; kind: "PROCESS"; process: HistoricalAgentRunProcess };
 
 interface ExecutionAnswer {
   content: string;
@@ -289,6 +310,14 @@ function clarificationParameterLabel(parameterName: string) {
 function textField(record: Record<string, unknown> | undefined, key: string) {
   const value = record?.[key];
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** 只接受普通 JSON 对象，供历史 Run 从持久化 variables 中逐层读取模型治理事实。 */
+function recordField(record: Record<string, unknown> | undefined, key: string) {
+  const value = record?.[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function booleanField(record: Record<string, unknown> | undefined, key: string) {
@@ -666,6 +695,279 @@ function actionPayloadText(value: unknown) {
   return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
+/**
+ * 从 Durable Run 中恢复本轮公开的模型决策动作。
+ *
+ * 系统不会保存或展示模型隐藏思维链，但会持久化实际路由、公开计划摘要、所选工具和治理结果。这些事实足以
+ * 解释模型是否参与、使用了哪个模型、提出了哪些受控动作，同时避免把系统提示词或 Provider 原始事件泄露给页面。
+ */
+function historicalModelAction(run: AgentRun): AgentActionItem | undefined {
+  const variables = run.variables;
+  const governance = recordField(variables, "modelGatewayGovernance");
+  const governanceAttributes = recordField(governance, "attributes");
+  const selectedRoute = recordField(governance, "selected_route")
+    || recordField(governance, "selectedRoute");
+  const cachePlan = recordField(governance, "cache_plan")
+    || recordField(governance, "cachePlan");
+  const budgetDecision = recordField(governance, "budget_decision")
+    || recordField(governance, "budgetDecision");
+  const toolPlans = Array.isArray(variables.toolPlans)
+    ? variables.toolPlans.filter((item): item is Record<string, unknown> => (
+        Boolean(item) && typeof item === "object" && !Array.isArray(item)
+      ))
+    : [];
+  const proposedTools = toolPlans
+    .map((item) => textField(item, "toolCode"))
+    .filter((item): item is string => Boolean(item));
+  const responseSummary = textField(variables, "responseSummary")
+    || textField(variables, "modelIntentSummary")
+    || run.message;
+  const provider = textField(selectedRoute, "provider_name")
+    || textField(selectedRoute, "providerName")
+    || textField(governanceAttributes, "selectedProvider");
+  const model = textField(selectedRoute, "model_name")
+    || textField(selectedRoute, "modelName");
+  if (!responseSummary && !provider && !model && !proposedTools.length) return undefined;
+  return {
+    id: `history-model-${run.runId}`,
+    kind: "MODEL_OUTPUT",
+    status: "SUCCEEDED",
+    title: "模型已完成目标理解与工具决策",
+    summary: responseSummary || `模型提出了 ${proposedTools.length} 个受控工具动作。`,
+    operation: `Responses API${model ? ` · ${model}` : ""}`,
+    targetService: provider || "model-gateway",
+    safeInput: sanitizeAgentActionPayload({
+      userInputPreview: run.userInputPreview,
+      stateTrace: Array.isArray(variables.stateTrace) ? variables.stateTrace : undefined,
+    }),
+    safeOutput: sanitizeAgentActionPayload({
+      publicDecisionSummary: responseSummary,
+      proposedTools,
+    }),
+    evidence: {
+      provider,
+      model,
+      cacheEnabled: cachePlan?.enabled,
+      cacheScope: cachePlan?.scope,
+      budgetAllowed: budgetDecision?.allowed,
+      toolCount: proposedTools.length,
+    },
+    startedAt: run.createTime,
+    completedAt: run.updateTime,
+    elapsedMs: agentActionElapsedMs(run.createTime, run.updateTime),
+  };
+}
+
+/** 根据 Run 与工具终态计算历史折叠条状态，避免把“等待审批”误显示成已经成功。 */
+function historicalRunDisplayStatus(process: HistoricalAgentRunProcess) {
+  const auditStates = process.audits.map((audit) => audit.state);
+  if (process.run.state === "CANCELLED" || auditStates.includes("CANCELLED")) return "CANCELLED";
+  if (process.run.state === "FAILED" || auditStates.includes("FAILED")) return "FAILED";
+  if (auditStates.includes("EXECUTING")) return "RUNNING";
+  if (auditStates.includes("WAITING_APPROVAL")) return "WAITING_APPROVAL";
+  if (auditStates.includes("PLANNED") || auditStates.includes("APPROVED")) return "PENDING";
+  if (process.audits.length && auditStates.every((state) => ["SUCCEEDED", "SKIPPED"].includes(state))) {
+    return "SUCCEEDED";
+  }
+  return agentActionStatus(process.run.state);
+}
+
+/** 取 Run 或最后一个工具事实的结束时间，用于恢复真实处理耗时。 */
+function historicalRunElapsedMs(process: HistoricalAgentRunProcess) {
+  const auditTimes = process.audits.flatMap((audit) => (
+    [audit.executionFinishTime, audit.updateTime].filter((item): item is string => Boolean(item))
+  ));
+  const candidates = [process.run.finishTime, process.run.updateTime, ...auditTimes]
+    .filter((item): item is string => Boolean(item))
+    .sort((left, right) => new Date(right).getTime() - new Date(left).getTime());
+  return agentActionElapsedMs(process.run.createTime, candidates[0]) ?? 0;
+}
+
+/**
+ * 历史 Run 的 Codex 风格过程折叠条。
+ *
+ * 默认只显示“已处理/失败/等待 + 耗时”；展开后才展示模型公开决策、真实工具/API、脱敏参数、结果与审计证据。
+ * 该组件只消费服务端事实，不会执行工具，也不会改变 Run 状态。
+ */
+function HistoricalAgentRunProcessPlayback({ process }: { process: HistoricalAgentRunProcess }) {
+  const resultByAuditId = new Map(process.results.map((item) => [item.audit.auditId, item]));
+  const modelAction = historicalModelAction(process.run);
+  const actions = [
+    ...(modelAction ? [modelAction] : []),
+    ...process.audits.map((audit) => auditToAgentAction(audit, resultByAuditId.get(audit.auditId))),
+  ];
+  const status = historicalRunDisplayStatus(process);
+  const elapsedMs = historicalRunElapsedMs(process);
+  const statusLabel = status === "FAILED"
+    ? "处理失败"
+    : status === "CANCELLED"
+      ? "已停止"
+      : status === "RUNNING"
+        ? "正在处理"
+        : ["WAITING_APPROVAL", "PENDING"].includes(status)
+          ? "等待继续"
+          : "已处理";
+  return (
+    <div className={`agent-process-shell agent-history-process is-${status.toLowerCase()}`}>
+      <Collapse
+        ghost
+        expandIconPosition="end"
+        items={[{
+          key: `history-process-${process.run.runId}`,
+          label: (
+            <Typography.Text
+              strong
+              className={status === "FAILED"
+                ? "agent-process-failed"
+                : status === "CANCELLED"
+                  ? "agent-process-cancelled"
+                  : undefined}
+            >
+              {statusLabel} {formatAgentProcessElapsed(elapsedMs)}
+            </Typography.Text>
+          ),
+          children: actions.length ? (
+            <div className="agent-process-body">
+              <div className="agent-process-summary">
+                {agentProcessActionSummaries(actions).map((summary) => <Tag key={summary}>{summary}</Tag>)}
+                <Typography.Text type="secondary">
+                  历史 Run 的真实模型路由、受控工具调用与低敏结果
+                </Typography.Text>
+              </div>
+              <Timeline
+                className="agent-process-timeline"
+                items={actions.map((item) => {
+                  const safeInputText = actionPayloadText(item.safeInput);
+                  const safeOutputText = actionPayloadText(item.safeOutput);
+                  const evidenceEntries = Object.entries(item.evidence ?? {}).filter(([, value]) => (
+                    value !== undefined && value !== null && value !== ""
+                  ));
+                  return {
+                    color: observationColor(item.status),
+                    dot: agentActionIcon(item.kind),
+                    children: (
+                      <div className={`agent-process-step agent-action-step is-${item.kind.toLowerCase()}`}>
+                        <Space wrap>
+                          <Typography.Text strong>{item.title}</Typography.Text>
+                          <Tag color="blue">{agentActionKindLabel(item.kind)}</Tag>
+                          <Tag color={observationColor(item.status)}>{observationStatus(item.status)}</Tag>
+                          {item.elapsedMs !== undefined ? (
+                            <Typography.Text type="secondary">
+                              {formatAgentProcessElapsed(item.elapsedMs)}
+                            </Typography.Text>
+                          ) : null}
+                        </Space>
+                        <Typography.Paragraph className="agent-process-step-summary">
+                          {item.summary}
+                        </Typography.Paragraph>
+                        {item.operation ? (
+                          <div className="agent-action-operation">
+                            <CodeOutlined />
+                            <Typography.Text code>{item.operation}</Typography.Text>
+                            {item.targetService ? <Tag>{item.targetService}</Tag> : null}
+                          </div>
+                        ) : null}
+                        {safeInputText || safeOutputText || item.changedFields?.length || evidenceEntries.length ? (
+                          <Collapse
+                            ghost
+                            size="small"
+                            items={[{
+                              key: `${item.id}-history-details`,
+                              label: "查看调用参数、结果与证据",
+                              children: (
+                                <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                                  {item.changedFields?.length ? (
+                                    <div className="agent-action-tags">
+                                      {item.changedFields.map((field) => <Tag key={field}>{field}</Tag>)}
+                                    </div>
+                                  ) : null}
+                                  {safeInputText ? <pre className="agent-action-payload">{safeInputText}</pre> : null}
+                                  {safeOutputText ? <pre className="agent-action-payload">{safeOutputText}</pre> : null}
+                                  {evidenceEntries.length ? (
+                                    <Descriptions
+                                      size="small"
+                                      column={{ xs: 1, sm: 2, lg: 3 }}
+                                      items={evidenceEntries.map(([key, value]) => ({
+                                        key,
+                                        label: observationDetailLabel(key),
+                                        children: formatObservationValue(value, key),
+                                      }))}
+                                    />
+                                  ) : null}
+                                </Space>
+                              ),
+                            }]}
+                          />
+                        ) : null}
+                      </div>
+                    ),
+                  };
+                })}
+              />
+            </div>
+          ) : (
+            <Typography.Text type="secondary">
+              该旧 Run 没有可展示的模型或工具过程事实，仅保留了最终会话消息。
+            </Typography.Text>
+          ),
+        }]}
+      />
+    </div>
+  );
+}
+
+/** 统一渲染用户与 Agent 消息，避免历史区和实时区继续维护两套聊天气泡。 */
+function AgentConversationMessageBubble({ item }: { item: AgentChatMessage }) {
+  return (
+    <div className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}>
+      <div className="agent-message-meta">{item.role === "USER" ? "你" : "Agent"}</div>
+      <div className={`agent-message-bubble${item.role === "AGENT" ? " is-final" : ""}`}>
+        <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
+          {item.content}
+        </Typography.Paragraph>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 将持久消息和历史 Run 组装成稳定回合顺序。
+ *
+ * 数据库中同一时刻写入的 USER/AGENT 消息可能拥有相同毫秒时间，不能仅按时间字符串决定先后。这里固定为
+ * “本 Run 的用户消息 -> 过程折叠条 -> 本 Run 的 Agent 消息”，同时把尚未取得 Run ID 的当前流式消息单独返回，
+ * 由实时 processPanel 插入到用户输入与最终回答之间。
+ */
+function buildHistoricalConversationTranscript(
+  messages: AgentChatMessage[],
+  processes: HistoricalAgentRunProcess[],
+) {
+  const processRunIds = new Set(processes.map((process) => process.run.runId));
+  const entries: HistoricalTranscriptEntry[] = [];
+  processes.forEach((process) => {
+    const runMessages = messages
+      .filter((message) => message.runId === process.run.runId)
+      .sort((left, right) => {
+        if (left.role !== right.role) return left.role === "USER" ? -1 : 1;
+        return new Date(left.createTime || 0).getTime() - new Date(right.createTime || 0).getTime();
+      });
+    runMessages.filter((message) => message.role === "USER").forEach((message) => {
+      entries.push({ key: message.id, kind: "MESSAGE", message });
+    });
+    entries.push({
+      key: `process-${process.run.runId}`,
+      kind: "PROCESS",
+      process,
+    });
+    runMessages.filter((message) => message.role === "AGENT").forEach((message) => {
+      entries.push({ key: message.id, kind: "MESSAGE", message });
+    });
+  });
+  return {
+    entries,
+    currentMessages: messages.filter((message) => !message.runId || !processRunIds.has(message.runId)),
+  };
+}
+
 function observationDetailLabel(key: string) {
   return {
     provider: "模型 Provider",
@@ -924,6 +1226,8 @@ function UserAgentAssistant() {
   const [configurationReviewConfirmed, setConfigurationReviewConfirmed] = useState(false);
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
+  const [historicalRunProcesses, setHistoricalRunProcesses] = useState<HistoricalAgentRunProcess[]>([]);
+  const [historyPlaybackWarning, setHistoryPlaybackWarning] = useState<string>();
   const autoAdvanceTurnRef = useRef<string>();
   const mappingDefaultsPromptTurnRef = useRef<string>();
   const processStartedAtRef = useRef<number>();
@@ -956,6 +1260,8 @@ function UserAgentAssistant() {
     setActiveAgentRuntimeSessionId(undefined);
     setActiveSessionArchived(false);
     setConversationMessages([]);
+    setHistoricalRunProcesses([]);
+    setHistoryPlaybackWarning(undefined);
     setPlan(undefined);
     setControlPlane(undefined);
     setLiveObservationItems([]);
@@ -1026,9 +1332,39 @@ function UserAgentAssistant() {
    * 清空上一次临时计划与执行结果，确保下一次追问创建新 Run 但仍归属于所选历史会话。
    */
   const loadSessionMutation = useMutation({
-    mutationFn: (sessionId: string) => api.getAgentSession(sessionId),
+    /**
+     * 一次加载完整会话后，再按 Run 并行读取审计和批量结果。
+     * 单个旧 Run 的过程接口失败不会阻断整个会话，页面仍展示消息并明确提示哪些过程事实未恢复。
+     */
+    mutationFn: async (sessionId: string) => {
+      const sessionResult = await api.getAgentSession(sessionId);
+      let failedRunCount = 0;
+      const processes = await Promise.all(sessionResult.data.runs.map(async (run) => {
+        const [auditsResult, resultsResult] = await Promise.allSettled([
+          api.listAgentToolExecutions(sessionId, run.runId),
+          api.listAgentToolExecutionResults(sessionId, run.runId),
+        ]);
+        if (auditsResult.status === "rejected" || resultsResult.status === "rejected") {
+          failedRunCount += 1;
+        }
+        return {
+          run,
+          audits: auditsResult.status === "fulfilled" ? auditsResult.value.data : [],
+          results: resultsResult.status === "fulfilled" ? resultsResult.value.data : [],
+        } satisfies HistoricalAgentRunProcess;
+      }));
+      processes.sort((left, right) => (
+        new Date(left.run.createTime || 0).getTime() - new Date(right.run.createTime || 0).getTime()
+      ));
+      return { sessionResult, processes, failedRunCount };
+    },
+    onMutate: () => {
+      // 切换历史会话前停止旧页面流，防止旧请求结束后把计划和消息写入刚打开的另一个会话。
+      activePlanAbortControllerRef.current?.abort();
+      processOwnerRef.current = undefined;
+    },
     onSuccess: (result) => {
-      const historicalSession = result.data;
+      const historicalSession = result.sessionResult.data;
       setActiveAgentRuntimeSessionId(historicalSession.sessionId);
       setAgentConversationSessionId(historicalSession.sessionId);
       setActiveSessionArchived(historicalSession.archived);
@@ -1038,16 +1374,30 @@ function UserAgentAssistant() {
         id: item.messageId,
         role: item.role,
         content: item.content,
+        runId: item.runId,
+        createTime: item.createTime,
       })));
+      setHistoricalRunProcesses(result.processes);
+      setHistoryPlaybackWarning(result.failedRunCount
+        ? `有 ${result.failedRunCount} 个旧 Run 的部分过程事实暂时无法读取，消息与其余过程已正常恢复。`
+        : undefined);
       setPlan(undefined);
       setControlPlane(undefined);
       setExecutionResults([]);
       setExecutionAnswer(undefined);
       setPlanFailure(undefined);
       setLiveObservationItems([]);
+      setLiveRequestId(undefined);
       setFollowUpMessage("");
+      setProcessStatus("IDLE");
+      setProcessStartedAt(undefined);
+      setProcessElapsedMs(0);
+      setProcessExpanded(false);
       setConfigurationReviewConfirmed(false);
       setShowAdvancedClarification(false);
+      // 历史会话依靠其持久消息、Run 与 Agent memory 继续推理，不能夹带刚才另一个会话的临时表单值。
+      clarificationForm.resetFields();
+      quickClarificationForm.resetFields();
     },
     onError: (error) => message.error(errorMessage(error)),
   });
@@ -1455,14 +1805,16 @@ function UserAgentAssistant() {
             content: latestUserMessage,
           }]
         : requestConversation;
+      const continuedRuntimeSessionId = activeAgentRuntimeSessionId || controlPlane?.sessionId;
       const variables: Record<string, unknown> = {
         frontendSurface: "UserAgentAssistant",
         runtimeProfile: "production",
         sessionId: agentConversationSessionId,
-        // 新会话禁止复用旧控制面状态；历史追问则优先使用最近一次 ingestion 返回的真实 runtime sessionId。
+        // 新会话禁止复用旧控制面状态；历史追问必须优先使用左侧所选的真实 runtime sessionId。
+        // 这一区分正是“同一会话新增 Run”和“新建会话”的持久化边界，不能只依赖聊天内容是否相同。
         agentRuntimeSessionId: submission.startNewSession
           ? undefined
-          : controlPlane?.sessionId ?? activeAgentRuntimeSessionId,
+          : continuedRuntimeSessionId,
         cacheKeyScope: "session_only",
         conversationMessages: completeConversation.slice(-12).map((item) => ({
           role: item.role === "USER" ? "user" : "assistant",
@@ -1640,6 +1992,7 @@ function UserAgentAssistant() {
       }
       setPlan(nextPlan);
       const ingestedRuntimeSessionId = textField(nextPlan.controlPlaneIngestion, "sessionId");
+      const ingestedRuntimeRunId = textField(nextPlan.controlPlaneIngestion, "runId");
       if (ingestedRuntimeSessionId) {
         setActiveAgentRuntimeSessionId(ingestedRuntimeSessionId);
         setActiveSessionArchived(false);
@@ -1658,13 +2011,38 @@ function UserAgentAssistant() {
       if (submission.followUpMessage) setFollowUpMessage("");
       if (conversation?.assistantMessage) {
         const messageId = `agent-${conversation.turnId || nextPlan.plan?.requestId || crypto.randomUUID()}`;
-        setConversationMessages((current) => (
-          current.some((item) => item.id === messageId)
-            ? current.map((item) => item.id === messageId
-                ? { ...item, content: conversation.assistantMessage }
-                : item)
-            : [...current, { id: messageId, role: "AGENT", content: conversation.assistantMessage }]
-        ));
+        setConversationMessages((current) => {
+          const associatedMessages = [...current];
+          // 新回合提交时，用户消息先在浏览器即时出现；Java Run ID 要到流式规划结束后才产生。
+          // 这里把最后一条尚未关联的用户消息补上真实 Run ID，使当前页面与稍后重新加载的历史排序一致。
+          if (ingestedRuntimeRunId && (submission.followUpMessage || submission.startNewSession)) {
+            let userIndex = -1;
+            for (let index = associatedMessages.length - 1; index >= 0; index -= 1) {
+              if (associatedMessages[index].role === "USER" && !associatedMessages[index].runId) {
+                userIndex = index;
+                break;
+              }
+            }
+            if (userIndex >= 0) {
+              associatedMessages[userIndex] = { ...associatedMessages[userIndex], runId: ingestedRuntimeRunId };
+            }
+          }
+          const existingIndex = associatedMessages.findIndex((item) => item.id === messageId);
+          if (existingIndex >= 0) {
+            associatedMessages[existingIndex] = {
+              ...associatedMessages[existingIndex],
+              content: conversation.assistantMessage,
+              runId: ingestedRuntimeRunId || associatedMessages[existingIndex].runId,
+            };
+            return associatedMessages;
+          }
+          return [...associatedMessages, {
+            id: messageId,
+            role: "AGENT",
+            content: conversation.assistantMessage,
+            runId: ingestedRuntimeRunId,
+          }];
+        });
       }
 
       if (conversation?.resolvedConfiguration) {
@@ -2199,6 +2577,8 @@ function UserAgentAssistant() {
     if (startNewSession) {
       setAgentConversationSessionId(crypto.randomUUID());
       setActiveAgentRuntimeSessionId(undefined);
+      setHistoricalRunProcesses([]);
+      setHistoryPlaybackWarning(undefined);
     }
     planMutation.mutate({
       objective,
@@ -2700,6 +3080,8 @@ function UserAgentAssistant() {
     mappingDefaultsPromptTurnRef.current = undefined;
     clarificationForm.resetFields();
     quickClarificationForm.resetFields();
+    setHistoricalRunProcesses([]);
+    setHistoryPlaybackWarning(undefined);
     setConversationMessages([{
       id: `user-${crypto.randomUUID()}`,
       role: "USER",
@@ -2720,6 +3102,8 @@ function UserAgentAssistant() {
     setObjective(defaultObjective);
     objectiveForm.setFieldsValue({ objective: defaultObjective });
     setConversationMessages([]);
+    setHistoricalRunProcesses([]);
+    setHistoryPlaybackWarning(undefined);
     setPlan(undefined);
     setControlPlane(undefined);
     setExecutionResults([]);
@@ -2742,6 +3126,8 @@ function UserAgentAssistant() {
     setAgentConversationSessionId(crypto.randomUUID());
     setActiveAgentRuntimeSessionId(undefined);
     setActiveSessionArchived(false);
+    setHistoricalRunProcesses([]);
+    setHistoryPlaybackWarning(undefined);
     setPlan(undefined);
     setControlPlane(undefined);
     setExecutionResults([]);
@@ -2927,18 +3313,23 @@ function UserAgentAssistant() {
   const editingReadyConfiguration = showAdvancedClarification
     && conversation?.phase !== "WAITING_CLARIFICATION";
 
+  const historicalTranscript = useMemo(
+    () => buildHistoricalConversationTranscript(conversationMessages, historicalRunProcesses),
+    [conversationMessages, historicalRunProcesses],
+  );
+  const currentConversationMessages = historicalTranscript.currentMessages;
   let latestUserMessageIndex = -1;
-  conversationMessages.forEach((item, index) => {
+  currentConversationMessages.forEach((item, index) => {
     if (item.role === "USER") latestUserMessageIndex = index;
   });
   let currentTurnAgentMessageIndex = -1;
-  conversationMessages.forEach((item, index) => {
+  currentConversationMessages.forEach((item, index) => {
     if (index > latestUserMessageIndex && item.role === "AGENT") currentTurnAgentMessageIndex = index;
   });
   const currentTurnAgentMessage = currentTurnAgentMessageIndex >= 0
-    ? conversationMessages[currentTurnAgentMessageIndex]
+    ? currentConversationMessages[currentTurnAgentMessageIndex]
     : undefined;
-  const conversationHistoryMessages = conversationMessages.filter(
+  const currentConversationHistoryMessages = currentConversationMessages.filter(
     (_, index) => index !== currentTurnAgentMessageIndex,
   );
   const processActionSummaries = agentProcessActionSummaries(agentActions);
@@ -3286,12 +3677,12 @@ function UserAgentAssistant() {
         ) : null}
       </Card>
 
-      {!conversation && activeAgentRuntimeSessionId && conversationMessages.length ? (
+      {!conversation && (activeAgentRuntimeSessionId || conversationMessages.length || planMutation.isPending) ? (
         <Card
-          title="继续历史会话"
+          title="与 Agent 协作"
           className="compact-card agent-conversation-card"
-          extra={<Tag color={activeSessionArchived ? "default" : "blue"}>
-            {activeSessionArchived ? "已归档" : "可继续追问"}
+          extra={<Tag color={activeSessionArchived ? "default" : planMutation.isPending ? "processing" : "blue"}>
+            {activeSessionArchived ? "已归档" : planMutation.isPending ? "Agent 正在处理" : "可继续追问"}
           </Tag>}
         >
           {activeSessionArchived ? (
@@ -3303,21 +3694,38 @@ function UserAgentAssistant() {
               style={{ marginBottom: 16 }}
             />
           ) : null}
+          {historyPlaybackWarning ? (
+            <Alert
+              showIcon
+              type="warning"
+              message="部分历史过程暂未恢复"
+              description={historyPlaybackWarning}
+              style={{ marginBottom: 16 }}
+            />
+          ) : null}
           <div className="agent-message-list">
-            {conversationMessages.map((item) => (
-              <div
-                key={item.id}
-                className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}
-              >
-                <div className="agent-message-meta">{item.role === "USER" ? "你" : "Agent"}</div>
-                <div className="agent-message-bubble">
-                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-                    {item.content}
-                  </Typography.Paragraph>
-                </div>
+            {historicalTranscript.entries.map((entry) => entry.kind === "MESSAGE" ? (
+              <AgentConversationMessageBubble key={entry.key} item={entry.message} />
+            ) : (
+              <div key={entry.key} className="agent-message-row is-agent agent-process-message-row">
+                <div className="agent-message-meta">Agent</div>
+                <HistoricalAgentRunProcessPlayback process={entry.process} />
               </div>
             ))}
+            {currentConversationHistoryMessages.map((item) => (
+              <AgentConversationMessageBubble key={item.id} item={item} />
+            ))}
+            {processPanel ? (
+              <div className="agent-message-row is-agent agent-process-message-row">
+                <div className="agent-message-meta">Agent</div>
+                {processPanel}
+              </div>
+            ) : null}
+            {currentTurnAgentMessage ? (
+              <AgentConversationMessageBubble item={currentTurnAgentMessage} />
+            ) : null}
           </div>
+          {planFailurePanel}
           <div className="agent-composer">
             <Input.TextArea
               value={followUpMessage}
@@ -3330,27 +3738,33 @@ function UserAgentAssistant() {
               }}
               autoSize={{ minRows: 2, maxRows: 6 }}
               placeholder="继续补充、追问或纠正 Agent。Enter 发送，Shift + Enter 换行"
-              disabled={activeSessionArchived || executionInProgress}
+              disabled={activeSessionArchived || executionInProgress || planMutation.isPending}
             />
             <div className="agent-composer-footer">
               <Typography.Text type="secondary">
-                后续消息会创建新的 Run，但仍归属于当前历史会话。
+                后续消息只会在当前会话中创建新 Run；仅左侧“+”会新建会话。
               </Typography.Text>
-              <Button
-                type="primary"
-                icon={<ArrowRightOutlined />}
-                onClick={continueConversation}
-                disabled={activeSessionArchived || !followUpMessage.trim() || executionInProgress}
-                loading={planMutation.isPending}
-              >
-                发送
-              </Button>
+              {planMutation.isPending ? (
+                <Button danger icon={<StopOutlined />} onClick={stopCurrentAgentPlan}>
+                  停止思考
+                </Button>
+              ) : (
+                <Button
+                  type="primary"
+                  icon={<ArrowRightOutlined />}
+                  onClick={continueConversation}
+                  disabled={activeSessionArchived || !followUpMessage.trim() || executionInProgress}
+                >
+                  发送
+                </Button>
+              )}
             </div>
           </div>
         </Card>
       ) : null}
 
-      <Card title="告诉 Agent 你想完成什么" className="compact-card">
+      {!conversation && !activeAgentRuntimeSessionId && !conversationMessages.length && !planMutation.isPending ? (
+      <Card title="与 Agent 协作" className="compact-card agent-conversation-card">
         <Form<ObjectiveFormValues>
           form={objectiveForm}
           layout="vertical"
@@ -3388,15 +3802,6 @@ function UserAgentAssistant() {
           </Tooltip>
         </Form>
       </Card>
-
-      {!conversation && processPanel ? (
-        <Card className="compact-card agent-process-card">
-          {processPanel}
-        </Card>
-      ) : null}
-
-      {!conversation && planFailurePanel ? (
-        <Card className="compact-card">{planFailurePanel}</Card>
       ) : null}
 
       {conversation ? (
@@ -3407,21 +3812,26 @@ function UserAgentAssistant() {
             {planMutation.isPending ? "Agent 正在处理" : "可继续补充或纠正"}
           </Tag>}
         >
+          {historyPlaybackWarning ? (
+            <Alert
+              showIcon
+              type="warning"
+              message="部分历史过程暂未恢复"
+              description={historyPlaybackWarning}
+              style={{ marginBottom: 16 }}
+            />
+          ) : null}
           <div className="agent-message-list">
-            {conversationHistoryMessages.map((item) => (
-              <div
-                key={item.id}
-                className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}
-              >
-                <div className="agent-message-meta">
-                  {item.role === "USER" ? "你" : "Agent"}
-                </div>
-                <div className="agent-message-bubble">
-                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-                    {item.content}
-                  </Typography.Paragraph>
-                </div>
+            {historicalTranscript.entries.map((entry) => entry.kind === "MESSAGE" ? (
+              <AgentConversationMessageBubble key={entry.key} item={entry.message} />
+            ) : (
+              <div key={entry.key} className="agent-message-row is-agent agent-process-message-row">
+                <div className="agent-message-meta">Agent</div>
+                <HistoricalAgentRunProcessPlayback process={entry.process} />
               </div>
+            ))}
+            {currentConversationHistoryMessages.map((item) => (
+              <AgentConversationMessageBubble key={item.id} item={item} />
             ))}
             {processPanel ? (
               <div className="agent-message-row is-agent agent-process-message-row">
@@ -3430,14 +3840,7 @@ function UserAgentAssistant() {
               </div>
             ) : null}
             {currentTurnAgentMessage ? (
-              <div className="agent-message-row is-agent">
-                <div className="agent-message-meta">Agent</div>
-                <div className="agent-message-bubble is-final">
-                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-                    {currentTurnAgentMessage.content}
-                  </Typography.Paragraph>
-                </div>
-              </div>
+              <AgentConversationMessageBubble item={currentTurnAgentMessage} />
             ) : null}
           </div>
           {planFailurePanel}
@@ -3541,11 +3944,11 @@ function UserAgentAssistant() {
               }}
               autoSize={{ minRows: 2, maxRows: 6 }}
               placeholder="继续告诉 Agent 需要补充、修改或纠正什么。Enter 发送，Shift + Enter 换行"
-              disabled={executionInProgress}
+              disabled={executionInProgress || planMutation.isPending}
             />
             <div className="agent-composer-footer">
               <Typography.Text type="secondary">
-                后续消息会沿用当前会话，Agent 将重新理解并自动更新已解析配置。
+                后续消息只会在当前会话中创建新 Run；Agent 会沿用上下文并更新已解析配置。
               </Typography.Text>
               {planMutation.isPending ? (
                 <Tooltip title="停止当前模型请求和后续 Agent 推理，不会撤销已启动的同步任务">
