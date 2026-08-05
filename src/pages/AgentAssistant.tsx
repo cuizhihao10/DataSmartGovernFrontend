@@ -193,6 +193,13 @@ type HistoricalTranscriptEntry =
 interface ExecutionAnswer {
   content: string;
   status: "SUCCESS" | "ERROR";
+  /**
+   * 表示本轮“创建同步任务”业务目标已经到达不可重复提交的终态。
+   *
+   * 不能只根据成功提示或任务 ID 推断：只读元数据工具也可能成功，部分旧执行结果也可能暂时缺少 ID。
+   * 该字段只在即时任务成功运行，或定期/实时任务成功发布后写入，用于关闭旧计划的编辑和审批入口。
+   */
+  workflowCompleted?: boolean;
   taskId?: number;
   executionId?: number;
   failures?: AgentToolExecutionFailure[];
@@ -1054,11 +1061,64 @@ function buildHistoricalConversationTranscript(
 }
 
 interface HistoricalAgentRecoverySnapshot {
-  plan: AgentPlanResponse;
-  formValues: Partial<ClarificationFormValues>;
+  /** 未完成、失败或待审批会话才恢复为可继续操作的计划。 */
+  plan?: AgentPlanResponse;
+  /** 已完成会话不再恢复旧表单，避免同一个任务被再次提交。 */
+  formValues?: Partial<ClarificationFormValues>;
   controlPlane?: { sessionId: string; runId: string };
   failure?: AgentPlanFailure;
+  /** 已成功创建并提交的历史任务只恢复只读结果卡。 */
+  executionAnswer?: ExecutionAnswer;
   openAdvancedEditor: boolean;
+}
+
+/**
+ * Read durable audit and result facts to decide whether a historical task-creation
+ * workflow has crossed its final submission boundary.
+ *
+ * Immediate full/SQL tasks are terminal for the Agent after ``sync.task.run`` succeeds.
+ * Scheduled and CDC tasks have no conventional completion time, so their Agent workflow
+ * becomes terminal after ``sync.task.publish`` succeeds. Both audit collections are
+ * inspected because an older Run may retain only audit facts when result-detail loading
+ * was partially unavailable; IDs are recovered only from real tool outputs.
+ */
+function historicalTaskCompletion(
+  processes: HistoricalAgentRunProcess[],
+  syncMode: UserSyncMode,
+): ExecutionAnswer | undefined {
+  const terminalToolCode = isScheduledSyncMode(syncMode) || isRealtimeSyncMode(syncMode)
+    ? "sync.task.publish"
+    : "sync.task.run";
+  const lifecycleSucceeded = processes.some((process) => (
+    process.audits.some((audit) => audit.toolCode === terminalToolCode && audit.state === "SUCCEEDED")
+    || process.results.some((result) => (
+      result.audit.toolCode === terminalToolCode && result.audit.state === "SUCCEEDED"
+    ))
+  ));
+  if (!lifecycleSucceeded) return undefined;
+
+  const historicalOutputs = processes.flatMap((process) => process.results);
+  const taskId = [...historicalOutputs]
+    .reverse()
+    .map((result) => findNumericField(result.output, ["taskId", "syncTaskId"]))
+    .find(Boolean);
+  const executionId = [...historicalOutputs]
+    .reverse()
+    .map((result) => findNumericField(result.output, ["executionId"]))
+    .find(Boolean);
+  const content = isScheduledSyncMode(syncMode)
+    ? "同步任务已创建并启用调度，可在同步任务列表查看。"
+    : isRealtimeSyncMode(syncMode)
+      ? "实时同步任务已创建并交由实时通道运行，可在同步任务列表持续查看。"
+      : "同步任务已创建并提交执行，可在同步任务列表持续查看进度。";
+
+  return {
+    content,
+    status: "SUCCESS",
+    workflowCompleted: true,
+    taskId,
+    executionId,
+  };
 }
 
 /**
@@ -1266,6 +1326,17 @@ function buildHistoricalRecoverySnapshot(
   const customSqlConfirmed = booleanField(draftArguments, "customSqlConfirmed");
   const targetTableResolution = textField(draftArguments, "targetTableResolution");
   const mappingDefaultsConfirmed = booleanField(draftArguments, "mappingDefaultsConfirmed");
+  const completedExecutionAnswer = historicalTaskCompletion(processes, syncMode);
+
+  // A successful task submission is intentionally restored as a read-only terminal
+  // result. Reconstructing its former draft/approval contract would allow the exact
+  // same task-creation plan to be confirmed for a second time after reopening history.
+  if (completedExecutionAnswer) {
+    return {
+      executionAnswer: completedExecutionAnswer,
+      openAdvancedEditor: false,
+    };
+  }
   const missing = new Set<string>();
   let duplicateTaskNameFailure = false;
 
@@ -1844,13 +1915,13 @@ function UserAgentAssistant() {
       setHistoryPlaybackWarning(result.failedRunCount
         ? `有 ${result.failedRunCount} 个旧 Run 的部分过程事实暂时无法读取，消息与其余过程已正常恢复。`
         : undefined);
-      // History is not a read-only transcript. Rehydrate the newest durable tool
-      // contract so failed parameter collection and waiting approvals use exactly
-      // the same forms/actions as a live Run in this session.
+      // Incomplete history remains actionable, but successful task creation is a
+      // terminal business result. The recovery reducer deliberately omits the old
+      // plan/control-plane contract in that case so reopening history cannot submit it twice.
       setPlan(recoverySnapshot?.plan);
       setControlPlane(recoverySnapshot?.controlPlane);
       setExecutionResults([]);
-      setExecutionAnswer(undefined);
+      setExecutionAnswer(recoverySnapshot?.executionAnswer);
       setPlanFailure(recoverySnapshot?.failure);
       setLiveObservationItems([]);
       setLiveRequestId(undefined);
@@ -2875,6 +2946,7 @@ function UserAgentAssistant() {
             ? "同步任务创建或提交失败，Agent 正在根据失败事实继续诊断。"
             : "同步任务已创建并进入业务执行链路。"),
           status: result.data.failedCount > 0 ? "ERROR" : "SUCCESS",
+          workflowCompleted: result.data.failedCount === 0 && taskLifecycleReached,
           taskId: createdTaskId,
           executionId: createdExecutionId,
           failures: result.data.failures,
@@ -2892,6 +2964,16 @@ function UserAgentAssistant() {
             runId: recoveryRunId,
           });
           setConfigurationReviewConfirmed(false);
+        }
+        if (result.data.failedCount === 0 && taskLifecycleReached) {
+          // Crossing the task lifecycle boundary consumes the current approval scope.
+          // Keep the process/result history, but remove every mutable surface tied to
+          // the old Run so the same task cannot be created or submitted a second time.
+          setControlPlane(undefined);
+          setConfigurationReviewConfirmed(false);
+          setShowAdvancedClarification(false);
+          setPlanFailure(undefined);
+          reviewEditSnapshotRef.current = undefined;
         }
       } else {
         // Read-only discovery is an intermediate Agent step, not a task
@@ -3249,6 +3331,12 @@ function UserAgentAssistant() {
     executionAnswer?.recoveryRunId
     && controlPlane?.runId === executionAnswer.recoveryRunId,
   );
+  /**
+   * Terminal task workflows retain their success card and conversation composer, while
+   * all clarification and confirmation UI from the consumed Run stays hidden.
+   */
+  const taskWorkflowCompleted = executionAnswer?.status === "SUCCESS"
+    && executionAnswer.workflowCompleted === true;
   const taskNameRepairActive = failureRecoveryPlanActive
     && executionAnswer?.repairProposal?.kind === "DUPLICATE_TASK_NAME";
   const taskNameRepairNeedsRegeneration = Boolean(
@@ -4461,7 +4549,7 @@ function UserAgentAssistant() {
               description={modelFallbackReason ? `降级原因：${modelFallbackReason}` : `解析模式：${resolverMode || "DETERMINISTIC_FALLBACK"}`}
             />
           ) : null}
-          {conversation.phase === "WAITING_CLARIFICATION" && !planFailure ? (
+          {!taskWorkflowCompleted && conversation.phase === "WAITING_CLARIFICATION" && !planFailure ? (
             <Alert
               showIcon
               type="warning"
@@ -4595,7 +4683,7 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
-      {conversation?.phase === "RESOLVING_AUTONOMOUSLY" ? (
+      {!taskWorkflowCompleted && conversation?.phase === "RESOLVING_AUTONOMOUSLY" ? (
         <Alert
           showIcon
           icon={<Spin size="small" />}
@@ -4606,7 +4694,8 @@ function UserAgentAssistant() {
         />
       ) : null}
 
-      {conversation && (conversation.phase === "WAITING_CLARIFICATION" || showAdvancedClarification) ? (
+      {!taskWorkflowCompleted && conversation
+        && (conversation.phase === "WAITING_CLARIFICATION" || showAdvancedClarification) ? (
         <Card
           id="agent-clarification-card"
           title={editingReadyConfiguration
@@ -5298,7 +5387,7 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
-      {controlPlane && activeToolNames.length && activeRequiresConfirmation ? (
+      {!taskWorkflowCompleted && controlPlane && activeToolNames.length && activeRequiresConfirmation ? (
         <Card id="agent-execution-plan-card" title="可观测执行计划" className="compact-card">
           {isSyncTaskCreationReview && !failureRecoveryPlanActive ? (
             <div className="agent-configuration-review">
