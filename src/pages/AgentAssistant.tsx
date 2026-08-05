@@ -128,6 +128,20 @@ interface QuickClarificationValues {
 
 type AgentScheduleFrequency = "HOURLY" | "DAILY" | "WEEKLY" | "CUSTOM_CRON";
 
+/**
+ * 一次规划请求在当前用户会话中的来源。
+ *
+ * 只有 USER_MESSAGE 会产生右侧用户气泡；其余值仍会创建 Durable Run 和审计事实，但在界面中作为配置提交、
+ * 审批或 Agent 自动处理过程展示。该协议与 Java AgentInteractionOrigin 同名，禁止再通过文本相同判断来源。
+ */
+type AgentInteractionOrigin =
+  | "USER_MESSAGE"
+  | "FORM_SUBMISSION"
+  | "APPROVAL_DECISION"
+  | "AGENT_CONTINUATION"
+  | "SYSTEM_RECOVERY"
+  | "AUTOMATIC_CONTINUATION";
+
 interface PlanSubmission {
   objective: string;
   clarification?: Partial<ClarificationFormValues>;
@@ -139,6 +153,15 @@ interface PlanSubmission {
   recoveryExecutionId?: number;
   preserveTimeline?: boolean;
   startNewSession?: boolean;
+  interactionOrigin?: AgentInteractionOrigin;
+}
+
+/** 为未显式分类的旧调用点提供安全默认：新目标/文本输入是消息，其余同会话提交是结构化表单动作。 */
+function planSubmissionInteractionOrigin(submission: PlanSubmission): AgentInteractionOrigin {
+  return submission.interactionOrigin
+    ?? (submission.startNewSession || submission.followUpMessage?.trim()
+      ? "USER_MESSAGE"
+      : "FORM_SUBMISSION");
 }
 
 interface AgentChatMessage {
@@ -703,6 +726,7 @@ function actionPayloadText(value: unknown) {
  */
 function historicalModelAction(run: AgentRun): AgentActionItem | undefined {
   const variables = run.variables;
+  const interactionOrigin = textField(variables, "interactionOrigin") as AgentInteractionOrigin | undefined;
   const governance = recordField(variables, "modelGatewayGovernance");
   const governanceAttributes = recordField(governance, "attributes");
   const selectedRoute = recordField(governance, "selected_route")
@@ -737,7 +761,12 @@ function historicalModelAction(run: AgentRun): AgentActionItem | undefined {
     operation: `Responses API${model ? ` · ${model}` : ""}`,
     targetService: provider || "model-gateway",
     safeInput: sanitizeAgentActionPayload({
-      userInputPreview: run.userInputPreview,
+      // 表单、审批和自动续跑的 userInputPreview 只是跨运行时摘要，并不是一条新的用户发言。
+      // 仅真实 USER_MESSAGE 在模型动作详情中使用“用户输入”语义，避免展开后再次误读初始目标。
+      userInputPreview: !interactionOrigin || interactionOrigin === "USER_MESSAGE"
+        ? run.userInputPreview
+        : undefined,
+      interactionOrigin,
       stateTrace: Array.isArray(variables.stateTrace) ? variables.stateTrace : undefined,
     }),
     safeOutput: sanitizeAgentActionPayload({
@@ -756,6 +785,20 @@ function historicalModelAction(run: AgentRun): AgentActionItem | undefined {
     completedAt: run.updateTime,
     elapsedMs: agentActionElapsedMs(run.createTime, run.updateTime),
   };
+}
+
+/** 将后端交互来源翻译成面向用户的动作标签，不暴露内部枚举作为产品文案。 */
+function historicalRunInteractionLabel(run: AgentRun) {
+  const origin = textField(run.variables, "interactionOrigin") as AgentInteractionOrigin | undefined;
+  const labels: Partial<Record<AgentInteractionOrigin, string>> = {
+    USER_MESSAGE: "用户消息",
+    FORM_SUBMISSION: "已提交任务配置",
+    APPROVAL_DECISION: "已完成确认操作",
+    AGENT_CONTINUATION: "Agent 继续处理",
+    SYSTEM_RECOVERY: "Agent 故障恢复",
+    AUTOMATIC_CONTINUATION: "Agent 自动继续",
+  };
+  return origin ? labels[origin] : undefined;
 }
 
 /** 根据 Run 与工具终态计算历史折叠条状态，避免把“等待审批”误显示成已经成功。 */
@@ -798,6 +841,7 @@ function HistoricalAgentRunProcessPlayback({ process }: { process: HistoricalAge
   ];
   const status = historicalRunDisplayStatus(process);
   const elapsedMs = historicalRunElapsedMs(process);
+  const interactionLabel = historicalRunInteractionLabel(process.run);
   const statusLabel = status === "FAILED"
     ? "处理失败"
     : status === "CANCELLED"
@@ -815,16 +859,19 @@ function HistoricalAgentRunProcessPlayback({ process }: { process: HistoricalAge
         items={[{
           key: `history-process-${process.run.runId}`,
           label: (
-            <Typography.Text
-              strong
-              className={status === "FAILED"
-                ? "agent-process-failed"
-                : status === "CANCELLED"
-                  ? "agent-process-cancelled"
-                  : undefined}
-            >
-              {statusLabel} {formatAgentProcessElapsed(elapsedMs)}
-            </Typography.Text>
+            <Space size={8} wrap>
+              <Typography.Text
+                strong
+                className={status === "FAILED"
+                  ? "agent-process-failed"
+                  : status === "CANCELLED"
+                    ? "agent-process-cancelled"
+                    : undefined}
+              >
+                {statusLabel} {formatAgentProcessElapsed(elapsedMs)}
+              </Typography.Text>
+              {interactionLabel ? <Tag>{interactionLabel}</Tag> : null}
+            </Space>
           ),
           children: actions.length ? (
             <div className="agent-process-body">
@@ -940,11 +987,31 @@ function AgentConversationMessageBubble({ item }: { item: AgentChatMessage }) {
 function buildHistoricalConversationTranscript(
   messages: AgentChatMessage[],
   processes: HistoricalAgentRunProcess[],
+  objective: string,
 ) {
+  const originByRunId = new Map(processes.map((process) => [
+    process.run.runId,
+    textField(process.run.variables, "interactionOrigin") as AgentInteractionOrigin | undefined,
+  ]));
+  let initialObjectiveMessageSeen = false;
+  const visibleMessages = messages.filter((message) => {
+    if (message.role !== "USER" || message.content.trim() !== objective.trim()) return true;
+    const origin = message.runId ? originByRunId.get(message.runId) : undefined;
+    if (origin === "USER_MESSAGE") {
+      initialObjectiveMessageSeen = true;
+      return true;
+    }
+    if (origin) return false;
+    // 旧记录没有 interactionOrigin。仅对与 session objective 完全相同的后续 USER 记录做保守兼容，
+    // 保留第一条真实目标；不同文本一律保留为真实历史纠偏。新记录完全依赖显式来源，不再做文本推断。
+    if (initialObjectiveMessageSeen) return false;
+    initialObjectiveMessageSeen = true;
+    return true;
+  });
   const processRunIds = new Set(processes.map((process) => process.run.runId));
   const entries: HistoricalTranscriptEntry[] = [];
   processes.forEach((process) => {
-    const runMessages = messages
+    const runMessages = visibleMessages
       .filter((message) => message.runId === process.run.runId)
       .sort((left, right) => {
         if (left.role !== right.role) return left.role === "USER" ? -1 : 1;
@@ -964,7 +1031,7 @@ function buildHistoricalConversationTranscript(
   });
   return {
     entries,
-    currentMessages: messages.filter((message) => !message.runId || !processRunIds.has(message.runId)),
+    currentMessages: visibleMessages.filter((message) => !message.runId || !processRunIds.has(message.runId)),
   };
 }
 
@@ -1791,6 +1858,7 @@ function UserAgentAssistant() {
         throw new Error("缺少登录租户、项目或操作者上下文，请先选择项目");
       }
       const latestUserMessage = submission.followUpMessage?.trim();
+      const interactionOrigin = planSubmissionInteractionOrigin(submission);
       const requestConversation = submission.conversationContext ?? conversationMessages;
       const lastConversationMessage = requestConversation[requestConversation.length - 1];
       const currentTurnAlreadyIncluded = Boolean(
@@ -1798,7 +1866,9 @@ function UserAgentAssistant() {
         && lastConversationMessage?.role === "USER"
         && lastConversationMessage.content === latestUserMessage,
       );
-      const completeConversation = latestUserMessage && !currentTurnAlreadyIncluded
+      const completeConversation = interactionOrigin === "USER_MESSAGE"
+        && latestUserMessage
+        && !currentTurnAlreadyIncluded
         ? [...requestConversation, {
             id: `request-user-${crypto.randomUUID()}`,
             role: "USER" as const,
@@ -1816,6 +1886,7 @@ function UserAgentAssistant() {
           ? undefined
           : continuedRuntimeSessionId,
         cacheKeyScope: "session_only",
+        interactionOrigin,
         conversationMessages: completeConversation.slice(-12).map((item) => ({
           role: item.role === "USER" ? "user" : "assistant",
           content: item.content,
@@ -1826,7 +1897,10 @@ function UserAgentAssistant() {
       };
       if (latestUserMessage) {
         variables.latestUserMessage = latestUserMessage;
-        variables.conversationMode = "CLARIFICATION_OR_CORRECTION";
+        variables.conversationMode = interactionOrigin === "USER_MESSAGE"
+          ? "CLARIFICATION_OR_CORRECTION"
+          : "USER_ACTION_CONTINUATION";
+        if (interactionOrigin !== "USER_MESSAGE") variables.userActionSummary = latestUserMessage;
         variables.previousTurnId = plan?.agentConversation?.turnId;
         variables.previousIntentType = plan?.agentConversation?.structuredIntent.intentType;
       }
@@ -2015,7 +2089,7 @@ function UserAgentAssistant() {
           const associatedMessages = [...current];
           // 新回合提交时，用户消息先在浏览器即时出现；Java Run ID 要到流式规划结束后才产生。
           // 这里把最后一条尚未关联的用户消息补上真实 Run ID，使当前页面与稍后重新加载的历史排序一致。
-          if (ingestedRuntimeRunId && (submission.followUpMessage || submission.startNewSession)) {
+          if (ingestedRuntimeRunId && planSubmissionInteractionOrigin(submission) === "USER_MESSAGE") {
             let userIndex = -1;
             for (let index = associatedMessages.length - 1; index >= 0; index -= 1) {
               if (associatedMessages[index].role === "USER" && !associatedMessages[index].runId) {
@@ -2444,6 +2518,7 @@ function UserAgentAssistant() {
           taskImportArtifactRef: repairedArtifactRef,
           taskImportRunImmediately,
           preserveTimeline: true,
+          interactionOrigin: "SYSTEM_RECOVERY",
         });
         return;
       }
@@ -2488,6 +2563,7 @@ function UserAgentAssistant() {
         recoveryTaskId: taskId,
         recoveryExecutionId: diagnosisExecutionId,
         preserveTimeline: true,
+        interactionOrigin: "SYSTEM_RECOVERY",
       });
     },
     onError: (error) => {
@@ -2558,6 +2634,7 @@ function UserAgentAssistant() {
       followUpMessage: latestMessage,
       conversationContext: nextConversationMessages,
       preserveTimeline: true,
+      interactionOrigin: "USER_MESSAGE",
     });
   };
 
@@ -2579,12 +2656,19 @@ function UserAgentAssistant() {
       setActiveAgentRuntimeSessionId(undefined);
       setHistoricalRunProcesses([]);
       setHistoryPlaybackWarning(undefined);
+      // “新会话重试”会创建新的 session，因此当前目标在新会话中是唯一的初始 USER 消息。
+      setConversationMessages([{
+        id: `user-${crypto.randomUUID()}`,
+        role: "USER",
+        content: objective,
+      }]);
     }
     planMutation.mutate({
       objective,
       clarification,
       preserveTimeline: true,
       startNewSession,
+      interactionOrigin: startNewSession ? "USER_MESSAGE" : "FORM_SUBMISSION",
     });
   };
 
@@ -2608,6 +2692,7 @@ function UserAgentAssistant() {
       clarification,
       followUpMessage: `采用 Agent 建议，将任务名称改为“${proposedTaskName}”，使用当前已审核配置重新生成计划；不要直接执行。`,
       preserveTimeline: true,
+      interactionOrigin: "APPROVAL_DECISION",
     });
   };
 
@@ -3036,6 +3121,7 @@ function UserAgentAssistant() {
         objective,
         clarification: values,
         preserveTimeline: true,
+        interactionOrigin: "AUTOMATIC_CONTINUATION",
       });
     }, 250);
     return () => window.clearTimeout(timer);
@@ -3087,7 +3173,11 @@ function UserAgentAssistant() {
       role: "USER",
       content: values.objective,
     }]);
-    planMutation.mutate({ objective: values.objective, startNewSession: true });
+    planMutation.mutate({
+      objective: values.objective,
+      startNewSession: true,
+      interactionOrigin: "USER_MESSAGE",
+    });
   };
 
   /**
@@ -3132,11 +3222,17 @@ function UserAgentAssistant() {
     setControlPlane(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
+    setConversationMessages([{
+      id: `user-${crypto.randomUUID()}`,
+      role: "USER",
+      content: taskImportObjective,
+    }]);
     planMutation.mutate({
       objective: taskImportObjective,
       taskImportArtifactRef: taskImportArtifact.artifactRef,
       taskImportRunImmediately,
       startNewSession: true,
+      interactionOrigin: "USER_MESSAGE",
     });
   };
 
@@ -3314,8 +3410,8 @@ function UserAgentAssistant() {
     && conversation?.phase !== "WAITING_CLARIFICATION";
 
   const historicalTranscript = useMemo(
-    () => buildHistoricalConversationTranscript(conversationMessages, historicalRunProcesses),
-    [conversationMessages, historicalRunProcesses],
+    () => buildHistoricalConversationTranscript(conversationMessages, historicalRunProcesses, objective),
+    [conversationMessages, historicalRunProcesses, objective],
   );
   const currentConversationMessages = historicalTranscript.currentMessages;
   let latestUserMessageIndex = -1;
@@ -4114,6 +4210,7 @@ function UserAgentAssistant() {
                         customSqlText: values.customSqlConfirmed ? generatedSqlPreview : undefined,
                       },
                       preserveTimeline: true,
+                      interactionOrigin: "FORM_SUBMISSION",
                     });
                   }}
                 >
@@ -4359,6 +4456,7 @@ function UserAgentAssistant() {
                 mappingDefaultsConfirmed: true,
               },
               preserveTimeline: true,
+              interactionOrigin: "FORM_SUBMISSION",
             })}
           >
             <Button
