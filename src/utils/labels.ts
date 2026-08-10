@@ -216,6 +216,8 @@ export const actorRoleLabels: Record<string, string> = {
   AUDITOR: "审计员",
   PLATFORM_ADMIN: "平台管理员",
   TENANT_ADMIN: "租户管理员",
+  PLATFORM_ADMINISTRATOR: "平台管理员",
+  TENANT_ADMINISTRATOR: "租户管理员",
   SERVICE_ACCOUNT: "服务账号",
   ORDINARY_USER: "普通用户",
 };

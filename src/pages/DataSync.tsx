@@ -49,6 +49,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import type { Key } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { ApiError } from "@/api/client";
 import {
   api,
   type CloneSyncTaskPayload,
@@ -449,6 +450,16 @@ interface AgentWizardHandoff {
     whereCondition?: string;
     fieldMappings?: FieldMappingRow[];
   }>;
+}
+
+/**
+ * Agent 历史结果跳转到同步任务详情时携带的最小定位信息。
+ * taskId 是打开任务抽屉的必要条件，executionId 只负责在抽屉中选中具体执行。
+ */
+interface AgentTaskLocator {
+  taskId?: number;
+  executionId?: number;
+  source?: string;
 }
 
 interface FieldMappingDetailRow extends FieldMappingRow {
@@ -960,6 +971,7 @@ export function DataSync() {
   const location = useLocation();
   const navigate = useNavigate();
   const consumedAgentHandoffId = useRef<string>();
+  const consumedAgentTaskLocator = useRef<string>();
   const [wizardForm] = Form.useForm<SyncWizardValues>();
   const [createGroupForm] = Form.useForm<CreateSyncTaskGroupPayload>();
   const [editTaskForm] = Form.useForm<UpdateSyncTaskPayload>();
@@ -973,6 +985,7 @@ export function DataSync() {
   const [workerForm] = Form.useForm<SyncWorkerLoopRunPayload>();
   const [schedulerForm] = Form.useForm<SyncTaskScheduleDispatchPayload>();
   const [executionPolicyForm] = Form.useForm<UpsertSyncExecutionPolicyPayload>();
+  const [agentTaskLocatorRetryVersion, setAgentTaskLocatorRetryVersion] = useState(0);
   const [activeTab, setActiveTab] = useState("tasks");
   const [taskTreeView, setTaskTreeView] = useState<"tasks" | "recycle">("tasks");
   const [taskKeyword, setTaskKeyword] = useState("");
@@ -2074,6 +2087,72 @@ export function DataSync() {
       message.warning("草稿已恢复，但部分源端/目标端元数据刷新失败；可以继续编辑，第四步预检查会再次校验真实库表结构。");
     }
   };
+
+  /**
+   * 消费 Agent 历史结果携带的任务定位。
+   *
+   * Agent 页面不能直接持有同步任务详情，因此只传递真实 taskId/executionId
+   * 到路由状态；这里重新通过受控业务 API 获取任务并打开现有详情抽屉。若
+   * 定位信息缺失或跨项目，显示低敏提示而不伪造一个任务对象。
+   */
+  useEffect(() => {
+    const state = location.state as { agentTaskLocator?: AgentTaskLocator } | null;
+    const locator = state?.agentTaskLocator;
+    const taskId = locator?.taskId;
+    if (!taskId || !selectedProjectScopeId) return;
+    const locatorKey = `${selectedProjectScopeId}:${taskId}:${locator.executionId ?? ""}`;
+    if (consumedAgentTaskLocator.current === locatorKey) return;
+    let cancelled = false;
+    const retryMessageKey = `agent-task-locator-${locatorKey}`;
+    void api.getSyncTask(taskId)
+      .then((result) => {
+        if (cancelled) return;
+        // Consume the handoff only after the controlled API returned the task. A transient
+        // gateway failure must remain retryable, while a successful load is safe to open once.
+        consumedAgentTaskLocator.current = locatorKey;
+        message.destroy(retryMessageKey);
+        const executionId = locator.executionId ?? result.data.lastExecutionId;
+        setSelectedTask(result.data);
+        setSelectedExecutionId(executionId);
+        setTaskDrawerActiveTab("executions");
+        dirtyReplayForm.setFieldsValue({ executionId });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        const status = error instanceof ApiError ? error.status : undefined;
+        if (status === 401 || status === 403 || status === 404) {
+          // Authorization and not-found responses are stable scope facts. Marking these as
+          // consumed prevents a render loop, while project changes still produce a new key.
+          consumedAgentTaskLocator.current = locatorKey;
+          message.warning("无法定位 Agent 结果中的同步任务，可能任务不在当前项目或已无访问权限。请返回任务列表重新查找。");
+          return;
+        }
+        message.open({
+          key: retryMessageKey,
+          type: "warning",
+          duration: 0,
+          content: (
+            <Space size={8}>
+              <span>任务详情暂时无法加载，可能是网关或服务短暂不可用。</span>
+              <Button
+                type="link"
+                size="small"
+                onClick={() => {
+                  message.destroy(retryMessageKey);
+                  setAgentTaskLocatorRetryVersion((version) => version + 1);
+                }}
+              >
+                重试
+              </Button>
+            </Space>
+          ),
+        });
+      });
+    return () => {
+      cancelled = true;
+      message.destroy(retryMessageKey);
+    };
+  }, [agentTaskLocatorRetryVersion, dirtyReplayForm, location.state, message, selectedProjectScopeId]);
 
   useEffect(() => {
     const state = location.state as { agentWizardHandoff?: AgentWizardHandoff } | null;

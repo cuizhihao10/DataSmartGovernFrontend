@@ -20,11 +20,18 @@ import type {
   AgentStructuredIntent,
   AgentRagQueryResult,
   AgentRun,
+  AgentPostConfirmContinuation,
+  AgentRepairProposal,
+  AgentSpecialistTurnFact,
   AgentRunConfirmedExecutionResponse,
   AgentSession,
+  PostBridgeVerificationSummary,
+  SpecialistToolPlanBridgeSummary,
+  SpecialistVerificationExecutionSummary,
   AgentTool,
   AgentToolBinding,
   AgentToolExecutionAudit,
+  AgentToolExecutionFailure,
   AgentToolExecutionResult,
   AgentToolInputField,
   AgentToolPlan,
@@ -741,6 +748,8 @@ export interface AgentRagQueryPayload {
 export interface ConfirmAgentRunPayload {
   confirmed: true;
   comment?: string;
+  /** Stable retry key for one durable Run confirmation boundary. */
+  idempotencyKey?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -768,6 +777,25 @@ function readNumber(value: unknown, fallback = 0) {
 
 function readBoolean(value: unknown, fallback = false) {
   return typeof value === "boolean" ? value : fallback;
+}
+
+/**
+ * Read an optional boolean without collapsing an absent value into `false`.
+ *
+ * Agent mapping snapshots use optional flags such as `syncEnabled` and
+ * `typeCompatible`.  Treating a missing flag as `false` would disable a valid
+ * source field during historical recovery, while treating the string "false"
+ * as truthy would be equally unsafe.  This helper keeps all three states:
+ * true, false, and not supplied.
+ */
+function readOptionalBoolean(value: unknown) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return undefined;
 }
 
 function readOptionalNumber(value: unknown) {
@@ -799,6 +827,57 @@ function readOptionalString(value: unknown) {
 
 function readRecord(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
+}
+
+/**
+ * 从多个兼容字段中读取第一个 JSON 对象。
+ *
+ * Agent Runtime 在不同版本中同时存在 camelCase 和 snake_case DTO；如果每个
+ * 页面都自行判断字段名，很容易出现计划详情、历史回放和流式结果三处行为不一致。
+ * 归一化层统一处理别名，并且只接受真正的对象，避免把字符串或数组误当成快照。
+ */
+function readFirstRecord(record: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (isRecord(value)) return value;
+  }
+  return {};
+}
+
+/**
+ * 从多个兼容字段中读取第一个数组。
+ *
+ * 数组字段缺失时返回空数组，调用方可以安全地继续做 map/filter；这里不把
+ * 非数组值强行转换为数组，以免把错误响应伪装成“有一个 specialist 结果”。
+ */
+function readFirstArray(record: Record<string, unknown>, ...keys: string[]) {
+  let emptyArray: unknown[] | undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    // A gateway can temporarily serialize both field versions while only the
+    // legacy one is populated. Prefer the non-empty data-bearing alias but
+    // still preserve an intentionally empty array when no alias has entries.
+    if (value.length > 0) return value;
+    emptyArray ??= value;
+  }
+  return emptyArray ?? [];
+}
+
+/**
+ * Read the first non-null field from aliases without imposing a JSON shape.
+ *
+ * The API normalizer normally needs an object or array and can use the helpers
+ * above.  Nested mapping flags may be strings, booleans, or names, so their
+ * compatibility layer needs to preserve the raw value until the target type is
+ * known.  `false` and `0` must stay visible and therefore cannot use `||`.
+ */
+function readFirstDefinedValue(record: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
 }
 
 function normalizePage<T>(
@@ -1932,19 +2011,184 @@ function normalizeAgentToolBinding(value: unknown, index: number): AgentToolBind
 function normalizeAgentRun(value: unknown, index: number): AgentRun {
   const record = isRecord(value) ? value : {};
   return {
-    runId: readString(record.runId, `run-${index + 1}`),
-    sessionId: readString(record.sessionId),
-    state: readString(record.state, "UNKNOWN"),
-    workloadType: readOptionalString(record.workloadType),
-    userInputPreview: readOptionalString(record.userInputPreview),
-    dryRun: readBoolean(record.dryRun, true),
-    requireHumanApproval: readBoolean(record.requireHumanApproval),
-    nextActions: readStringArray(record.nextActions),
-    variables: readRecord(record.variables),
-    createTime: readOptionalString(record.createTime),
-    updateTime: readOptionalString(record.updateTime),
-    finishTime: readOptionalString(record.finishTime),
-    message: readOptionalString(record.message),
+    runId: readString(record.runId ?? record.run_id, `run-${index + 1}`),
+    sessionId: readString(record.sessionId ?? record.session_id),
+    state: readString(record.state ?? record.status, "UNKNOWN"),
+    workloadType: readOptionalString(record.workloadType ?? record.workload_type),
+    userInputPreview: readOptionalString(record.userInputPreview ?? record.user_input_preview),
+    dryRun: readBoolean(record.dryRun ?? record.dry_run, true),
+    requireHumanApproval: readBoolean(record.requireHumanApproval ?? record.require_human_approval),
+    nextActions: readStringArray(record.nextActions ?? record.next_actions),
+    variables: readRecord(record.variables ?? record.run_variables),
+    createTime: readOptionalString(record.createTime ?? record.create_time),
+    updateTime: readOptionalString(record.updateTime ?? record.update_time),
+    finishTime: readOptionalString(record.finishTime ?? record.finish_time),
+    message: readOptionalString(record.message ?? record.error_message),
+  };
+}
+
+/**
+ * 规范化 Java Agent Runtime 的专业 Agent 低敏事实。
+ *
+ * 事实接口不会返回完整模型响应、工具参数或工具结果，因此这里仅做字段
+ * 兼容和类型收敛，不把缺失内容补成“看起来完整”的前端对象。这样历史页
+ * 才能明确区分“有完整快照”和“只有低敏事实兜底”两种来源。
+ */
+function normalizeAgentSpecialistTurnFact(value: unknown, index: number): AgentSpecialistTurnFact {
+  const record = isRecord(value) ? value : {};
+  return {
+    userId: readString(record.userId ?? record.user_id),
+    tenantId: readNumber(record.tenantId ?? record.tenant_id),
+    applicationId: readNumber(record.applicationId ?? record.application_id),
+    projectId: readNumber(record.projectId ?? record.project_id),
+    sessionId: readString(record.sessionId ?? record.session_id),
+    runId: readString(record.runId ?? record.run_id),
+    turnId: readString(record.turnId ?? record.turn_id, `turn-fact-${index + 1}`),
+    idempotencyKey: readString(record.idempotencyKey ?? record.idempotency_key),
+    agentId: readString(record.agentId ?? record.agent_id, `specialist-agent-${index + 1}`),
+    role: readString(record.role ?? record.agentRole ?? record.agent_role, "SPECIALIST_AGENT"),
+    delegationId: readOptionalString(record.delegationId ?? record.delegation_id),
+    status: readString(record.status, "UNKNOWN"),
+    lowSensitiveSummary: readString(record.lowSensitiveSummary ?? record.low_sensitive_summary),
+    modelInvocationId: readOptionalString(record.modelInvocationId ?? record.model_invocation_id),
+    modelName: readOptionalString(record.modelName ?? record.model_name),
+    toolActivitySummaryRefs: readStringArray(
+      record.toolActivitySummaryRefs ?? record.tool_activity_summary_refs,
+    ),
+    evidenceRefs: readStringArray(record.evidenceRefs ?? record.evidence_refs),
+    durationMillis: readOptionalNumber(record.durationMillis ?? record.duration_millis),
+    startedAt: readOptionalString(record.startedAt ?? record.started_at),
+    finishedAt: readOptionalString(record.finishedAt ?? record.finished_at),
+    createdAt: readOptionalString(record.createdAt ?? record.created_at),
+    updatedAt: readOptionalString(record.updatedAt ?? record.updated_at),
+  };
+}
+
+/**
+ * 归一化 post-bridge 资源复核结果。
+ *
+ * taskId/executionId 是后续跳转数据同步详情页的唯一可靠定位信息，因此这里
+ * 同时接受数字和字符串，并保留 null/缺失语义，不从自然语言摘要中猜测 ID。
+ */
+function normalizePostBridgeVerification(value: unknown): PostBridgeVerificationSummary | undefined {
+  if (!isRecord(value)) return undefined;
+  const record = value;
+  const taskId = record.taskId ?? record.task_id;
+  const executionId = record.executionId ?? record.execution_id;
+  return {
+    status: readOptionalString(record.status ?? record.state),
+    resourceChanged: typeof (record.resourceChanged ?? record.resource_changed) === "boolean"
+      ? (record.resourceChanged ?? record.resource_changed) as boolean
+      : undefined,
+    resourceFingerprint: readOptionalString(record.resourceFingerprint ?? record.resource_fingerprint),
+    previousResourceFingerprint: readOptionalString(
+      record.previousResourceFingerprint ?? record.previous_resource_fingerprint,
+    ),
+    taskId: taskId == null ? undefined : typeof taskId === "number" || typeof taskId === "string" ? taskId : undefined,
+    executionId: executionId == null
+      ? undefined
+      : typeof executionId === "number" || typeof executionId === "string" ? executionId : undefined,
+    executedRoles: readStringArray(record.executedRoles ?? record.executed_roles),
+    batchStatus: record.batchStatus == null && record.batch_status == null
+      ? undefined
+      : readOptionalString(record.batchStatus ?? record.batch_status),
+    payloadPolicy: readOptionalString(record.payloadPolicy ?? record.payload_policy),
+  };
+}
+
+/**
+ * 归一化 specialist 批次复核结果。
+ *
+ * 复核结果中的 results 只允许保留后端明确标记的低敏 JSON 对象；前端不会在
+ * 这里补造结果数量，也不会把缺少 results 的响应渲染成“六个 Agent 已完成”。
+ */
+function normalizeSpecialistVerificationExecution(
+  value: unknown,
+): SpecialistVerificationExecutionSummary | undefined {
+  if (!isRecord(value)) return undefined;
+  const results = readFirstArray(value, "results", "specialistResults", "specialist_results", "agentResults", "agent_results")
+    .map(readRecord)
+    .filter((item) => Object.keys(item).length > 0);
+  const skippedRoles = readFirstRecord(value, "skippedRoles", "skipped_roles");
+  const executionWaves = readFirstArray(value, "executionWaves", "execution_waves")
+    .map((wave) => readStringArray(wave))
+    .filter((wave) => wave.length > 0);
+  const normalizedSkippedRoles: Record<string, string> = Object.fromEntries(
+    Object.entries(skippedRoles).map(([role, reason]) => [role, readString(reason)]),
+  );
+  return {
+    status: readOptionalString(value.status ?? value.state),
+    executedCount: readOptionalNumber(value.executedCount ?? value.executed_count),
+    completedCount: readOptionalNumber(value.completedCount ?? value.completed_count),
+    waitingInputCount: readOptionalNumber(value.waitingInputCount ?? value.waiting_input_count),
+    failedCount: readOptionalNumber(value.failedCount ?? value.failed_count),
+    results: results.length ? results : undefined,
+    skippedRoles: Object.keys(normalizedSkippedRoles).length ? normalizedSkippedRoles : undefined,
+    executionWaves: executionWaves.length ? executionWaves : undefined,
+    executionBoundary: readOptionalString(value.executionBoundary ?? value.execution_boundary),
+    payloadPolicy: readOptionalString(value.payloadPolicy ?? value.payload_policy),
+  };
+}
+
+/**
+ * 归一化 specialist 到 Java ToolPlan 的公开桥接摘要。
+ *
+ * 桥接层故意只展示工具名称和参数字段名，不展示原始参数、SQL 或凭据；这里
+ * 只做字段命名兼容，真正的敏感信息过滤仍由 Agent 页面组件再次执行。
+ */
+function normalizeSpecialistToolPlanBridge(value: unknown, index: number): SpecialistToolPlanBridgeSummary {
+  const record = isRecord(value) ? value : {};
+  const handoff = readFirstRecord(record, "recoveryHandoff", "recovery_handoff");
+  const issues = readFirstArray(record, "issues", "bridgeIssues", "bridge_issues")
+    .map((item) => {
+      const issue = readRecord(item);
+      return {
+        code: readOptionalString(issue.code ?? issue.issueCode ?? issue.issue_code),
+        message: readOptionalString(issue.message ?? issue.publicMessage ?? issue.public_message ?? issue.summary),
+      };
+    })
+    .filter((item) => item.code || item.message);
+  return {
+    schemaVersion: readOptionalString(record.schemaVersion ?? record.schema_version),
+    status: readOptionalString(record.status ?? record.state),
+    specialistRole: readOptionalString(record.specialistRole ?? record.specialist_role ?? record.agentRole)
+      ?? `SPECIALIST_AGENT_${index + 1}`,
+    specialistTurnId: readOptionalString(record.specialistTurnId ?? record.specialist_turn_id),
+    publicSummary: readOptionalString(record.publicSummary ?? record.public_summary ?? record.summary),
+    acceptedToolPlanCount: readOptionalNumber(record.acceptedToolPlanCount ?? record.accepted_tool_plan_count),
+    acceptedToolNames: readStringArray(record.acceptedToolNames ?? record.accepted_tool_names),
+    visibleToolNames: readStringArray(record.visibleToolNames ?? record.visible_tool_names),
+    canSubmitDurableLoop: typeof (record.canSubmitDurableLoop ?? record.can_submit_durable_loop) === "boolean"
+      ? (record.canSubmitDurableLoop ?? record.can_submit_durable_loop) as boolean
+      : undefined,
+    toolArgumentNameSets: readFirstArray(record, "toolArgumentNameSets", "tool_argument_name_sets")
+      .map((fields) => readStringArray(fields)),
+    issues: issues.length ? issues : undefined,
+    specialistResultFingerprint: readOptionalString(
+      record.specialistResultFingerprint ?? record.specialist_result_fingerprint,
+    ),
+    scopeBinding: Object.keys(readFirstRecord(record, "scopeBinding", "scope_binding")).length
+      ? readFirstRecord(record, "scopeBinding", "scope_binding")
+      : undefined,
+    recoveryHandoff: Object.keys(handoff).length ? {
+      schemaVersion: readOptionalString(handoff.schemaVersion ?? handoff.schema_version),
+      approvalStatus: readOptionalString(handoff.approvalStatus ?? handoff.approval_status),
+      approvalFactAccepted: typeof (handoff.approvalFactAccepted ?? handoff.approval_fact_accepted) === "boolean"
+        ? (handoff.approvalFactAccepted ?? handoff.approval_fact_accepted) as boolean
+        : undefined,
+      blueprintCount: readOptionalNumber(handoff.blueprintCount ?? handoff.blueprint_count),
+      requiresJavaRehydration: typeof (handoff.requiresJavaRehydration ?? handoff.requires_java_rehydration) === "boolean"
+        ? (handoff.requiresJavaRehydration ?? handoff.requires_java_rehydration) as boolean
+        : undefined,
+      executionBoundary: readOptionalString(handoff.executionBoundary ?? handoff.execution_boundary),
+      directExecution: typeof (handoff.directExecution ?? handoff.direct_execution) === "boolean"
+        ? (handoff.directExecution ?? handoff.direct_execution) as boolean
+        : undefined,
+      requiredApprovalBindings: readStringArray(
+        handoff.requiredApprovalBindings ?? handoff.required_approval_bindings,
+      ),
+    } : undefined,
+    payloadPolicy: readOptionalString(record.payloadPolicy ?? record.payload_policy),
   };
 }
 
@@ -1956,53 +2200,76 @@ function normalizeAgentRun(value: unknown, index: number): AgentRun {
  */
 function normalizeAgentSession(value: unknown, index: number): AgentSession {
   const record = isRecord(value) ? value : {};
-  const workspace = isRecord(record.workspace) ? record.workspace : undefined;
+  const workspaceValue = record.workspace ?? record.workspace_info;
+  const workspace = isRecord(workspaceValue) ? workspaceValue : undefined;
+  const rawRuns = record.runs ?? record.runList ?? record.run_list;
+  const rawMessages = record.messages
+    ?? record.conversationMessages
+    ?? record.conversation_messages
+    ?? record.messageList
+    ?? record.message_list;
+  const rawToolBindings = record.toolBindings ?? record.tool_bindings ?? record.bindings;
+  const delegation = readFirstRecord(record, "delegation", "delegationSnapshot", "delegation_snapshot");
   return {
-    sessionId: readString(record.sessionId, `session-${index + 1}`),
-    agentId: readOptionalString(record.agentId),
-    tenantId: readOptionalNumber(record.tenantId),
-    projectId: readOptionalNumber(record.projectId),
-    workspaceId: readOptionalNumber(record.workspaceId),
-    actorId: readString(record.actorId, "-"),
-    channel: readOptionalString(record.channel),
-    objective: readString(record.objective),
-    state: readString(record.state, "UNKNOWN"),
+    sessionId: readString(record.sessionId ?? record.session_id, `session-${index + 1}`),
+    agentId: readOptionalString(record.agentId ?? record.agent_id),
+    tenantId: readOptionalNumber(record.tenantId ?? record.tenant_id),
+    projectId: readOptionalNumber(record.projectId ?? record.project_id),
+    workspaceId: readOptionalNumber(record.workspaceId ?? record.workspace_id),
+    actorId: readString(record.actorId ?? record.actor_id, "-"),
+    channel: readOptionalString(record.channel ?? record.session_channel),
+    objective: readString(record.objective ?? record.sessionObjective ?? record.session_objective),
+    state: readString(record.state ?? record.status, "UNKNOWN"),
     workspace,
-    toolBindings: Array.isArray(record.toolBindings)
-      ? record.toolBindings.map(normalizeAgentToolBinding)
+    toolBindings: Array.isArray(rawToolBindings)
+      ? rawToolBindings.map(normalizeAgentToolBinding)
       : [],
-    runs: Array.isArray(record.runs) ? record.runs.map(normalizeAgentRun) : [],
-    delegation: isRecord(record.delegation) ? {
-      delegationId: readString(record.delegation.delegationId),
-      agentId: readString(record.delegation.agentId),
-      userActorId: readString(record.delegation.userActorId),
-      tenantId: readOptionalNumber(record.delegation.tenantId),
-      projectId: readOptionalNumber(record.delegation.projectId),
-      toolCodes: readStringArray(record.delegation.toolCodes),
-      actions: readStringArray(record.delegation.actions),
-      resourceScopes: readStringArray(record.delegation.resourceScopes),
-      status: readString(record.delegation.status, "UNKNOWN"),
-      issuedAt: readOptionalString(record.delegation.issuedAt),
-      expiresAt: readOptionalString(record.delegation.expiresAt),
-      revokedAt: readOptionalString(record.delegation.revokedAt),
+    runs: Array.isArray(rawRuns) ? rawRuns.map(normalizeAgentRun) : [],
+    delegation: Object.keys(delegation).length ? {
+      delegationId: readString(delegation.delegationId ?? delegation.delegation_id),
+      agentId: readString(delegation.agentId ?? delegation.agent_id),
+      userActorId: readString(delegation.userActorId ?? delegation.user_actor_id),
+      tenantId: readOptionalNumber(delegation.tenantId ?? delegation.tenant_id),
+      projectId: readOptionalNumber(delegation.projectId ?? delegation.project_id),
+      toolCodes: readStringArray(delegation.toolCodes ?? delegation.tool_codes),
+      actions: readStringArray(delegation.actions),
+      resourceScopes: readStringArray(delegation.resourceScopes ?? delegation.resource_scopes),
+      status: readString(delegation.status ?? delegation.state, "UNKNOWN"),
+      issuedAt: readOptionalString(delegation.issuedAt ?? delegation.issued_at),
+      expiresAt: readOptionalString(delegation.expiresAt ?? delegation.expires_at),
+      revokedAt: readOptionalString(delegation.revokedAt ?? delegation.revoked_at),
     } : undefined,
-    messages: Array.isArray(record.messages) ? record.messages.map((item, messageIndex) => {
+    messages: Array.isArray(rawMessages) ? rawMessages.map((item, messageIndex) => {
       const messageRecord = isRecord(item) ? item : {};
-      const role = readString(messageRecord.role, "AGENT").toUpperCase();
+      const role = readString(messageRecord.role ?? messageRecord.message_role, "AGENT").toUpperCase();
       return {
-        messageId: readString(messageRecord.messageId, `message-${messageIndex + 1}`),
-        runId: readOptionalString(messageRecord.runId),
+        messageId: readString(messageRecord.messageId ?? messageRecord.message_id, `message-${messageIndex + 1}`),
+        runId: readOptionalString(messageRecord.runId ?? messageRecord.run_id),
         role: role === "USER" ? "USER" as const : "AGENT" as const,
-        content: readString(messageRecord.content),
-        createTime: readOptionalString(messageRecord.createTime),
+        content: readString(messageRecord.content ?? messageRecord.message_content),
+        createTime: readOptionalString(messageRecord.createTime ?? messageRecord.create_time),
+        // 新旧服务端可能使用两套字段名；只有真实对象才保留，避免空对象制造无内容面板。
+        specialistAgentExecution: isRecord(
+          messageRecord.specialistAgentExecution
+            ?? messageRecord.specialist_agent_execution
+            ?? messageRecord.executionSnapshot
+            ?? messageRecord.execution_snapshot,
+        )
+          ? readRecord(
+              messageRecord.specialistAgentExecution
+                ?? messageRecord.specialist_agent_execution
+                ?? messageRecord.executionSnapshot
+                ?? messageRecord.execution_snapshot,
+            )
+          : undefined,
       };
     }) : [],
-    pinned: readBoolean(record.pinned),
-    archived: readBoolean(record.archived),
-    archivedAt: readOptionalString(record.archivedAt),
-    lastMessageAt: readOptionalString(record.lastMessageAt),
-    createTime: readOptionalString(record.createTime),
-    updateTime: readOptionalString(record.updateTime),
+    pinned: readBoolean(record.pinned ?? record.isPinned ?? record.is_pinned),
+    archived: readBoolean(record.archived ?? record.isArchived ?? record.is_archived),
+    archivedAt: readOptionalString(record.archivedAt ?? record.archived_at),
+    lastMessageAt: readOptionalString(record.lastMessageAt ?? record.last_message_at),
+    createTime: readOptionalString(record.createTime ?? record.create_time),
+    updateTime: readOptionalString(record.updateTime ?? record.update_time),
   };
 }
 
@@ -2053,48 +2320,55 @@ function normalizeAgentPlanCore(value: unknown): AgentPlanCore | undefined {
 
 function normalizeAgentClarificationQuestion(value: unknown): AgentClarificationQuestion {
   const record = readRecord(value);
-  const candidates = Array.isArray(record.candidates)
-    ? record.candidates.map((item) => {
+  const rawCandidates = record.candidates ?? record.datasourceCandidates ?? record.datasource_candidates;
+  const candidates = Array.isArray(rawCandidates)
+    ? rawCandidates.map((item) => {
         const candidate = readRecord(item);
         return {
-          datasourceId: readNumber(candidate.datasourceId),
-          name: readString(candidate.name),
-          type: readString(candidate.type),
-          usagePurpose: readOptionalString(candidate.usagePurpose),
+          datasourceId: readNumber(candidate.datasourceId ?? candidate.datasource_id ?? candidate.id),
+          name: readString(candidate.name ?? candidate.datasourceName ?? candidate.datasource_name),
+          type: readString(candidate.type ?? candidate.datasourceType ?? candidate.datasource_type),
+          usagePurpose: readOptionalString(candidate.usagePurpose ?? candidate.usage_purpose),
         };
       }).filter((item) => item.datasourceId > 0 && item.name)
     : [];
-  const options = Array.isArray(record.options)
-    ? record.options.map((item) => {
+  const rawOptions = record.options ?? record.choiceOptions ?? record.choice_options;
+  const options = Array.isArray(rawOptions)
+    ? rawOptions.map((item) => {
         const option = readRecord(item);
+        const rawValue = option.value ?? option.optionValue ?? option.option_value;
         return {
-          value: typeof option.value === "boolean" ? option.value : readString(option.value),
-          label: readString(option.label),
+          value: typeof rawValue === "boolean" ? rawValue : readString(rawValue),
+          label: readString(option.label ?? option.name),
         };
       }).filter((item) => item.label && (typeof item.value === "boolean" || item.value))
     : [];
-  const preview = readRecord(record.configurationPreview);
+  const preview = readFirstRecord(record, "configurationPreview", "configuration_preview", "preview");
   return {
-    parameterName: readString(record.parameterName),
-    fieldPath: readString(record.fieldPath),
-    label: readString(record.label),
-    question: readString(record.question),
-    inputType: readString(record.inputType, "TEXT"),
+    parameterName: readString(record.parameterName ?? record.parameter_name),
+    fieldPath: readString(record.fieldPath ?? record.field_path),
+    label: readString(record.label ?? record.displayLabel ?? record.display_label),
+    question: readString(record.question ?? record.prompt),
+    inputType: readString(record.inputType ?? record.input_type, "TEXT"),
     required: readBoolean(record.required, true),
     sensitive: readBoolean(record.sensitive),
     candidates: candidates.length ? candidates : undefined,
     options: options.length ? options : undefined,
-    reasonCode: readOptionalString(record.reasonCode),
-    ambiguityType: readOptionalString(record.ambiguityType),
-    requestedDatasourceType: readOptionalString(record.requestedDatasourceType),
-    allowsNaturalLanguageCorrection: readBoolean(record.allowsNaturalLanguageCorrection),
-    repairGuidance: readOptionalString(record.repairGuidance),
+    reasonCode: readOptionalString(record.reasonCode ?? record.reason_code),
+    ambiguityType: readOptionalString(record.ambiguityType ?? record.ambiguity_type),
+    requestedDatasourceType: readOptionalString(record.requestedDatasourceType ?? record.requested_datasource_type),
+    allowsNaturalLanguageCorrection: readBoolean(
+      record.allowsNaturalLanguageCorrection ?? record.allows_natural_language_correction,
+    ),
+    repairGuidance: readOptionalString(record.repairGuidance ?? record.repair_guidance),
     configurationPreview: Object.keys(preview).length ? {
-      kind: readOptionalString(preview.kind),
-      customSqlText: readOptionalString(preview.customSqlText),
-      generatedByAgent: readBoolean(preview.generatedByAgent),
-      requiresExplicitConfirmation: readBoolean(preview.requiresExplicitConfirmation),
-      payloadPolicy: readOptionalString(preview.payloadPolicy),
+      kind: readOptionalString(preview.kind ?? preview.type),
+      customSqlText: readOptionalString(preview.customSqlText ?? preview.custom_sql_text),
+      generatedByAgent: readBoolean(preview.generatedByAgent ?? preview.generated_by_agent),
+      requiresExplicitConfirmation: readBoolean(
+        preview.requiresExplicitConfirmation ?? preview.requires_explicit_confirmation,
+      ),
+      payloadPolicy: readOptionalString(preview.payloadPolicy ?? preview.payload_policy),
     } : undefined,
   };
 }
@@ -2102,66 +2376,151 @@ function normalizeAgentClarificationQuestion(value: unknown): AgentClarification
 function normalizeAgentStructuredIntent(value: unknown): AgentStructuredIntent {
   const record = readRecord(value);
   return {
-    intentType: readString(record.intentType, "GENERAL_GOVERNANCE_REQUEST"),
-    domains: readStringArray(record.domains),
-    candidateTools: readStringArray(record.candidateTools),
-    riskTags: readStringArray(record.riskTags),
+    intentType: readString(record.intentType ?? record.intent_type, "GENERAL_GOVERNANCE_REQUEST"),
+    domains: readStringArray(record.domains ?? record.domain_list),
+    candidateTools: readStringArray(record.candidateTools ?? record.candidate_tools),
+    riskTags: readStringArray(record.riskTags ?? record.risk_tags),
     confidence: readNumber(record.confidence),
     summary: readOptionalString(record.summary),
-    syncMode: readOptionalString(record.syncMode),
-    writeStrategy: readOptionalString(record.writeStrategy),
-    sourceDatasourceSelected: readBoolean(record.sourceDatasourceSelected),
-    targetDatasourceSelected: readBoolean(record.targetDatasourceSelected),
-    objectMappingCount: readNumber(record.objectMappingCount),
+    syncMode: readOptionalString(record.syncMode ?? record.sync_mode),
+    writeStrategy: readOptionalString(record.writeStrategy ?? record.write_strategy),
+    sourceDatasourceSelected: readBoolean(
+      record.sourceDatasourceSelected ?? record.source_datasource_selected,
+    ),
+    targetDatasourceSelected: readBoolean(
+      record.targetDatasourceSelected ?? record.target_datasource_selected,
+    ),
+    objectMappingCount: readNumber(record.objectMappingCount ?? record.object_mapping_count),
   };
+}
+
+/**
+ * Normalize one Agent-generated field mapping to the form-editor vocabulary.
+ *
+ * A task plan can be produced by either runtime and later replayed from a
+ * durable JSON snapshot.  The outer conversation decoder previously kept the
+ * mapping object untouched, which meant a valid `source_field` or
+ * `field_mappings` response could disappear when the form read only camelCase.
+ * Keeping the original keys plus canonical UI aliases is intentionally
+ * backward-compatible: unknown server additions survive, while the editor
+ * always receives the fields it needs to render and validate a mapping.
+ */
+function normalizeAgentResolvedFieldMapping(value: unknown, index: number): Record<string, unknown> {
+  const record = readRecord(value);
+  if (!Object.keys(record).length) return {};
+  const normalized: Record<string, unknown> = { ...record };
+  const textAliases: Array<[string, string[]]> = [
+    ["key", ["key", "mappingKey", "mapping_key"]],
+    ["sourceField", ["sourceField", "source_field", "sourceColumn", "source_column", "sourceName", "source_name"]],
+    ["sourceType", ["sourceType", "source_type"]],
+    ["targetField", ["targetField", "target_field", "targetColumn", "target_column", "targetName", "target_name"]],
+    ["targetType", ["targetType", "target_type"]],
+    ["compatibilityNote", ["compatibilityNote", "compatibility_note", "conversionSuggestion", "conversion_suggestion"]],
+    ["transform", ["transform", "transformation", "expression"]],
+  ];
+  textAliases.forEach(([canonicalKey, aliases]) => {
+    const text = readOptionalString(readFirstDefinedValue(record, ...aliases));
+    if (text) normalized[canonicalKey] = text;
+  });
+  const booleanAliases: Array<[string, string[]]> = [
+    ["nullable", ["nullable", "isNullable", "is_nullable"]],
+    ["primaryKey", ["primaryKey", "primary_key", "isPrimaryKey", "is_primary_key"]],
+    ["syncEnabled", ["syncEnabled", "sync_enabled", "enabled"]],
+    ["typeCompatible", ["typeCompatible", "type_compatible", "compatible"]],
+  ];
+  booleanAliases.forEach(([canonicalKey, aliases]) => {
+    const boolean = readOptionalBoolean(readFirstDefinedValue(record, ...aliases));
+    if (boolean !== undefined) normalized[canonicalKey] = boolean;
+  });
+  if (!normalized.key) normalized.key = `agent-field-${index + 1}`;
+  return normalized;
+}
+
+/**
+ * Normalize a source-to-target object mapping and all of its nested fields.
+ *
+ * The result remains a generic JSON object because the API contract is
+ * extensible, but every mapping property used by the Agent review form is
+ * written under its canonical camelCase key.  This makes new requests, stream
+ * responses, and historical-session replay share one mapping model instead of
+ * requiring every page to reimplement the Java/Python alias matrix.
+ */
+function normalizeAgentResolvedObjectMapping(value: unknown, index: number): Record<string, unknown> {
+  const record = readRecord(value);
+  if (!Object.keys(record).length) return {};
+  const normalized: Record<string, unknown> = { ...record };
+  const textAliases: Array<[string, string[]]> = [
+    ["objectKey", ["objectKey", "object_key", "mappingKey", "mapping_key"]],
+    ["sourceTableKey", ["sourceTableKey", "source_table_key"]],
+    ["targetTableKey", ["targetTableKey", "target_table_key"]],
+    ["sourceSchemaName", ["sourceSchemaName", "source_schema_name", "sourceSchema", "source_schema"]],
+    ["sourceObjectName", ["sourceObjectName", "source_object_name", "sourceTableName", "source_table_name", "sourceTable", "source_table"]],
+    ["targetSchemaName", ["targetSchemaName", "target_schema_name", "targetSchema", "target_schema"]],
+    ["targetObjectName", ["targetObjectName", "target_object_name", "targetTableName", "target_table_name", "targetTable", "target_table"]],
+    ["whereCondition", ["whereCondition", "where_condition", "whereClause", "where_clause", "filterCondition", "filter_condition", "where"]],
+  ];
+  textAliases.forEach(([canonicalKey, aliases]) => {
+    const text = readOptionalString(readFirstDefinedValue(record, ...aliases));
+    if (text) normalized[canonicalKey] = text;
+  });
+  const rawFieldMappings = readFirstArray(record, "fieldMappings", "field_mappings", "fields", "columns");
+  normalized.fieldMappings = rawFieldMappings
+    .map((item, fieldIndex) => normalizeAgentResolvedFieldMapping(item, fieldIndex))
+    .filter((item) => Object.keys(item).length > 0);
+  if (!normalized.objectKey) normalized.objectKey = `agent-mapping-${index + 1}`;
+  return normalized;
 }
 
 function normalizeAgentConversation(value: unknown): AgentConversation | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
-  const resolved = readRecord(value.resolvedConfiguration);
-  const resolvedMappings = Array.isArray(resolved.objectMappings)
-    ? resolved.objectMappings.map(readRecord).filter((item) => Object.keys(item).length > 0)
-    : [];
+  const resolved = readFirstRecord(value, "resolvedConfiguration", "resolved_configuration", "configuration");
+  const resolvedMappings = readFirstArray(resolved, "objectMappings", "object_mappings")
+    .map((item, index) => normalizeAgentResolvedObjectMapping(item, index))
+    .filter((item) => Object.keys(item).length > 0);
+  const rawClarificationQuestions = value.clarificationQuestions ?? value.clarification_questions;
   return {
-    schemaVersion: readString(value.schemaVersion, "1.0"),
-    turnId: readOptionalString(value.turnId),
-    phase: readString(value.phase, "NO_EXECUTABLE_PLAN"),
-    assistantMessage: readString(value.assistantMessage),
-    structuredIntent: normalizeAgentStructuredIntent(value.structuredIntent),
+    schemaVersion: readString(value.schemaVersion ?? value.schema_version, "1.0"),
+    turnId: readOptionalString(value.turnId ?? value.turn_id),
+    phase: readString(value.phase ?? value.conversationPhase ?? value.conversation_phase, "NO_EXECUTABLE_PLAN"),
+    assistantMessage: readString(value.assistantMessage ?? value.assistant_message),
+    structuredIntent: normalizeAgentStructuredIntent(
+      value.structuredIntent ?? value.structured_intent ?? value.intent,
+    ),
     resolvedConfiguration: {
-      taskName: readOptionalString(resolved.taskName),
-      syncMode: readOptionalString(resolved.syncMode),
-      writeStrategy: readOptionalString(resolved.writeStrategy),
-      sourceDatasourceId: readOptionalNumber(resolved.sourceDatasourceId),
-      sourceDatasourceName: readOptionalString(resolved.sourceDatasourceName),
-      targetDatasourceId: readOptionalNumber(resolved.targetDatasourceId),
-      targetDatasourceName: readOptionalString(resolved.targetDatasourceName),
-      scheduleConfig: readOptionalString(resolved.scheduleConfig),
-      customSqlText: readOptionalString(resolved.customSqlText),
-      customSqlConfirmed: resolved.customSqlConfirmed === undefined
+      taskName: readOptionalString(resolved.taskName ?? resolved.task_name),
+      syncMode: readOptionalString(resolved.syncMode ?? resolved.sync_mode),
+      writeStrategy: readOptionalString(resolved.writeStrategy ?? resolved.write_strategy),
+      sourceDatasourceId: readOptionalNumber(resolved.sourceDatasourceId ?? resolved.source_datasource_id),
+      sourceDatasourceName: readOptionalString(resolved.sourceDatasourceName ?? resolved.source_datasource_name),
+      targetDatasourceId: readOptionalNumber(resolved.targetDatasourceId ?? resolved.target_datasource_id),
+      targetDatasourceName: readOptionalString(resolved.targetDatasourceName ?? resolved.target_datasource_name),
+      scheduleConfig: readOptionalString(resolved.scheduleConfig ?? resolved.schedule_config),
+      customSqlText: readOptionalString(resolved.customSqlText ?? resolved.custom_sql_text),
+      customSqlConfirmed: resolved.customSqlConfirmed === undefined && resolved.custom_sql_confirmed === undefined
         ? undefined
-        : readBoolean(resolved.customSqlConfirmed),
-      targetTableResolution: readOptionalString(resolved.targetTableResolution),
+        : readBoolean(resolved.customSqlConfirmed ?? resolved.custom_sql_confirmed),
+      targetTableResolution: readOptionalString(resolved.targetTableResolution ?? resolved.target_table_resolution),
       objectMappings: resolvedMappings,
-      objectMappingSource: readOptionalString(resolved.objectMappingSource),
-      fieldMappingSource: readOptionalString(resolved.fieldMappingSource),
+      objectMappingSource: readOptionalString(resolved.objectMappingSource ?? resolved.object_mapping_source),
+      fieldMappingSource: readOptionalString(resolved.fieldMappingSource ?? resolved.field_mapping_source),
       mappingDefaultsConfirmed: resolved.mappingDefaultsConfirmed === undefined
+        && resolved.mapping_defaults_confirmed === undefined
         ? undefined
-        : readBoolean(resolved.mappingDefaultsConfirmed),
-      autoFilledFields: readStringArray(resolved.autoFilledFields),
-      payloadPolicy: readOptionalString(resolved.payloadPolicy),
+        : readBoolean(resolved.mappingDefaultsConfirmed ?? resolved.mapping_defaults_confirmed),
+      autoFilledFields: readStringArray(resolved.autoFilledFields ?? resolved.auto_filled_fields),
+      payloadPolicy: readOptionalString(resolved.payloadPolicy ?? resolved.payload_policy),
     },
-    missingParameters: readStringArray(value.missingParameters),
-    clarificationQuestions: Array.isArray(value.clarificationQuestions)
-      ? value.clarificationQuestions.map(normalizeAgentClarificationQuestion)
+    missingParameters: readStringArray(value.missingParameters ?? value.missing_parameters),
+    clarificationQuestions: Array.isArray(rawClarificationQuestions)
+      ? rawClarificationQuestions.map(normalizeAgentClarificationQuestion)
       : [],
-    canExecute: readBoolean(value.canExecute),
-    controlPlaneIngested: readBoolean(value.controlPlaneIngested),
-    nextAction: readString(value.nextAction),
-    intentResolver: readRecord(value.intentResolver),
-    payloadPolicy: readOptionalString(value.payloadPolicy),
+    canExecute: readBoolean(value.canExecute ?? value.can_execute),
+    controlPlaneIngested: readBoolean(value.controlPlaneIngested ?? value.control_plane_ingested),
+    nextAction: readString(value.nextAction ?? value.next_action),
+    intentResolver: readFirstRecord(value, "intentResolver", "intent_resolver"),
+    payloadPolicy: readOptionalString(value.payloadPolicy ?? value.payload_policy),
   };
 }
 
@@ -2169,78 +2528,120 @@ function normalizeAgentObservationTimeline(value: unknown): AgentObservationTime
   if (!isRecord(value)) {
     return undefined;
   }
-  const rawItems = Array.isArray(value.items) ? value.items : [];
+  const rawItems = readFirstArray(value, "items", "timelineItems", "timeline_items", "observations");
   const items = rawItems.map((item, index) => {
     const record = readRecord(item);
     return {
-      id: readString(record.id, `observation-${index + 1}`),
-      category: readString(record.category, "GRAPH"),
-      stage: readString(record.stage),
-      status: readString(record.status, "UNKNOWN"),
-      title: readString(record.title, `观察项 ${index + 1}`),
-      summary: readString(record.summary),
-      details: readRecord(record.details),
+      id: readString(record.id ?? record.observationId ?? record.observation_id, `observation-${index + 1}`),
+      category: readString(record.category ?? record.eventCategory ?? record.event_category, "GRAPH"),
+      stage: readString(record.stage ?? record.phase),
+      status: readString(record.status ?? record.state, "UNKNOWN"),
+      title: readString(record.title ?? record.displayTitle ?? record.display_title, `观察项 ${index + 1}`),
+      summary: readString(record.summary ?? record.message),
+      details: readFirstRecord(record, "details", "attributes", "publicDetails", "public_details"),
     };
   });
   return {
-    schemaVersion: readString(value.schemaVersion, "datasmart.agent-observation-timeline.v1"),
-    payloadPolicy: readOptionalString(value.payloadPolicy),
-    requestId: readOptionalString(value.requestId),
-    itemCount: readNumber(value.itemCount, items.length),
+    schemaVersion: readString(value.schemaVersion ?? value.schema_version, "datasmart.agent-observation-timeline.v1"),
+    payloadPolicy: readOptionalString(value.payloadPolicy ?? value.payload_policy),
+    requestId: readOptionalString(value.requestId ?? value.request_id),
+    itemCount: readNumber(value.itemCount ?? value.item_count, items.length),
     items,
-    hiddenByDesign: readStringArray(value.hiddenByDesign),
+    hiddenByDesign: readStringArray(value.hiddenByDesign ?? value.hidden_by_design),
   };
 }
 
 function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
   const record = readRecord(value);
-  const durableLoop = readRecord(record.agentDurableModelToolLoop);
-  const durableTurns = Array.isArray(durableLoop.turns)
-    ? durableLoop.turns.map((item) => {
+  /* 统一兼容计划聚合接口的两套字段命名，避免 specialist 生命周期在页面丢失。 */
+  const planValue = record.plan ?? record.agentPlan ?? record.agent_plan;
+  const durableLoop = readFirstRecord(
+    record,
+    "agentDurableModelToolLoop",
+    "agent_durable_model_tool_loop",
+    "durableModelToolLoop",
+    "durable_model_tool_loop",
+  );
+  const durableTurns = readFirstArray(durableLoop, "turns", "loopTurns", "loop_turns")
+    .map((item) => {
         const turn = readRecord(item);
         return {
-          turnIndex: readNumber(turn.turnIndex),
-          requestId: readString(turn.requestId),
-          sessionId: readOptionalString(turn.sessionId),
-          runId: readOptionalString(turn.runId),
-          submittedToolNames: readStringArray(turn.submittedToolNames),
-          ingestionSucceeded: readBoolean(turn.ingestionSucceeded),
+          turnIndex: readNumber(turn.turnIndex ?? turn.turn_index),
+          requestId: readString(turn.requestId ?? turn.request_id),
+          sessionId: readOptionalString(turn.sessionId ?? turn.session_id),
+          runId: readOptionalString(turn.runId ?? turn.run_id),
+          submittedToolNames: readStringArray(turn.submittedToolNames ?? turn.submitted_tool_names),
+          ingestionSucceeded: readBoolean(turn.ingestionSucceeded ?? turn.ingestion_succeeded),
           feedbackStatusCounts: Object.fromEntries(
-            Object.entries(readRecord(turn.feedbackStatusCounts)).map(([key, count]) => [key, readNumber(count)]),
+            Object.entries(readFirstRecord(turn, "feedbackStatusCounts", "feedback_status_counts"))
+              .map(([key, count]) => [key, readNumber(count)]),
           ),
-          loopAction: readOptionalString(turn.loopAction),
-          modelExecuted: readBoolean(turn.modelExecuted),
-          nextToolNames: readStringArray(turn.nextToolNames),
-          stopReason: readOptionalString(turn.stopReason),
+          loopAction: readOptionalString(turn.loopAction ?? turn.loop_action),
+          modelExecuted: readBoolean(turn.modelExecuted ?? turn.model_executed),
+          nextToolNames: readStringArray(turn.nextToolNames ?? turn.next_tool_names),
+          stopReason: readOptionalString(turn.stopReason ?? turn.stop_reason),
         };
-      })
-    : [];
+      });
+  const specialistExecutionValue = record.specialistAgentExecution
+    ?? record.specialist_agent_execution
+    ?? record.specialistExecution
+    ?? record.specialist_execution;
+  const verificationValue = record.specialistVerificationExecution
+    ?? record.specialist_verification_execution;
+  const bridgeValues = record.specialistToolPlanBridges
+    ?? record.specialist_tool_plan_bridges;
+  const postBridgeValue = record.postBridgeVerification
+    ?? record.post_bridge_verification;
   return {
-    plan: normalizeAgentPlanCore(record.plan),
-    eventEnvelope: readRecord(record.eventEnvelope),
-    modelGatewayGovernance: readRecord(record.modelGatewayGovernance),
-    intelligentGatewayGovernance: readRecord(record.intelligentGatewayGovernance),
-    toolExecutionReadiness: readRecord(record.toolExecutionReadiness),
-    toolExecutionReadinessGraph: readRecord(record.toolExecutionReadinessGraph),
-    agentExecutionGateWorkflow: readRecord(record.agentExecutionGateWorkflow),
-    agentExecutionClosure: readRecord(record.agentExecutionClosure),
-    agentCapabilityClosure: readRecord(record.agentCapabilityClosure),
-    controlPlaneIngestion: readRecord(record.controlPlaneIngestion),
-    controlPlaneFeedback: readRecord(record.controlPlaneFeedback),
-    agentWorkflowDiagnostics: readRecord(record.agentWorkflowDiagnostics),
-    agentCollaborationWorkflow: readRecord(record.agentCollaborationWorkflow),
-    agentCollaborationExecutionPlan: readRecord(record.agentCollaborationExecutionPlan),
-    agentExecutionSession: readRecord(record.agentExecutionSession),
-    agentTurnRunner: readRecord(record.agentTurnRunner),
-    agentMemoryRetrievalWorkflow: readRecord(record.agentMemoryRetrievalWorkflow),
-    agentConversation: normalizeAgentConversation(record.agentConversation),
-    agentObservationTimeline: normalizeAgentObservationTimeline(record.agentObservationTimeline),
+    plan: normalizeAgentPlanCore(planValue),
+    eventEnvelope: readFirstRecord(record, "eventEnvelope", "event_envelope"),
+    modelGatewayGovernance: readFirstRecord(record, "modelGatewayGovernance", "model_gateway_governance"),
+    intelligentGatewayGovernance: readFirstRecord(
+      record,
+      "intelligentGatewayGovernance",
+      "intelligent_gateway_governance",
+    ),
+    toolExecutionReadiness: readFirstRecord(record, "toolExecutionReadiness", "tool_execution_readiness"),
+    toolExecutionReadinessGraph: readFirstRecord(
+      record,
+      "toolExecutionReadinessGraph",
+      "tool_execution_readiness_graph",
+    ),
+    agentExecutionGateWorkflow: readFirstRecord(record, "agentExecutionGateWorkflow", "agent_execution_gate_workflow"),
+    agentExecutionClosure: readFirstRecord(record, "agentExecutionClosure", "agent_execution_closure"),
+    agentCapabilityClosure: readFirstRecord(record, "agentCapabilityClosure", "agent_capability_closure"),
+    controlPlaneIngestion: readFirstRecord(record, "controlPlaneIngestion", "control_plane_ingestion"),
+    controlPlaneFeedback: readFirstRecord(record, "controlPlaneFeedback", "control_plane_feedback"),
+    agentWorkflowDiagnostics: readFirstRecord(record, "agentWorkflowDiagnostics", "agent_workflow_diagnostics"),
+    agentCollaborationWorkflow: readFirstRecord(record, "agentCollaborationWorkflow", "agent_collaboration_workflow"),
+    agentCollaborationExecutionPlan: readFirstRecord(
+      record,
+      "agentCollaborationExecutionPlan",
+      "agent_collaboration_execution_plan",
+    ),
+    agentExecutionSession: readFirstRecord(record, "agentExecutionSession", "agent_execution_session"),
+    agentTurnRunner: readFirstRecord(record, "agentTurnRunner", "agent_turn_runner"),
+    specialistAgentExecution: isRecord(specialistExecutionValue)
+      ? readRecord(specialistExecutionValue)
+      : undefined,
+    specialistVerificationExecution: normalizeSpecialistVerificationExecution(verificationValue),
+    specialistToolPlanBridges: Array.isArray(bridgeValues)
+      ? bridgeValues.map(normalizeSpecialistToolPlanBridge)
+      : undefined,
+    postBridgeVerification: normalizePostBridgeVerification(postBridgeValue),
+    agentMemoryRetrievalWorkflow: readFirstRecord(record, "agentMemoryRetrievalWorkflow", "agent_memory_retrieval_workflow"),
+    agentConversation: normalizeAgentConversation(record.agentConversation ?? record.agent_conversation),
+    agentObservationTimeline: normalizeAgentObservationTimeline(
+      record.agentObservationTimeline ?? record.agent_observation_timeline,
+    ),
     agentDurableModelToolLoop: Object.keys(durableLoop).length ? {
-      turnCount: readNumber(durableLoop.turnCount, durableTurns.length),
+      turnCount: readNumber(durableLoop.turnCount ?? durableLoop.turn_count, durableTurns.length),
       turns: durableTurns,
-      stoppedReason: readString(durableLoop.stoppedReason),
-      continuesAfterResponse: readBoolean(durableLoop.continuesAfterResponse),
-      payloadPolicy: readOptionalString(durableLoop.payloadPolicy),
+      stoppedReason: readString(durableLoop.stoppedReason ?? durableLoop.stopped_reason),
+      continuesAfterResponse: readBoolean(
+        durableLoop.continuesAfterResponse ?? durableLoop.continues_after_response,
+      ),
+      payloadPolicy: readOptionalString(durableLoop.payloadPolicy ?? durableLoop.payload_policy),
     } : undefined,
     raw: record,
   };
@@ -2249,41 +2650,41 @@ function normalizeAgentPlanResponse(value: unknown): AgentPlanResponse {
 function normalizeAgentToolExecutionAudit(value: unknown, index: number): AgentToolExecutionAudit {
   const record = isRecord(value) ? value : {};
   return {
-    auditId: readString(record.auditId, `audit-${index + 1}`),
-    sessionId: readString(record.sessionId),
-    runId: readString(record.runId),
-    bindingId: readOptionalString(record.bindingId),
-    toolCode: readString(record.toolCode, `tool-${index + 1}`),
-    toolType: readOptionalString(record.toolType),
-    targetService: readOptionalString(record.targetService),
-    targetEndpoint: readOptionalString(record.targetEndpoint),
-    targetResourceId: readOptionalNumber(record.targetResourceId),
-    tenantId: readOptionalNumber(record.tenantId),
-    projectId: readOptionalNumber(record.projectId),
-    workspaceId: readOptionalNumber(record.workspaceId),
-    actorId: readOptionalString(record.actorId),
-    riskLevel: normalizeRisk(record.riskLevel),
-    executionMode: normalizeAgentExecutionMode(record.executionMode),
-    requiresApproval: readBoolean(record.requiresApproval),
-    readOnly: readBoolean(record.readOnly),
+    auditId: readString(record.auditId ?? record.audit_id, `audit-${index + 1}`),
+    sessionId: readString(record.sessionId ?? record.session_id),
+    runId: readString(record.runId ?? record.run_id),
+    bindingId: readOptionalString(record.bindingId ?? record.binding_id),
+    toolCode: readString(record.toolCode ?? record.tool_code, `tool-${index + 1}`),
+    toolType: readOptionalString(record.toolType ?? record.tool_type),
+    targetService: readOptionalString(record.targetService ?? record.target_service),
+    targetEndpoint: readOptionalString(record.targetEndpoint ?? record.target_endpoint),
+    targetResourceId: readOptionalNumber(record.targetResourceId ?? record.target_resource_id),
+    tenantId: readOptionalNumber(record.tenantId ?? record.tenant_id),
+    projectId: readOptionalNumber(record.projectId ?? record.project_id),
+    workspaceId: readOptionalNumber(record.workspaceId ?? record.workspace_id),
+    actorId: readOptionalString(record.actorId ?? record.actor_id),
+    riskLevel: normalizeRisk(record.riskLevel ?? record.risk_level),
+    executionMode: normalizeAgentExecutionMode(record.executionMode ?? record.execution_mode),
+    requiresApproval: readBoolean(record.requiresApproval ?? record.requires_approval),
+    readOnly: readBoolean(record.readOnly ?? record.read_only),
     idempotent: readBoolean(record.idempotent),
-    allowedActions: readStringArray(record.allowedActions),
-    planReason: readOptionalString(record.planReason),
-    planArguments: readRecord(record.planArguments),
-    governanceHints: readRecord(record.governanceHints),
-    parameterValidation: readRecord(record.parameterValidation),
-    state: readString(record.state, "UNKNOWN"),
-    traceId: readOptionalString(record.traceId),
-    message: readOptionalString(record.message),
-    approvalOperatorId: readOptionalString(record.approvalOperatorId),
-    approvalComment: readOptionalString(record.approvalComment),
-    approvalTime: readOptionalString(record.approvalTime),
-    executionStartTime: readOptionalString(record.executionStartTime),
-    executionFinishTime: readOptionalString(record.executionFinishTime),
-    outputSummary: readOptionalString(record.outputSummary),
-    errorCode: readOptionalString(record.errorCode),
-    createTime: readOptionalString(record.createTime),
-    updateTime: readOptionalString(record.updateTime),
+    allowedActions: readStringArray(record.allowedActions ?? record.allowed_actions),
+    planReason: readOptionalString(record.planReason ?? record.plan_reason),
+    planArguments: readRecord(record.planArguments ?? record.plan_arguments),
+    governanceHints: readRecord(record.governanceHints ?? record.governance_hints),
+    parameterValidation: readRecord(record.parameterValidation ?? record.parameter_validation),
+    state: readString(record.state ?? record.status, "UNKNOWN").toUpperCase(),
+    traceId: readOptionalString(record.traceId ?? record.trace_id),
+    message: readOptionalString(record.message ?? record.error_message),
+    approvalOperatorId: readOptionalString(record.approvalOperatorId ?? record.approval_operator_id),
+    approvalComment: readOptionalString(record.approvalComment ?? record.approval_comment),
+    approvalTime: readOptionalString(record.approvalTime ?? record.approval_time),
+    executionStartTime: readOptionalString(record.executionStartTime ?? record.execution_start_time),
+    executionFinishTime: readOptionalString(record.executionFinishTime ?? record.execution_finish_time),
+    outputSummary: readOptionalString(record.outputSummary ?? record.output_summary),
+    errorCode: readOptionalString(record.errorCode ?? record.error_code),
+    createTime: readOptionalString(record.createTime ?? record.create_time),
+    updateTime: readOptionalString(record.updateTime ?? record.update_time),
   };
 }
 
@@ -2297,8 +2698,130 @@ function normalizeAgentToolExecutionAudit(value: unknown, index: number): AgentT
 function normalizeAgentToolExecutionResult(value: unknown, index: number): AgentToolExecutionResult {
   const record = isRecord(value) ? value : {};
   return {
-    audit: normalizeAgentToolExecutionAudit(record.audit, index),
-    output: readRecord(record.output),
+    audit: normalizeAgentToolExecutionAudit(record.audit ?? record.tool_execution_audit, index),
+    output: readRecord(record.output ?? record.result ?? record.tool_result),
+  };
+}
+
+function normalizeAgentRepairProposal(value: unknown): AgentRepairProposal | undefined {
+  const record = readRecord(value);
+  if (!Object.keys(record).length) return undefined;
+  return {
+    kind: readString(record.kind ?? record.recoveryKind ?? record.recovery_kind, "UNKNOWN"),
+    failureCode: readOptionalString(record.failureCode ?? record.failure_code),
+    failedToolName: readOptionalString(record.failedToolName ?? record.failed_tool_name),
+    originalTaskName: readOptionalString(record.originalTaskName ?? record.original_task_name),
+    proposedTaskName: readOptionalString(record.proposedTaskName ?? record.proposed_task_name),
+    // Repair actions are only shown as confirmable when the backend explicitly
+    // sends true; malformed or missing flags remain false.
+    requiresConfirmation: readBoolean(
+      record.requiresConfirmation ?? record.requires_confirmation,
+    ),
+    summary: readString(record.summary ?? record.publicSummary ?? record.public_summary),
+    changes: readStringArray(record.changes ?? record.changeSummaries ?? record.change_summaries),
+    payloadPolicy: readOptionalString(record.payloadPolicy ?? record.payload_policy),
+  };
+}
+
+function normalizeAgentPostConfirmContinuation(value: unknown): AgentPostConfirmContinuation | undefined {
+  const record = readRecord(value);
+  if (!Object.keys(record).length) return undefined;
+
+  const continued = readOptionalBoolean(
+    readFirstDefinedValue(record, "continued", "continuationContinued", "continuation_continued"),
+  ) ?? null;
+  const modelSecondTurn = readFirstRecord(record, "modelSecondTurn", "model_second_turn");
+  const durableLoop = readFirstRecord(record, "durableLoop", "durable_loop");
+  const repairProposal = normalizeAgentRepairProposal(
+    record.repairProposal ?? record.repair_proposal,
+  );
+  const specialistVerificationExecution = normalizeSpecialistVerificationExecution(
+    record.specialistVerificationExecution ?? record.specialist_verification_execution,
+  );
+  const postBridgeVerification = normalizePostBridgeVerification(
+    record.postBridgeVerification ?? record.post_bridge_verification,
+  );
+
+  return {
+    schemaVersion: readString(
+      record.schemaVersion ?? record.schema_version,
+      "datasmart.post-confirm-continuation.v1",
+    ),
+    status: readString(record.status ?? record.state, "UNKNOWN").toUpperCase(),
+    continued: readOptionalBoolean(
+      readFirstDefinedValue(record, "continued", "continuationContinued", "continuation_continued"),
+    ) ?? null,
+    requestId: readOptionalString(record.requestId ?? record.request_id),
+    sessionId: readOptionalString(record.sessionId ?? record.session_id),
+    sourceRunId: readOptionalString(record.sourceRunId ?? record.source_run_id),
+    // A next Run is an executable continuation.  Do not expose it to the
+    // action caller unless the nullable backend flag explicitly says true.
+    nextRunId: continued === true
+      ? readOptionalString(record.nextRunId ?? record.next_run_id)
+      : undefined,
+    requiresConfirmation: readOptionalBoolean(
+      readFirstDefinedValue(record, "requiresConfirmation", "requires_confirmation"),
+    ) ?? null,
+    stoppedReason: readOptionalString(record.stoppedReason ?? record.stopped_reason),
+    assistantReply: readOptionalString(record.assistantReply ?? record.assistant_reply),
+    modelSecondTurn: Object.keys(modelSecondTurn).length ? modelSecondTurn : undefined,
+    durableLoop: Object.keys(durableLoop).length ? durableLoop : undefined,
+    repairProposal,
+    specialistVerificationExecution,
+    postBridgeVerification,
+    payloadPolicy: readOptionalString(record.payloadPolicy ?? record.payload_policy),
+    message: readOptionalString(record.message),
+  };
+}
+
+function normalizeAgentToolExecutionFailure(value: unknown, index: number): AgentToolExecutionFailure {
+  const record = readRecord(value);
+  return {
+    auditId: readOptionalString(record.auditId ?? record.audit_id),
+    toolCode: readString(record.toolCode ?? record.tool_code, `tool-${index + 1}`),
+    errorCode: readString(record.errorCode ?? record.error_code, "UNKNOWN"),
+    message: readString(record.message ?? record.publicMessage ?? record.public_message),
+    outputSummary: readOptionalString(record.outputSummary ?? record.output_summary),
+    details: readStringArray(record.details ?? record.detailSummaries ?? record.detail_summaries),
+    suggestions: readStringArray(record.suggestions ?? record.recoverySuggestions ?? record.recovery_suggestions),
+  };
+}
+
+function normalizeAgentRunConfirmedExecutionResponse(
+  value: unknown,
+): AgentRunConfirmedExecutionResponse {
+  const record = readRecord(value);
+  const toolResults = readFirstArray(record, "toolResults", "tool_results")
+    .map(normalizeAgentToolExecutionResult);
+  const failures = readFirstArray(record, "failures", "executionFailures", "execution_failures")
+    .map(normalizeAgentToolExecutionFailure);
+  const plannedCount = readNumber(
+    record.plannedCount ?? record.planned_count,
+    toolResults.length + failures.length,
+  );
+  const failedCount = readNumber(record.failedCount ?? record.failed_count, failures.length);
+  const continuation = normalizeAgentPostConfirmContinuation(
+    record.continuation ?? record.postConfirmContinuation ?? record.post_confirm_continuation,
+  );
+  return {
+    sessionId: readString(record.sessionId ?? record.session_id),
+    runId: readString(record.runId ?? record.run_id),
+    runState: readString(record.runState ?? record.run_state ?? record.state, "UNKNOWN"),
+    plannedCount,
+    succeededCount: readNumber(
+      record.succeededCount ?? record.succeeded_count,
+      Math.max(0, plannedCount - failedCount),
+    ),
+    failedCount,
+    toolResults,
+    failures,
+    nextActions: readStringArray(record.nextActions ?? record.next_actions),
+    assistantReply: readString(record.assistantReply ?? record.assistant_reply),
+    answerMode: readString(record.answerMode ?? record.answer_mode),
+    modelProviderStatus: readString(
+      record.modelProviderStatus ?? record.model_provider_status,
+    ),
+    ...(continuation ? { continuation } : {}),
   };
 }
 
@@ -2408,6 +2931,20 @@ async function realPageEndpoint<T>(path: string, mapper?: (value: unknown, index
   return {
     ...result,
     data: normalizePage<T>(result.data, [], mapper),
+  };
+}
+
+/**
+ * 读取真实的低敏事实集合，不允许在生产历史回放中静默切换到 mock 数据。
+ *
+ * Agent 历史事实属于审计和回放证据，接口失败时应由调用方按“非阻断”策略
+ * 处理并显示有限提示，而不是把本地样例误当成真实专业 Agent 过程。
+ */
+async function realArrayEndpoint<T>(path: string, mapper?: (value: unknown, index: number) => T) {
+  const result = await request<unknown>(path);
+  return {
+    ...result,
+    data: normalizeArray<T>(result.data, [], mapper),
   };
 }
 
@@ -2846,8 +3383,18 @@ export const api = {
       data: normalizeSyncConnectorCompatibility(result.data),
     };
   },
-  /** 查询当前项目范围内可访问的 Agent 会话历史，可切换活跃/归档集合。 */
-  listAgentSessions: (params?: { archived?: boolean; limit?: number; actorId?: string }) => {
+  /**
+   * 查询当前项目范围内可访问的 Agent 会话历史，可切换活跃/归档集合。
+   *
+   * projectId 显式进入查询参数，与网关的项目 Header 形成双重约束；这样项目
+   * 切换时不会只依赖 React Query key，而让旧项目的会话短暂出现在新项目列表。
+   */
+  listAgentSessions: (params?: {
+    archived?: boolean;
+    limit?: number;
+    actorId?: string;
+    projectId?: number;
+  }) => {
     const query = compactQueryString(params);
     return arrayEndpoint<AgentSession>(`/agent/sessions${query ? `?${query}` : ""}`, [], normalizeAgentSession);
   },
@@ -2856,6 +3403,23 @@ export const api = {
     const result = await request<unknown>(`/agent/sessions/${sessionId}`);
     return { ...result, data: normalizeAgentSession(result.data, 0) };
   },
+  /** 查询一个历史会话中的专业 Agent 低敏事实，权限上下文由 request 统一注入。 */
+  listAgentSpecialistTurnFactsBySession: (sessionId: string) =>
+    realArrayEndpoint<AgentSpecialistTurnFact>(
+      `/agent/specialist-turn-facts/sessions/${encodeURIComponent(sessionId)}`,
+      normalizeAgentSpecialistTurnFact,
+    ),
+  /**
+   * 按 Run 查询专业 Agent 低敏事实。
+   *
+   * 历史会话优先使用 session 查询以避免 N+1；当 session 事实接口不可用或
+   * 未来需要单独回放某个 Run 时，再由页面调用这个精确定位接口。
+   */
+  listAgentSpecialistTurnFactsByRun: (runId: string) =>
+    realArrayEndpoint<AgentSpecialistTurnFact>(
+      `/agent/specialist-turn-facts/runs/${encodeURIComponent(runId)}`,
+      normalizeAgentSpecialistTurnFact,
+    ),
   /** 修改会话置顶状态；后端仍会校验当前用户是会话所有者。 */
   setAgentSessionPinned: async (sessionId: string, enabled: boolean) => {
     const result = await patchJson<unknown>(`/agent/sessions/${sessionId}/pin`, { enabled });
@@ -2909,11 +3473,16 @@ export const api = {
     request<Record<string, unknown>>(`/agent/sessions/${sessionId}/runs/${runId}/tool-executions/dag-plan`),
   getAgentAsyncCommandPlans: (sessionId: string, runId: string) =>
     request<Record<string, unknown>>(`/agent/sessions/${sessionId}/runs/${runId}/tool-executions/async-command-plans`),
-  confirmAndExecuteAgentRun: (sessionId: string, runId: string, payload: ConfirmAgentRunPayload) =>
-    postJson<AgentRunConfirmedExecutionResponse>(
+  confirmAndExecuteAgentRun: async (sessionId: string, runId: string, payload: ConfirmAgentRunPayload) => {
+    const result = await postJson<unknown>(
       `/agent/sessions/${sessionId}/runs/${runId}/confirm-and-execute`,
       payload,
-    ),
+    );
+    return {
+      ...result,
+      data: normalizeAgentRunConfirmedExecutionResponse(result.data),
+    };
+  },
   createAgentPlan: async (payload: CreateAgentPlanPayload) => {
     const result = await postJson<unknown>("/agent/plans", payload);
     return {

@@ -7,7 +7,12 @@
     "dev": "vite --host localhost",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host localhost",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test:agent-control-plane": "node scripts/agent-control-plane-selection.test.mjs",
+    "test:agent-specialist-audit": "node scripts/agent-specialist-audit.test.mjs",
+    "test:agent-confirmation-gate": "node scripts/agent-confirmation-gate.test.mjs",
+    "test:agent-console-live-contract": "node scripts/agent-console-live-contract.test.mjs",
+    "test:data-sync-agent-locator": "node scripts/data-sync-agent-locator.test.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",

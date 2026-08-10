@@ -1,0 +1,564 @@
+.specialist-agent-panel {
+  --specialist-agent-surface: #f8fafc;
+  --specialist-agent-border: #e5e7eb;
+  --specialist-agent-muted: #64748b;
+  overflow: hidden;
+  width: 100%;
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.specialist-agent-panel .ant-card-head {
+  min-height: 52px;
+}
+
+.specialist-agent-panel-title,
+.specialist-agent-section-title,
+.specialist-agent-result-title,
+.specialist-agent-tool-activity,
+.specialist-agent-evidence-reference {
+  display: flex;
+  align-items: center;
+}
+
+.specialist-agent-panel-title {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.specialist-agent-batch-collapse {
+  border: 0;
+  background: transparent;
+}
+
+.specialist-agent-batch-collapse > .ant-collapse-item {
+  border: 0;
+}
+
+.specialist-agent-batch-collapse > .ant-collapse-item > .ant-collapse-header {
+  min-height: 50px;
+  padding: 12px 14px;
+  align-items: center;
+}
+
+.specialist-agent-batch-collapse > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
+  padding: 0 14px 14px;
+}
+
+.specialist-agent-batch-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: 16px;
+}
+
+.specialist-agent-batch-metrics {
+  flex: 0 0 auto;
+}
+
+.specialist-agent-overview {
+  padding: 14px 16px;
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 10px;
+  background: linear-gradient(135deg, #f8fafc 0%, #ffffff 72%);
+}
+
+.specialist-agent-overview-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.specialist-agent-overview-summary {
+  max-width: 720px;
+  margin: 4px 0 0;
+  color: var(--specialist-agent-muted);
+}
+
+.specialist-agent-progress {
+  flex: 0 0 180px;
+  min-width: 150px;
+}
+
+.specialist-agent-progress .ant-progress {
+  display: block;
+  margin-top: 6px;
+}
+
+.specialist-agent-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.specialist-agent-skipped,
+.specialist-agent-waves,
+.specialist-agent-results,
+.specialist-agent-no-result {
+  margin-top: 14px;
+}
+
+.specialist-agent-skipped-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.35fr) minmax(0, 1fr);
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.specialist-agent-waves {
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 8px;
+  background: var(--specialist-agent-surface);
+}
+
+.specialist-agent-waves .ant-collapse-header {
+  align-items: center !important;
+}
+
+.specialist-agent-waves .ant-collapse-header-text {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.specialist-agent-wave-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.specialist-agent-wave {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.specialist-agent-wave-index .ant-badge-count {
+  position: static;
+  transform: none;
+}
+
+.specialist-agent-results > .ant-collapse-item {
+  border-color: var(--specialist-agent-border);
+}
+
+.specialist-agent-results .ant-collapse-header {
+  padding: 12px 14px !important;
+}
+
+.specialist-agent-results .ant-collapse-content-box {
+  padding: 4px 14px 16px !important;
+}
+
+.specialist-agent-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: 16px;
+}
+
+.specialist-agent-result-title {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.specialist-agent-result-title .ant-typography {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.specialist-agent-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+}
+
+.specialist-agent-status-icon.is-processing {
+  color: #1677ff;
+}
+
+.specialist-agent-status-icon.is-success {
+  color: #389e0d;
+}
+
+.specialist-agent-status-icon.is-warning {
+  color: #d48806;
+}
+
+.specialist-agent-status-icon.is-error {
+  color: #cf1322;
+}
+
+.specialist-agent-result-duration {
+  flex: 0 0 auto;
+}
+
+.specialist-agent-turn-id {
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.specialist-agent-result-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.specialist-agent-result-identifiers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding-bottom: 2px;
+}
+
+.specialist-agent-full-width {
+  width: 100%;
+}
+
+.specialist-agent-required-input,
+.specialist-agent-failure {
+  margin: 0;
+}
+
+.specialist-agent-missing-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.specialist-agent-public-result,
+.specialist-agent-section {
+  padding-top: 2px;
+}
+
+.specialist-agent-section-title {
+  gap: 7px;
+  margin-bottom: 8px;
+}
+
+.specialist-agent-public-summary {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.specialist-agent-descriptions {
+  width: 100%;
+}
+
+.specialist-agent-descriptions .ant-descriptions-item-label {
+  white-space: nowrap;
+}
+
+.specialist-agent-nested-values {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+}
+
+.specialist-agent-nested-value {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.specialist-agent-value-list {
+  max-width: 100%;
+  width: 100%;
+}
+
+.specialist-agent-value-list .ant-tag {
+  margin-inline-end: 0;
+  white-space: normal;
+}
+
+/* 复杂对象数组（尤其是对象映射和字段映射）使用块容器，避免把 div 嵌入 Tag。 */
+.specialist-agent-array-item {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.specialist-agent-tool-list {
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 8px;
+}
+
+.specialist-agent-tool-list .ant-list-item {
+  padding: 10px 12px;
+}
+
+.specialist-agent-tool-activity {
+  align-items: flex-start;
+  width: 100%;
+  gap: 10px;
+}
+
+.specialist-agent-tool-icon {
+  display: flex;
+  flex: 0 0 24px;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  color: #1677ff;
+  background: #e6f4ff;
+}
+
+.specialist-agent-tool-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.specialist-agent-tool-body .ant-space {
+  max-width: 100%;
+}
+
+.specialist-agent-evidence-reference {
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--specialist-agent-muted);
+}
+
+.specialist-agent-evidence-reference .ant-typography {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.specialist-agent-evidence-reference.is-compact {
+  margin-top: 3px;
+  font-size: 12px;
+}
+
+/* 生命周期摘要与首轮 Agent 结果使用同一张卡片，但通过分区边界避免把
+ * “分析结果”“Java 桥接”和“执行后复核”误读成同一个阶段。 */
+.specialist-agent-lifecycle-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 10px;
+  background: var(--specialist-agent-surface);
+}
+
+.specialist-agent-lifecycle-description {
+  margin: -3px 0 2px;
+}
+
+.specialist-agent-lifecycle-collapse {
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.specialist-agent-lifecycle-collapse > .ant-collapse-item {
+  border-color: var(--specialist-agent-border);
+}
+
+.specialist-agent-lifecycle-collapse > .ant-collapse-item:last-child {
+  border-bottom: 0;
+}
+
+.specialist-agent-lifecycle-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: 12px;
+}
+
+.specialist-agent-lifecycle-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.specialist-agent-lifecycle-heading > .ant-typography {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.specialist-agent-bridge-field-list,
+.specialist-agent-bridge-handoff,
+.specialist-agent-bridge-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.specialist-agent-bridge-handoff {
+  padding: 9px 10px;
+  border-left: 3px solid #1677ff;
+  border-radius: 4px;
+  background: #f0f7ff;
+}
+
+.specialist-agent-bridge-issues .ant-alert {
+  margin: 0;
+}
+
+.specialist-agent-verification-results {
+  background: #f6ffed;
+}
+
+.specialist-agent-verification-note {
+  margin-top: 8px;
+}
+
+.specialist-agent-verification-count {
+  display: block;
+  margin-top: 2px;
+}
+
+/*
+ * The coverage ledger gives every expected Specialist a stable place without
+ * duplicating detailed result cards. Fixed grid tracks contain long public
+ * skip summaries on desktop, while the mobile rule below switches to one
+ * column so text never overlaps another role.
+ */
+.specialist-agent-role-coverage {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--specialist-agent-border);
+  border-radius: 8px;
+  background: #fafcff;
+}
+
+.specialist-agent-role-coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.specialist-agent-role-coverage-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #e7edf4;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.specialist-agent-role-coverage-detail {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .specialist-agent-panel .ant-card-body {
+    padding: 12px;
+  }
+
+  .specialist-agent-overview {
+    padding: 12px;
+  }
+
+  .specialist-agent-overview-heading,
+  .specialist-agent-result-header,
+  .specialist-agent-batch-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .specialist-agent-progress {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .specialist-agent-result-duration {
+    padding-left: 27px;
+  }
+
+  .specialist-agent-turn-id {
+    max-width: min(70vw, 260px);
+  }
+
+  .specialist-agent-skipped-row,
+  .specialist-agent-nested-value,
+  .specialist-agent-role-coverage-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .specialist-agent-role-coverage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .specialist-agent-role-coverage-detail {
+    white-space: normal;
+  }
+
+  .specialist-agent-results .ant-collapse-header {
+    padding: 10px 10px !important;
+  }
+
+  .specialist-agent-results .ant-collapse-content-box {
+    padding: 4px 10px 14px !important;
+  }
+
+  .specialist-agent-result-title {
+    padding-right: 8px;
+  }
+
+  .specialist-agent-batch-collapse > .ant-collapse-item > .ant-collapse-header {
+    padding: 10px;
+  }
+
+  .specialist-agent-batch-collapse > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
+    padding: 0 10px 10px;
+  }
+
+  .specialist-agent-result-title .ant-tag {
+    margin-inline-end: 0;
+  }
+
+  .specialist-agent-descriptions .ant-descriptions-item-label {
+    white-space: normal;
+  }
+
+  .specialist-agent-lifecycle-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .specialist-agent-lifecycle-heading > .ant-typography {
+    max-width: 100%;
+    white-space: normal;
+  }
+}

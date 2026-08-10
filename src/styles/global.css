@@ -359,6 +359,27 @@ select {
   min-width: 0;
 }
 
+/*
+ * 一个 Agent 回合由公开过程、专业 Agent 结果和最终回答共同组成。这里让过程与专业结果共享同一列宽，
+ * 但不创建第二个输入框或独立聊天区域；移动端由组件自身的响应式规则继续收窄。
+ */
+.agent-turn-process-stack,
+.agent-message-specialist-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(860px, 96%);
+  min-width: 0;
+}
+
+.agent-message-specialist-panel {
+  margin-top: 2px;
+}
+
+.agent-turn-specialist-panel {
+  padding: 0 4px 12px;
+}
+
 .agent-process-shell {
   max-width: min(860px, 96%);
   overflow: hidden;
@@ -1056,6 +1077,31 @@ select {
 .agent-session-item:focus-within .agent-session-item-actions,
 .agent-session-item.is-active .agent-session-item-actions {
   opacity: 1;
+}
+
+/*
+ * Hover is not a discoverable interaction on touch screens. Keep session
+ * controls visible there so pinning and archiving do not depend on a user
+ * first guessing that an inactive history card contains hidden actions.
+ */
+@media (hover: none), (pointer: coarse) {
+  .agent-session-item {
+    min-height: 64px;
+    padding-right: 76px;
+  }
+
+  .agent-session-item-actions {
+    top: 8px;
+    right: 8px;
+    flex-direction: row;
+    gap: 2px;
+    opacity: 1;
+  }
+
+  .agent-session-item-actions .ant-btn {
+    min-width: 32px;
+    min-height: 32px;
+  }
 }
 
 @media (max-width: 960px) {

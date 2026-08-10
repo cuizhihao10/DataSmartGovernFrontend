@@ -111,3 +111,26 @@ OIDC 模式使用 Authorization Code + PKCE，登录后前端只把 `Authorizati
 - Agent 创建的即时任务在 `sync.task.run` 成功后进入只读终态；定期与实时任务在 `sync.task.publish` 成功后进入只读终态。
 - 进入终态后保留 Agent 过程、最终结果、任务 ID、执行 ID、任务列表入口和当前会话输入框，但移除本轮旧任务的补参、编辑、审核、确认与拒绝入口，避免同一任务重复提交。
 - 重新打开历史会话时，前端会同时检查持久化工具审计和工具结果；已提交任务只恢复成功结果卡，失败、缺参和待审批任务仍恢复原有 Agent 诊断与人工接管能力。
+
+## 六 Agent 协作可观察性（2026-08-07）
+
+- “与 Agent 协作”把 `DATASOURCE_AGENT`、`DATA_SYNC_AGENT`、`PRECHECK_AGENT`、`KNOWLEDGE_AGENT`、`RECOVERY_AGENT` 和 `MONITOR_AGENT` 的公开结果投影到同一条过程时间线；每项结果会显示处理中、完成、失败、待补参或待审批状态，并保留对应 Specialist 明细面板。
+- 实时 NDJSON 过程先展示流式 Specialist 动作，最终 Durable 计划或会话消息到达后按稳定的 Agent/turn 标识覆盖临时状态，避免同一 Agent 在主时间线重复出现两次。
+- 历史会话的过程折叠条同样恢复 Specialist 结果、低敏工具活动、证据引用、缺参和审批状态；展开后可使用已有的补参、审批定位、故障诊断和任务详情入口。不会显示模型隐藏推理、原始 prompt、凭据或工具参数。
+- Agent 结果兼容 Java camelCase 与 Python snake_case 的批次、对象映射、字段映射和审批字段；源/目标表、字段类型、WHERE、显式禁用字段等信息能进入统一的任务审核表单和手工编辑器。
+- `sync.task.run` 或定期/实时任务的 `sync.task.publish` 成功后，旧 Run 的补参、审批、编辑和重复提交入口会一并收起；任务详情跳转与会话续聊仍然可用。
+- 本轮 `npm run lint` 和 `npm run build` 均通过；Vite 仍提示主 JavaScript bundle 大于 `500kB`，属于现有拆包优化项，不阻断本次前端功能。
+
+## Agent 生命周期 Run 选择（2026-08-07）
+
+- 完整任务生命周期同时存在 `controlPlaneIngestion` 与 Durable turn 时，前端始终选择最后一个拥有完整 `sessionId/runId` 的 Durable turn；该 Run 才包含草稿、预检查、审批、发布与执行工具，避免误确认首轮数据源元数据 Run。
+- 只有后端确实未返回任何完整 Durable turn 时，页面才回退到 `controlPlaneIngestion`。会话绑定、历史消息关联、审计轮询与确认按钮复用同一个选择函数，防止页面不同区域观察或提交不同 Run。
+- 可执行回归测试：`npm run test:agent-control-plane`，覆盖生命周期 Run 优先、回退、忽略部分标识与拒绝拼接不完整标识四种情况。
+
+## 受治理执行与实时审计（2026-08-09）
+
+- 每个 Durable Run 都必须经过当前用户的明确确认；续跑发现新的 `WAITING_CONFIRMATION`、`requiresConfirmation=true` 或待审批工具时会停止自动链路，并把新的 Run 留回现有审核入口，不复用首轮确认。
+- Agent Console 的会话、运行、Specialist durable fact 查询都带当前项目范围；切换项目会清理旧的活动选择，避免跨项目复用浏览器缓存。
+- Console 通过 `/api/agent/events/ws` 接收低敏运行事件，使用订阅、ack、断线重连和 REST 回放作为同一运行时间线的实时补偿；原始 prompt、SQL、工具参数、连接信息和模型正文不进入页面。
+- DataSync 的 Agent 任务深链只在任务详情成功加载后消费；网关或服务短暂失败提供重试，`401/403/404` 则按项目权限/资源不存在的稳定结果处理。
+- 可执行回归测试：`npm run test:agent-confirmation-gate`、`npm run test:agent-console-live-contract`、`npm run test:data-sync-agent-locator`，以及既有的 `npm run test:agent-control-plane` 和 `npm run test:agent-specialist-audit`。

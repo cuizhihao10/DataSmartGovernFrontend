@@ -1088,6 +1088,39 @@ export interface AgentRun {
 }
 
 /**
+ * Java Agent Runtime 持久化的专业 Agent 低敏事实。
+ *
+ * 这不是完整的模型响应，也不是工具审计详情：后端故意只保存可用于历史
+ * 定位和过程概览的摘要、引用和身份字段。前端因此只能把它渲染成“事实兜底”
+ * 面板，不能根据 toolActivitySummaryRefs 推断工具参数、返回值或结构化结论。
+ */
+export interface AgentSpecialistTurnFact {
+  userId: string;
+  tenantId: number;
+  /** Java fact scope; this is a required backend isolation boundary. */
+  applicationId: number;
+  projectId: number;
+  sessionId: string;
+  runId: string;
+  turnId: string;
+  idempotencyKey: string;
+  agentId: string;
+  role: string;
+  delegationId?: string;
+  status: string;
+  lowSensitiveSummary: string;
+  modelInvocationId?: string;
+  modelName?: string;
+  toolActivitySummaryRefs: string[];
+  evidenceRefs: string[];
+  durationMillis?: number;
+  startedAt?: string;
+  finishedAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/**
  * 用户授予 Agent 的最小权限快照。
  *
  * 该结构用于向用户解释 Agent 被允许调用哪些工具和资源，不表示前端可以自行授权；实际执行仍由后端
@@ -1118,6 +1151,8 @@ export interface AgentConversationMessage {
   role: "USER" | "AGENT";
   content: string;
   createTime?: string;
+  /** 对应本消息回合的真实专业 Agent 低敏执行快照，用于持久历史回放。 */
+  specialistAgentExecution?: JsonObject;
 }
 
 export interface AgentSession {
@@ -1295,6 +1330,96 @@ export interface AgentObservationTimeline {
   hiddenByDesign: string[];
 }
 
+/**
+ * Specialist Agent 到 Java ToolPlan 桥接阶段公开给前端的问题摘要。
+ *
+ * 桥接层只允许返回错误码和面向用户的说明，不返回 ToolPlan 参数值、SQL、
+ * 凭据或模型内部文本。前端可以据此告诉用户“正在等待什么”，但不能把
+ * 这些字段当成可以直接执行的命令。
+ */
+export interface SpecialistToolPlanBridgeIssueSummary {
+  code?: string;
+  message?: string;
+}
+
+/**
+ * RECOVERY_AGENT 交给 Java 控制面的低敏 handoff 摘要。
+ *
+ * blueprint 只保留动作类型和参数字段名集合，真实参数必须由 Java 根据
+ * 受信控制面事实重新组装，因此这里刻意不定义或保存 arguments 字段。
+ */
+export interface SpecialistRecoveryHandoffSummary {
+  schemaVersion?: string;
+  approvalStatus?: string;
+  approvalFactAccepted?: boolean;
+  blueprintCount?: number;
+  requiresJavaRehydration?: boolean;
+  executionBoundary?: string;
+  directExecution?: boolean;
+  requiredApprovalBindings?: string[];
+}
+
+/**
+ * DATA_SYNC_AGENT/RECOVERY_AGENT 进入 Java ToolPlan 生命周期的公开桥接状态。
+ *
+ * 这个类型服务于实时响应和历史快照，所有属性都是可选的，以兼容旧版本
+ * 后端只返回 specialistAgentExecution 的情况。
+ */
+export interface SpecialistToolPlanBridgeSummary {
+  schemaVersion?: string;
+  status?: string;
+  specialistRole?: string;
+  specialistTurnId?: string;
+  publicSummary?: string;
+  acceptedToolPlanCount?: number;
+  acceptedToolNames?: string[];
+  visibleToolNames?: string[];
+  canSubmitDurableLoop?: boolean;
+  toolArgumentNameSets?: string[][];
+  issues?: SpecialistToolPlanBridgeIssueSummary[];
+  specialistResultFingerprint?: string;
+  scopeBinding?: JsonObject;
+  recoveryHandoff?: SpecialistRecoveryHandoffSummary;
+  payloadPolicy?: string;
+}
+
+/**
+ * post-bridge 的 PRECHECK_AGENT/MONITOR_AGENT 批次摘要。
+ *
+ * 复核结果本身沿用 Specialist Agent 的低敏结果结构；这里保留 JsonObject
+ * 是为了兼容后端以后增加只读检查项，同时仍由前端统一过滤敏感字段。
+ */
+export interface SpecialistVerificationExecutionSummary {
+  status?: string;
+  executedCount?: number;
+  completedCount?: number;
+  waitingInputCount?: number;
+  failedCount?: number;
+  results?: JsonObject[];
+  skippedRoles?: Record<string, string>;
+  executionWaves?: string[][];
+  executionBoundary?: string;
+  payloadPolicy?: string;
+}
+
+/**
+ * Java 控制面返回真实任务/执行定位后，后端是否启动复核波次的摘要。
+ *
+ * taskId 和 executionId 只接受真实控制面反馈，前端不会从自然语言或模型
+ * 文本中猜测它们；缺失时只展示“尚未具备可信定位”的用户提示。
+ */
+export interface PostBridgeVerificationSummary {
+  status?: string;
+  resourceChanged?: boolean;
+  resourceFingerprint?: string;
+  previousResourceFingerprint?: string;
+  taskId?: number | string | null;
+  executionId?: number | string | null;
+  executedRoles?: string[];
+  batchStatus?: string | null;
+  payloadPolicy?: string;
+}
+
 export interface AgentPlanResponse {
   plan?: AgentPlanCore;
   eventEnvelope?: JsonObject;
@@ -1312,6 +1437,10 @@ export interface AgentPlanResponse {
   agentCollaborationExecutionPlan?: JsonObject;
   agentExecutionSession?: JsonObject;
   agentTurnRunner?: JsonObject;
+  specialistAgentExecution?: JsonObject;
+  specialistVerificationExecution?: SpecialistVerificationExecutionSummary;
+  specialistToolPlanBridges?: SpecialistToolPlanBridgeSummary[];
+  postBridgeVerification?: PostBridgeVerificationSummary;
   agentMemoryRetrievalWorkflow?: JsonObject;
   agentConversation?: AgentConversation;
   agentObservationTimeline?: AgentObservationTimeline;
@@ -1386,17 +1515,23 @@ export interface AgentToolExecutionFailure {
 export interface AgentPostConfirmContinuation {
   schemaVersion: string;
   status: string;
-  continued: boolean;
+  /** Java uses nullable `Boolean`; null must never claim that a next run exists. */
+  continued: boolean | null;
   requestId?: string;
   sessionId?: string;
   sourceRunId?: string;
   nextRunId?: string;
-  requiresConfirmation: boolean;
+  /** Null/missing confirmation flags are treated as false by action callers. */
+  requiresConfirmation: boolean | null;
   stoppedReason?: string;
   assistantReply?: string;
   modelSecondTurn?: JsonObject;
   durableLoop?: JsonObject;
   repairProposal?: AgentRepairProposal;
+  /** 提交后基于真实 task/execution 运行的 PRECHECK/MONITOR 专业批次。 */
+  specialistVerificationExecution?: SpecialistVerificationExecutionSummary;
+  /** 只包含资源定位、执行角色和批次状态的低敏后置复核摘要。 */
+  postBridgeVerification?: PostBridgeVerificationSummary;
   payloadPolicy?: string;
   message?: string;
 }

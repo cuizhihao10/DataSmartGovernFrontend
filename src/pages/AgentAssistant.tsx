@@ -51,6 +51,12 @@ import { api } from "@/api/endpoints";
 import type { AgentPlanStreamFrame, AgentPlanStreamProgressEvent } from "@/api/endpoints";
 import { PageHeader } from "@/components/PageHeader";
 import {
+  SpecialistAgentExecutionPanel,
+  type SpecialistAgentExecutionInput,
+  type SpecialistAgentExecutionPanelProps,
+  type SpecialistTaskDetailLocator,
+} from "@/components/agent/SpecialistAgentExecutionPanel";
+import {
   findMetadataTableByKey,
   findMetadataTableByName,
   findSameNameTargetTable,
@@ -67,6 +73,25 @@ import {
   type SyncFieldMappingRow,
   type UserSyncMode,
 } from "@/features/dataSync/syncTaskMapping";
+import { selectLatestAgentControlPlane } from "@/features/agent/controlPlaneSelection";
+import {
+  buildPostConfirmSpecialistSnapshot,
+  isPostConfirmVerificationRole,
+} from "@/features/agent/postConfirmSpecialistProjection";
+import {
+  isHiddenAgentPresentationKey,
+  projectAgentSseAttributes,
+  publicAgentSummary,
+  sanitizeAgentPresentationValue,
+} from "@/features/agent/publicPresentationSafety";
+import {
+  classifySpecialistLifecycleState,
+  isSpecialistApprovalPendingStatus,
+  isSpecialistFailureStatus,
+  isSpecialistPartiallySuccessfulStatus,
+  isSpecialistSuccessfulStatus,
+  isTerminalSpecialistApprovalStatus,
+} from "@/features/agent/specialistStatus";
 import { AgentConsole } from "@/pages/AgentConsole";
 import { useAuthStore } from "@/store/authStore";
 import { useUiStore } from "@/store/uiStore";
@@ -74,6 +99,7 @@ import type {
   AgentPlanResponse,
   AgentObservationTimelineItem,
   AgentRun,
+  AgentSpecialistTurnFact,
   AgentToolExecutionAudit,
   AgentToolExecutionFailure,
   AgentRepairProposal,
@@ -172,6 +198,8 @@ interface AgentChatMessage {
   runId?: string;
   /** 服务端消息时间用于稳定恢复同一 Run 内多条阶段性回答的顺序。 */
   createTime?: string;
+  /** 对应本 Agent 回合的真实专业 Agent 公开结果；历史回放时仍跟随原消息展示。 */
+  specialistAgentExecution?: SpecialistAgentExecutionInput;
 }
 
 /**
@@ -184,7 +212,17 @@ interface HistoricalAgentRunProcess {
   run: AgentRun;
   audits: AgentToolExecutionAudit[];
   results: AgentToolExecutionResult[];
+  /** 旧消息未直接携带结果时，从 Run 持久变量恢复专业 Agent 执行快照。 */
+  specialistAgentExecution?: SpecialistAgentExecutionInput;
+  /** 标记面板来源，避免把低敏事实回放误标成完整模型执行快照。 */
+  specialistAgentExecutionSource?: "FULL_SNAPSHOT" | "DURABLE_FACT";
 }
+
+/** 复用专业 Agent 面板的四类业务动作，所有按钮都必须由宿主提供真实入口后才会出现。 */
+type SpecialistPanelActions = Pick<
+  SpecialistAgentExecutionPanelProps,
+  "onRequiredInput" | "onApproval" | "onFailure" | "onViewTaskDetails" | "onViewTaskLocator"
+>;
 
 type HistoricalTranscriptEntry =
   | { key: string; kind: "MESSAGE"; message: AgentChatMessage }
@@ -212,6 +250,16 @@ interface ExecutionAnswer {
    * 页面据此隐藏失效的确认按钮，并提供重新生成审核计划的持久入口。
    */
   recoveryRunUnavailableReason?: string;
+}
+
+/**
+ * Page-local handoff used when a post-confirmation continuation becomes a new
+ * human approval boundary.  It is never sent back to the API; it only rebinds
+ * the existing review card to the newly durable Run.
+ */
+interface ManualConfirmationControlPlane {
+  sessionId: string;
+  runId: string;
 }
 
 /**
@@ -347,6 +395,103 @@ function textField(record: Record<string, unknown> | undefined, key: string) {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+/**
+ * Read the first explicitly populated value from a compatibility field list.
+ *
+ * Specialist events and durable snapshots can be produced by Java and Python
+ * runtimes during the same rolling upgrade.  Keeping the alias lookup in one
+ * helper prevents every caller from accidentally accepting only camelCase or
+ * only snake_case.  `false`, `0`, and an empty array are deliberately kept as
+ * real values; only `undefined` and `null` mean that the next alias may be
+ * considered.
+ */
+function firstCompatibleField(
+  record: Readonly<Record<string, unknown>> | undefined,
+  ...keys: string[]
+): unknown {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
+}
+
+/**
+ * Read a non-empty text value from multiple DTO aliases.
+ *
+ * Unlike `firstCompatibleField`, this helper skips blank strings and continues
+ * to the next alias.  That matters for historical records where a newly added
+ * camelCase field may exist as an empty placeholder while the older snake_case
+ * field still contains the actual table, field, or Agent role name.
+ */
+function textFromCompatibleFields(
+  record: Readonly<Record<string, unknown>> | undefined,
+  ...keys: string[]
+): string | undefined {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+/**
+ * Read one ordinary JSON object from multiple aliases without treating arrays
+ * or scalar values as structured data.  This preserves the page's safe
+ * rendering boundary before specialist payloads reach the collaboration UI.
+ */
+function recordFromCompatibleFields(
+  record: Readonly<Record<string, unknown>> | undefined,
+  ...keys: string[]
+): Record<string, unknown> | undefined {
+  const value = firstCompatibleField(record, ...keys);
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/**
+ * Read an array from versioned DTO aliases.  A malformed scalar is not coerced
+ * into a one-item list: doing so could make an error message look like a real
+ * field mapping or Specialist result and would incorrectly enable an action.
+ */
+function arrayFromCompatibleFields(
+  record: Readonly<Record<string, unknown>> | undefined,
+  ...keys: string[]
+): unknown[] {
+  let emptyArray: unknown[] | undefined;
+  for (const key of keys) {
+    const value = record?.[key];
+    if (!Array.isArray(value)) continue;
+    // During a rolling upgrade an adapter can emit an empty canonical field
+    // together with a populated legacy alias.  Prefer actual facts, but retain
+    // the first empty array as the correct result when every alias is empty.
+    if (value.length > 0) return value;
+    emptyArray ??= value;
+  }
+  return emptyArray ?? [];
+}
+
+/**
+ * Preserve an explicitly supplied boolean while normalizing historical JSON
+ * strings.  Returning `undefined` rather than `false` for an absent field is
+ * important for mapping defaults: callers must distinguish "not supplied"
+ * from an intentional `syncEnabled: false` decision.
+ */
+function booleanFromCompatibleFields(
+  record: Readonly<Record<string, unknown>> | undefined,
+  ...keys: string[]
+): boolean | undefined {
+  const value = firstCompatibleField(record, ...keys);
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return undefined;
+}
+
 /** 只接受普通 JSON 对象，供历史 Run 从持久化 variables 中逐层读取模型治理事实。 */
 function recordField(record: Record<string, unknown> | undefined, key: string) {
   const value = record?.[key];
@@ -364,41 +509,670 @@ function numberField(record: Record<string, unknown> | undefined, key: string) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * 从持久消息或 Run variables 中读取专业 Agent 快照。
+ * 滚动升级期间可能出现 camelCase、snake_case，或被包在 planResponse 中的旧格式，因此这里集中兼容，
+ * 调用方只消费一个稳定对象，不需要在历史时间线里重复判断字段版本。
+ */
+function specialistExecutionSnapshot(record: Record<string, unknown> | undefined) {
+  if (!record) return undefined;
+  /*
+   * 旧版本有时会把空对象或只有 status 的中间状态写到直接字段，同时把完整
+   * 结果放在 planResponse 中。只有真正包含 results 数组的快照才有资格阻止
+   * Durable 事实兜底；否则一个“看起来存在”的半成品会把历史面板变成空白。
+   */
+  const directCandidates = [
+    recordField(record, "specialistAgentExecution"),
+    recordField(record, "specialist_agent_execution"),
+    recordField(record, "specialistExecution"),
+    recordField(record, "specialist_execution"),
+  ];
+  const planResponse = recordField(record, "planResponse")
+    || recordField(record, "agentPlanResponse")
+    || recordField(record, "response");
+  const nestedCandidates = [
+    recordField(planResponse, "specialistAgentExecution"),
+    recordField(planResponse, "specialist_agent_execution"),
+    recordField(planResponse, "specialistExecution"),
+    recordField(planResponse, "specialist_execution"),
+  ];
+  const baseSnapshot = [...directCandidates, ...nestedCandidates]
+    .find((candidate) => hasSpecialistExecutionSnapshot(candidate));
+  const sources = [record, planResponse].filter(
+    (candidate): candidate is Record<string, unknown> => Boolean(candidate),
+  );
+  /*
+   * A few durable versions nest the post-confirmation fields inside the main
+   * Specialist execution object instead of placing them beside it.  Read both
+   * shapes before projecting so a historical replay cannot bypass the role
+   * allowlist merely because the field moved one JSON level during an upgrade.
+   */
+  const verification = [
+    ...sources.map((candidate) => recordField(candidate, "specialistVerificationExecution")
+      || recordField(candidate, "specialist_verification_execution")),
+    recordField(baseSnapshot, "specialistVerificationExecution")
+      || recordField(baseSnapshot, "specialist_verification_execution"),
+  ].find(Boolean);
+  const bridges = sources
+    .map((candidate) => candidate.specialistToolPlanBridges ?? candidate.specialist_tool_plan_bridges)
+    .find((candidate) => Array.isArray(candidate));
+  const postBridgeVerification = [
+    ...sources.map((candidate) => recordField(candidate, "postBridgeVerification")
+      || recordField(candidate, "post_bridge_verification")),
+    recordField(baseSnapshot, "postBridgeVerification")
+      || recordField(baseSnapshot, "post_bridge_verification"),
+  ].find(Boolean);
+  if (!baseSnapshot && !verification && !bridges && !postBridgeVerification) return undefined;
+
+  /*
+   * Strip any raw nested verification fields before merging the shared public
+   * projection back into the primary snapshot.  Keeping the original object
+   * and only appending the projection would leave snake_case aliases in place,
+   * which would let history and the live panel render a RECOVERY role after a
+   * task had already been confirmed.  The helper owns the PRECHECK/MONITOR
+   * allowlist and also removes transport-only bridge metadata.
+   */
+  const primarySnapshot = Object.fromEntries(
+    Object.entries(baseSnapshot ?? {}).filter(([key]) => ![
+      "specialistVerificationExecution",
+      "specialist_verification_execution",
+      "postBridgeVerification",
+      "post_bridge_verification",
+    ].includes(key)),
+  );
+  const postConfirmSnapshot = buildPostConfirmSpecialistSnapshot({
+    specialistVerificationExecution: verification as AgentPlanResponse["specialistVerificationExecution"],
+    postBridgeVerification: postBridgeVerification as AgentPlanResponse["postBridgeVerification"],
+  });
+  return {
+    ...primarySnapshot,
+    ...(postConfirmSnapshot ?? {}),
+    ...(bridges ? { specialistToolPlanBridges: bridges } : {}),
+  };
+}
+
+/**
+ * 判断一个历史对象是否真的携带专业 Agent 快照。
+ *
+ * 旧版本可能会把空对象写入 message 或 variables。空对象不能阻止 Durable
+ * 事实兜底，否则用户看到的会是一个空面板而不是可读的持久化摘要。
+ */
+function hasSpecialistExecutionSnapshot(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).length > 0
+    && (Array.isArray(record.results)
+      || Array.isArray(record.specialistResults)
+      || Array.isArray(record.specialist_results)
+      || Array.isArray(record.agentResults)
+      || Array.isArray(record.agent_results)
+      || Array.isArray(record.specialistToolPlanBridges)
+      || Array.isArray(record.specialist_tool_plan_bridges)
+      || Boolean(record.specialistVerificationExecution)
+      || Boolean(record.specialist_verification_execution)
+      || Boolean(record.postBridgeVerification)
+      || Boolean(record.post_bridge_verification));
+}
+
+/**
+ * 将计划响应中的四类 Specialist 可观察性摘要合并成一份消息快照。
+ *
+ * `normalizeAgentPlanResponse` 为了兼容旧接口仍会把未知顶层字段放入
+ * `raw`，因此这里同时读取类型化字段和 `raw`。这能避免为了展示新增摘要
+ * 去改动通用 API 解码器，也保证旧后端只返回首轮结果时仍然可以正常工作。
+ */
+function specialistExecutionSnapshotFromPlan(
+  plan: AgentPlanResponse | undefined,
+): SpecialistAgentExecutionInput | undefined {
+  if (!plan) return undefined;
+  return specialistExecutionSnapshot({
+    ...plan.raw,
+    specialistAgentExecution: plan.specialistAgentExecution ?? plan.raw.specialistAgentExecution,
+    specialistVerificationExecution: plan.specialistVerificationExecution
+      ?? plan.raw.specialistVerificationExecution,
+    specialistToolPlanBridges: plan.specialistToolPlanBridges
+      ?? plan.raw.specialistToolPlanBridges,
+    postBridgeVerification: plan.postBridgeVerification ?? plan.raw.postBridgeVerification,
+  });
+}
+
+/**
+ * 从完整专业 Agent 快照中判断是否存在尚未结束的审批请求。
+ *
+ * 专业 turn 本身可能已经是 COMPLETED，但它返回的 `structuredOutput.approvalRequest`
+ * 仍然可能代表一个需要 Java 控制面的高风险动作。历史恢复和当前执行计划都必须
+ * 识别这个显式事实，不能只看 turn 顶层状态，也不能根据摘要文字猜测审批。
+ */
+function specialistExecutionHasPendingApproval(value: SpecialistAgentExecutionInput | undefined): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const rawResults = arrayFromCompatibleFields(
+    record,
+    "results",
+    "specialistResults",
+    "specialist_results",
+    "agentResults",
+    "agent_results",
+  );
+  if (!rawResults.length) return false;
+  return rawResults.some((rawResult) => {
+    if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) return false;
+    const result = rawResult as Record<string, unknown>;
+    const structuredOutput = recordFromCompatibleFields(
+      result,
+      "structuredOutput",
+      "structured_output",
+      "output",
+    );
+    const approvalRequest = recordFromCompatibleFields(
+      structuredOutput,
+      "approvalRequest",
+      "approval_request",
+    );
+    const approvalRequired = booleanFromCompatibleFields(
+      approvalRequest,
+      "required",
+      "approvalRequired",
+      "approval_required",
+    );
+    if (!approvalRequest || approvalRequired !== true) return false;
+    const approvalStatus = (textFromCompatibleFields(approvalRequest, "status", "state") || "").toUpperCase();
+    return !isTerminalSpecialistApprovalStatus(approvalStatus);
+  });
+}
+
+/**
+ * A confirmation attached to one Run is single-use.  A continuation can still
+ * be an approved batch of the same plan, but these explicit signals mean the
+ * backend created a fresh approval boundary and the browser must return to the
+ * existing human review UI before sending another `confirmed: true` request.
+ *
+ * `hasPendingDurableConfirmation` is computed only from scoped, low-sensitive
+ * audit/run facts by the caller; raw continuation payloads never reach this
+ * decision helper or the rendered timeline.
+ */
+function continuationNeedsManualConfirmation(
+  continuation: {
+    requiresConfirmation?: boolean | string | null;
+    status?: string | null;
+  } | undefined,
+  hasPendingDurableConfirmation: boolean,
+): boolean {
+  const status = continuation?.status?.trim().toUpperCase() || "";
+  return continuation?.requiresConfirmation === true
+    || continuation?.requiresConfirmation === "true"
+    || status === "WAITING_CONFIRMATION"
+    || status === "WAITING_APPROVAL"
+    || status === "APPROVAL_REQUIRED"
+    || hasPendingDurableConfirmation;
+}
+
+/**
+ * 判断 Java 工具审计是否仍然等待本次用户审批。
+ *
+ * 兼容两种后端生命周期：新接口直接返回 WAITING_APPROVAL，旧接口可能保留
+ * `requiresApproval=true + PLANNED`。APPROVED、EXECUTING、SUCCEEDED、FAILED
+ * 等状态都不是“还没审批”，避免历史页把已处理动作重新渲染成待审批。
+ */
+function isPendingApprovalAudit(audit: AgentToolExecutionAudit): boolean {
+  const state = audit.state.trim().toUpperCase();
+  if (isSpecialistFailureStatus(state)
+    || ["SUCCEEDED", "SKIPPED", "EXECUTING"].includes(state)) {
+    return false;
+  }
+  return state === "WAITING_APPROVAL"
+    || state === "APPROVAL_REQUIRED"
+    || state === "WAITING_CONFIRMATION"
+    || (audit.requiresApproval && ["PLANNED", "PENDING"].includes(state));
+}
+
+/** 将 Java 事实状态收敛为专业 Agent 面板可识别的公开状态。 */
+function durableFactStatus(status: string): string {
+  const classified = classifySpecialistLifecycleState(status);
+  // Unknown durable facts are intentionally kept as "RECORDED" rather than
+  // being promoted to success.  This preserves the historic-panel contract
+  // while letting the shared classifier reject partial failures consistently.
+  return classified === "UNKNOWN" ? "RECORDED" : classified;
+}
+
+/** 计算低敏事实的实际耗时；后端已给耗时时优先使用后端值。 */
+function durableFactDuration(fact: AgentSpecialistTurnFact): number {
+  if (typeof fact.durationMillis === "number" && fact.durationMillis >= 0) return fact.durationMillis;
+  if (fact.startedAt && fact.finishedAt) {
+    const duration = new Date(fact.finishedAt).getTime() - new Date(fact.startedAt).getTime();
+    return Number.isFinite(duration) && duration >= 0 ? duration : 0;
+  }
+  return 0;
+}
+
+/**
+ * 将真实 Durable 事实映射成面板可读的最小快照。
+ *
+ * 这里刻意保留空的 structuredOutput 和 toolActivities。事实表只有工具活动
+ * 引用，没有工具明细；用引用推造“工具已调用”会误导用户，因此只在摘要中
+ * 说明引用数量，并展示后端明确提供的 evidenceRefs。
+ */
+function specialistExecutionFromDurableFacts(
+  facts: AgentSpecialistTurnFact[],
+): SpecialistAgentExecutionInput | undefined {
+  if (!facts.length) return undefined;
+  const results = [...facts]
+    .sort((left, right) => {
+      const leftTime = new Date(left.startedAt || left.createdAt || left.updatedAt || 0).getTime();
+      const rightTime = new Date(right.startedAt || right.createdAt || right.updatedAt || 0).getTime();
+      return leftTime - rightTime;
+    })
+    .map((fact) => {
+      const status = durableFactStatus(fact.status);
+      const referenceNote = fact.toolActivitySummaryRefs.length
+        ? ` 已保留 ${fact.toolActivitySummaryRefs.length} 个工具活动引用，但本次接口未返回工具明细。`
+        : "";
+      return {
+        agentId: fact.agentId,
+        agentRole: fact.role,
+        turnId: fact.turnId,
+        status,
+        publicSummary: `${fact.lowSensitiveSummary || "已恢复专业 Agent 的低敏执行事实。"}${referenceNote}`,
+        structuredOutput: {},
+        evidenceReferences: fact.evidenceRefs,
+        toolActivities: [],
+        modelInvocationSummary: fact.modelName
+          ? { modelName: fact.modelName, source: "DURABLE_SPECIALIST_TURN_FACT" }
+          : { source: "DURABLE_SPECIALIST_TURN_FACT" },
+        requiredInputFields: [],
+        errorCode: null,
+        durationMs: durableFactDuration(fact),
+      };
+    });
+  const failedCount = results.filter((item) => isSpecialistFailureStatus(item.status)).length;
+  const waitingInputCount = results.filter((item) => ["WAITING_FOR_INPUT", "WAITING_APPROVAL"].includes(item.status)).length;
+  const completedCount = results.filter((item) => item.status === "SUCCEEDED").length;
+  const runningCount = results.filter((item) => item.status === "RUNNING").length;
+  const pendingCount = results.filter((item) => item.status === "PENDING").length;
+  const status = failedCount
+    ? "FAILED"
+    : waitingInputCount
+      ? "WAITING_FOR_INPUT"
+      : runningCount
+        ? "RUNNING"
+        : pendingCount
+          ? "PENDING"
+          : completedCount === results.length
+            ? "SUCCEEDED"
+            : "RECORDED";
+  return {
+    status,
+    executedCount: results.length,
+    completedCount,
+    waitingInputCount,
+    failedCount,
+    results,
+    skippedRoles: {},
+    executionWaves: [],
+    payloadPolicy: "LOW_SENSITIVE_DURABLE_FACT_FALLBACK",
+  } as SpecialistAgentExecutionInput;
+}
+
+function isSpecialistAgentStreamEvent(event: AgentPlanStreamProgressEvent) {
+  const eventType = event.eventType.toUpperCase();
+  const stage = event.stage.toUpperCase();
+  return eventType.includes("SPECIALIST_AGENT")
+    || stage.includes("SPECIALIST_AGENT")
+    || Boolean(eventAttributeText(event, "agentRole", "agent_role") && eventAttributeText(event, "turnId", "turn_id"));
+}
+
+/**
+ * 读取专业 Agent SSE 事件中的公开身份字段。
+ *
+ * Java/Python 两条运行链在升级期间可能分别返回 camelCase 和 snake_case；
+ * 事件聚合不能只读其中一套，否则并行 specialist 会被错误归到同一个默认
+ * Agent。这个读取器只处理身份、状态和动作等低敏公开字段，不读取 prompt 或
+ * 工具参数。
+ */
+function eventAttributeText(event: AgentPlanStreamProgressEvent, ...keys: string[]) {
+  for (const key of keys) {
+    const eventValue = event[key as keyof AgentPlanStreamProgressEvent];
+    if (typeof eventValue === "string" && eventValue.trim()) return eventValue.trim();
+    const attributeValue = event.attributes?.[key];
+    if (typeof attributeValue === "string" && attributeValue.trim()) return attributeValue.trim();
+  }
+  return undefined;
+}
+
+interface SpecialistStreamIdentity {
+  key: string;
+  agentRole: string;
+  agentId: string;
+  turnId: string;
+}
+
+/**
+ * 生成一次 specialist 流实例的稳定身份。
+ *
+ * 同一个 Durable Run 可能并行运行多个 specialist，同一个 `stage` 或同一个
+ * `agentId` 都不能单独作为聚合键。优先使用后端真实 `turnId`；没有返回时，
+ * 以 run/request、角色和 Agent ID 组合成当前流内唯一兜底键，避免把不同角色
+ * 或不同回合的结果合并成一张卡片。
+ */
+function specialistStreamIdentity(event: AgentPlanStreamProgressEvent): SpecialistStreamIdentity | undefined {
+  if (!isSpecialistAgentStreamEvent(event)) return undefined;
+  const agentRole = eventAttributeText(event, "agentRole", "agent_role") || "SPECIALIST_AGENT";
+  const agentId = eventAttributeText(event, "agentId", "agent_id") || `${agentRole.toLowerCase()}-runtime`;
+  const streamId = event.runId
+    || eventAttributeText(event, "runId", "run_id", "requestId", "request_id")
+    || event.requestId
+    || "stream";
+  const explicitTurnId = eventAttributeText(
+    event,
+    "turnId",
+    "turn_id",
+    "specialistTurnId",
+    "specialist_turn_id",
+  );
+  const turnId = explicitTurnId || `${streamId}:${agentRole}:${agentId}`;
+  return {
+    key: `${streamId}|${agentRole}|${agentId}|${turnId}`,
+    agentRole,
+    agentId,
+    turnId,
+  };
+}
+
+/**
+ * 把专业 Agent 的低敏 SSE 动作合并为面板可消费的批次快照。
+ * 事件只提供公开摘要、角色、turn、状态、耗时和统计，不包含 prompt、原始工具参数或隐藏思维；完整最终结果
+ * 到达后会由 AgentPlanResponse 覆盖这个临时快照，因此这里不尝试推断缺失的业务输出。
+ */
+function mergeSpecialistAgentStreamEvent(
+  current: Readonly<Record<string, unknown>> | undefined,
+  event: AgentPlanStreamProgressEvent,
+  elapsedMs?: number,
+): Record<string, unknown> | undefined {
+  if (!isSpecialistAgentStreamEvent(event)) return current ? { ...current } : undefined;
+  const attributes = event.attributes;
+  const identity = specialistStreamIdentity(event);
+  if (!identity) return current ? { ...current } : undefined;
+  const { key: specialistIdentity, agentRole, agentId, turnId } = identity;
+  const action = eventAttributeText(event, "action", "action_code") || event.stage || "specialist.action";
+  const eventStatus = (eventAttributeText(event, "status", "state") || event.severity || "RUNNING").toUpperCase();
+  const normalizedAction = action.toUpperCase();
+  const actionFailed = isSpecialistFailureStatus(normalizedAction);
+  const actionApproval = isSpecialistApprovalPendingStatus(normalizedAction);
+  const actionInput = /(WAITING[._-]?(FOR[._-]?)?INPUT|REQUIRED[._-]?INPUT)/.test(normalizedAction);
+  const actionSucceeded = isSpecialistSuccessfulStatus(normalizedAction);
+  const eventRecorded = event.eventType.toUpperCase().includes("RECORDED");
+  const statusFailed = isSpecialistFailureStatus(eventStatus);
+  const statusApproval = isSpecialistApprovalPendingStatus(eventStatus);
+  const statusInput = /WAITING[._-]?(FOR[._-]?)?INPUT|REQUIRED[._-]?INPUT/.test(eventStatus);
+  const statusSucceeded = isSpecialistSuccessfulStatus(eventStatus);
+  /*
+   * 后端既可能用 action 表示终态，也可能只在 status 中返回 SUCCEEDED。
+   * 旧逻辑把“成功状态”排除在终态判断之外，导致最终专业 Agent 永远停留在 RUNNING，
+   * 进而无法自动折叠，也让实时进度看起来像没有完成。
+   */
+  const resultStatus = classifySpecialistLifecycleState(
+    statusSucceeded || actionSucceeded || eventRecorded ? "SUCCEEDED" : eventStatus,
+    {
+      hasFailure: statusFailed || actionFailed,
+      waitsForApproval: statusApproval || actionApproval,
+      waitsForInput: statusInput || actionInput,
+    },
+  );
+  const rawResults = arrayFromCompatibleFields(
+    current,
+    "results",
+    "specialistResults",
+    "specialist_results",
+    "agentResults",
+    "agent_results",
+  );
+  const results = rawResults
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({ ...item }));
+  const resultIndex = results.findIndex((item) => {
+    const existingIdentity = textFromCompatibleFields(item, "streamIdentity", "stream_identity");
+    if (existingIdentity) return existingIdentity === specialistIdentity;
+    // Old live snapshots have no streamIdentity. Require the complete known
+    // identity instead of matching only agentId, which would merge separate turns.
+    return textFromCompatibleFields(item, "turnId", "turn_id") === turnId
+      && textFromCompatibleFields(item, "agentId", "agent_id") === agentId
+      && textFromCompatibleFields(item, "agentRole", "agent_role", "role") === agentRole;
+  });
+  const previousResult = resultIndex >= 0 ? results[resultIndex] : undefined;
+  const previousActivities = arrayFromCompatibleFields(
+    previousResult,
+    "toolActivities",
+    "tool_activities",
+    "tools",
+  ).filter((item): item is Record<string, unknown> => (
+    Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  ));
+  const actionActivity = {
+    toolName: action,
+    status: resultStatus,
+    publicSummary: event.message,
+    durationMs: numberField(attributes, "durationMs") ?? elapsedMs ?? 0,
+  };
+  const eventIdentity = event.sequence !== undefined
+    ? `sequence:${event.sequence}`
+    : eventAttributeText(event, "eventId", "event_id")
+      || eventAttributeText(event, "actionId", "action_id")
+      || `${eventStatus}:${event.message || ""}`;
+  const activityKey = `${specialistIdentity}:${action}:${eventIdentity}`;
+  const toolActivities = [
+    ...previousActivities.filter((item) => textField(item, "activityKey") !== activityKey),
+    { ...actionActivity, activityKey },
+  ];
+  const nextResult: Record<string, unknown> = {
+    ...previousResult,
+    agentId,
+    agentRole,
+    turnId,
+    streamIdentity: specialistIdentity,
+    status: resultStatus,
+    publicSummary: event.message
+      || textFromCompatibleFields(previousResult, "publicSummary", "public_summary", "summary", "message")
+      || "专业 Agent 正在处理。",
+    structuredOutput: recordFromCompatibleFields(
+      previousResult,
+      "structuredOutput",
+      "structured_output",
+      "output",
+    ) || {},
+    evidenceReferences: arrayFromCompatibleFields(
+      previousResult,
+      "evidenceReferences",
+      "evidence_references",
+      "evidence",
+    ),
+    toolActivities,
+    modelInvocationSummary: recordFromCompatibleFields(
+      previousResult,
+      "modelInvocationSummary",
+      "model_invocation_summary",
+      "model",
+    ) || {},
+    requiredInputFields: arrayFromCompatibleFields(
+      previousResult,
+      "requiredInputFields",
+      "required_input_fields",
+      "missingFields",
+    ),
+    errorCode: eventAttributeText(event, "errorCode", "error_code")
+      || textFromCompatibleFields(previousResult, "errorCode", "error_code"),
+    durationMs: numberField(attributes, "durationMs")
+      ?? elapsedMs
+      ?? numberField(previousResult, "durationMs")
+      ?? numberField(previousResult, "duration_ms")
+      ?? 0,
+  };
+  if (resultIndex >= 0) results[resultIndex] = nextResult;
+  else results.push(nextResult);
+  const completedCount = results.filter((item) => isSpecialistSuccessfulStatus(textField(item, "status"))).length;
+  const waitingInputCount = results.filter((item) => /WAITING.*INPUT|REQUIRED_INPUT/.test(textField(item, "status") || "")).length;
+  const approvalCount = results.filter((item) => /APPROVAL|REVIEW_REQUIRED/.test(textField(item, "status") || "")).length;
+  const failedCount = results.filter((item) => isSpecialistFailureStatus(textField(item, "status"))).length;
+  const allTerminal = results.length > 0
+    && completedCount + waitingInputCount + approvalCount + failedCount === results.length;
+  const batchStatus = failedCount
+    ? "PARTIALLY_FAILED"
+    : waitingInputCount
+      ? "WAITING_FOR_INPUT"
+      : approvalCount
+        ? "WAITING_APPROVAL"
+      : allTerminal
+        ? "COMPLETED"
+        : "RUNNING";
+  return {
+    status: batchStatus,
+    executedCount: results.length,
+    completedCount,
+    waitingInputCount,
+    failedCount,
+    results,
+    skippedRoles: recordFromCompatibleFields(current, "skippedRoles", "skipped_roles") || {},
+    executionWaves: [results.map((item) => (
+      textFromCompatibleFields(item, "agentRole", "agent_role", "role") || "SPECIALIST_AGENT"
+    ))],
+  };
+}
+
+/**
+ * 流式请求异常或取消时结束仍处于 RUNNING 的临时专业 Agent 卡片，防止历史画面永久显示“处理中”。
+ * 已经完成、等待输入或明确失败的 turn 保留原状态和公开摘要。
+ */
+function finalizeLiveSpecialistExecution(
+  current: Readonly<Record<string, unknown>> | undefined,
+  status: "FAILED" | "CANCELLED",
+): Record<string, unknown> | undefined {
+  if (!current) return undefined;
+  const results = Array.isArray(current.results)
+    ? current.results.map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        const result = item as Record<string, unknown>;
+        return /PENDING|READY|RUNNING|PROCESSING|EXECUTING|STARTED/.test(textField(result, "status") || "")
+          ? { ...result, status, errorCode: status === "FAILED" ? "AGENT_PLAN_FAILED" : "USER_CANCELLED" }
+          : result;
+      })
+    : [];
+  return {
+    ...current,
+    status,
+    failedCount: status === "FAILED" ? results.filter((item) => (
+      item && typeof item === "object" && !Array.isArray(item)
+      && /FAILED|ERROR/.test(textField(item as Record<string, unknown>, "status") || "")
+    )).length : numberField(current as Record<string, unknown>, "failedCount") ?? 0,
+    results,
+  };
+}
+
+/**
+ * Convert Agent-produced object mappings into the exact form model consumed by
+ * the manual synchronization wizard.
+ *
+ * The Agent Runtime can return Java camelCase or Python snake_case snapshots,
+ * and older durable runs may use table/column aliases.  Normalizing at this
+ * boundary means restored history, streaming results, and the editable review
+ * form all describe the same source-to-target mapping instead of silently
+ * dropping fields because one runtime used a different JSON convention.
+ */
 function resolvedObjectMappings(value: unknown): ObjectMappingInput[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((rawMapping, mappingIndex) => {
     if (!rawMapping || typeof rawMapping !== "object" || Array.isArray(rawMapping)) return [];
     const mapping = rawMapping as Record<string, unknown>;
-    const sourceObjectName = textField(mapping, "sourceObjectName");
-    const targetObjectName = textField(mapping, "targetObjectName");
+    // Do not turn a malformed `{}` placeholder into a phantom mapping row. A
+    // real mapping must carry at least one backend field before the editor can
+    // give it a stable local key and let the normal validation handle it.
+    if (!Object.keys(mapping).length) return [];
+    const sourceObjectName = textFromCompatibleFields(
+      mapping,
+      "sourceObjectName",
+      "source_object_name",
+      "sourceTableName",
+      "source_table_name",
+      "sourceTable",
+      "source_table",
+    );
+    const targetObjectName = textFromCompatibleFields(
+      mapping,
+      "targetObjectName",
+      "target_object_name",
+      "targetTableName",
+      "target_table_name",
+      "targetTable",
+      "target_table",
+    );
     if (!targetObjectName) return [];
-    const rawFields = Array.isArray(mapping.fieldMappings) ? mapping.fieldMappings : [];
+    const rawFields = arrayFromCompatibleFields(
+      mapping,
+      "fieldMappings",
+      "field_mappings",
+      "fields",
+      "columns",
+    );
     const fieldMappings = rawFields.flatMap((rawField, fieldIndex) => {
       if (!rawField || typeof rawField !== "object" || Array.isArray(rawField)) return [];
       const field = rawField as Record<string, unknown>;
-      const sourceField = textField(field, "sourceField");
-      const targetField = textField(field, "targetField");
+      const sourceField = textFromCompatibleFields(
+        field,
+        "sourceField",
+        "source_field",
+        "sourceColumn",
+        "source_column",
+        "sourceName",
+        "source_name",
+      );
+      const targetField = textFromCompatibleFields(
+        field,
+        "targetField",
+        "target_field",
+        "targetColumn",
+        "target_column",
+        "targetName",
+        "target_name",
+      );
       if (!sourceField || !targetField) return [];
       return [{
-        key: `agent-resolved-${mappingIndex}-${fieldIndex}-${sourceField}`,
+        key: textFromCompatibleFields(field, "key", "mappingKey", "mapping_key")
+          || `agent-resolved-${mappingIndex}-${fieldIndex}-${sourceField}`,
         sourceField,
-        sourceType: textField(field, "sourceType"),
+        sourceType: textFromCompatibleFields(field, "sourceType", "source_type"),
         targetField,
-        targetType: textField(field, "targetType"),
-        nullable: field.nullable === undefined ? undefined : Boolean(field.nullable),
-        primaryKey: field.primaryKey === undefined ? undefined : Boolean(field.primaryKey),
-        syncEnabled: field.syncEnabled !== false,
-        typeCompatible: field.typeCompatible === undefined ? undefined : Boolean(field.typeCompatible),
-        transform: textField(field, "transform"),
+        targetType: textFromCompatibleFields(field, "targetType", "target_type"),
+        nullable: booleanFromCompatibleFields(field, "nullable", "isNullable", "is_nullable"),
+        primaryKey: booleanFromCompatibleFields(field, "primaryKey", "primary_key", "isPrimaryKey", "is_primary_key"),
+        syncEnabled: booleanFromCompatibleFields(field, "syncEnabled", "sync_enabled", "enabled") !== false,
+        typeCompatible: booleanFromCompatibleFields(field, "typeCompatible", "type_compatible", "compatible"),
+        compatibilityNote: textFromCompatibleFields(
+          field,
+          "compatibilityNote",
+          "compatibility_note",
+          "conversionSuggestion",
+          "conversion_suggestion",
+        ),
+        transform: textFromCompatibleFields(field, "transform", "transformation", "expression"),
       }];
     });
     return [{
-      objectKey: textField(mapping, "objectKey") || `agent-resolved-mapping-${mappingIndex + 1}`,
-      sourceSchemaName: textField(mapping, "sourceSchemaName"),
+      objectKey: textFromCompatibleFields(mapping, "objectKey", "object_key", "mappingKey", "mapping_key")
+        || `agent-resolved-mapping-${mappingIndex + 1}`,
+      sourceTableKey: textFromCompatibleFields(mapping, "sourceTableKey", "source_table_key"),
+      targetTableKey: textFromCompatibleFields(mapping, "targetTableKey", "target_table_key"),
+      sourceSchemaName: textFromCompatibleFields(mapping, "sourceSchemaName", "source_schema_name", "sourceSchema", "source_schema"),
       sourceObjectName,
-      targetSchemaName: textField(mapping, "targetSchemaName"),
+      targetSchemaName: textFromCompatibleFields(mapping, "targetSchemaName", "target_schema_name", "targetSchema", "target_schema"),
       targetObjectName,
-      whereCondition: textField(mapping, "whereCondition"),
+      whereCondition: textFromCompatibleFields(
+        mapping,
+        "whereCondition",
+        "where_condition",
+        "whereClause",
+        "where_clause",
+        "filterCondition",
+        "filter_condition",
+        "where",
+      ),
       fieldMappings,
     }];
   });
@@ -448,8 +1222,8 @@ function isAgentPlanAbort(error: unknown) {
 
 function observationColor(status: string) {
   if (["SUCCEEDED", "READY", "LOADED", "CACHED"].includes(status)) return "green";
-  if (status === "FAILED" || status === "BLOCKED") return "red";
-  if (["FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED", "CANCELLED"].includes(status)) return "orange";
+  if (["FAILED", "PARTIALLY_FAILED", "BLOCKED"].includes(status)) return "red";
+  if (["PARTIALLY_SUCCEEDED", "FALLBACK", "WAITING", "WAITING_INPUT", "WAITING_APPROVAL", "PAUSED", "CANCELLED"].includes(status)) return "orange";
   if (["PLANNED", "EXECUTING", "TOOL_CALLING", "RUNNING", "QUEUED", "PENDING"].includes(status)) return "blue";
   return "gray";
 }
@@ -497,6 +1271,8 @@ function observationStatus(status: string) {
     CANCELLED: "已停止",
     BLOCKED: "已阻止",
     FAILED: "失败",
+    PARTIALLY_FAILED: "部分失败",
+    PARTIALLY_SUCCEEDED: "部分完成",
     FALLBACK: "已降级",
     CACHED: "已命中缓存",
     SKIPPED: "未调用",
@@ -532,12 +1308,16 @@ function streamEventPresentation(event: AgentPlanStreamProgressEvent) {
     model_second_turn_completed: { category: "MODEL", title: "模型根据工具结果完成下一轮决策" },
     model_second_turn_skipped: { category: "MODEL", title: "本轮模型调用已安全停止" },
     model_follow_up_tool_batch_governed: { category: "TOOL", title: "治理模型选择的下一批工具" },
+    specialist_agent_action: { category: "TOOL", title: "专业 Agent 公开动作" },
+    specialist_agent_action_recorded: { category: "TOOL", title: "记录专业 Agent 公开动作" },
+    specialist_agent_action_started: { category: "TOOL", title: "开始专业 Agent 公开动作", status: "RUNNING" },
     tool_parameter_validated: { category: "USER_ACTION", title: "校验工具执行参数", status: "WAITING_INPUT" },
     memory_retrieved: { category: "ORCHESTRATION", title: "检索受控记忆" },
     approval_waiting: { category: "PERMISSION", title: "等待用户确认", status: "WAITING_APPROVAL" },
     agent_plan_completed: { category: "ORCHESTRATION", title: "完成本轮受控规划" },
   };
-  return presentations[event.eventType] || {
+  const eventKey = event.eventType.toLowerCase();
+  return presentations[event.eventType] || presentations[eventKey] || {
     category: "ORCHESTRATION",
     title: event.stage || event.eventType,
   };
@@ -547,29 +1327,66 @@ function streamEventToObservation(event: AgentPlanStreamProgressEvent): AgentObs
   const presentation = streamEventPresentation(event);
   const eventFailed = event.severity?.toLowerCase() === "error";
   const eventWarning = event.severity?.toLowerCase() === "warning";
+  const explicitStatus = textField(event.attributes, "status")?.toUpperCase();
+  const specialistEvent = isSpecialistAgentStreamEvent(event);
+  const specialistActionRecorded = event.eventType.toUpperCase().includes("RECORDED");
   // 规则分析器的 confidence 是内部启发式匹配分，不是模型校准置信度，也不适合驱动用户决策。
   // 工作过程只展示可验证的领域、候选工具、风险和缺参事实，避免把固定分值误读成 AI 自信程度。
-  const publicAttributes = Object.fromEntries(
-    Object.entries(event.attributes || {}).filter(([key]) => (
-      !["confidence", "ruleConfidence", "publicContent"].includes(key)
-    )),
-  );
+  /*
+   * Streaming events cross an asynchronous transport boundary and can be
+   * produced by either the model runtime or Java control plane.  Filtering
+   * only field names is insufficient because a legacy producer may embed SQL
+   * or a connection string in an otherwise harmless field.  Reuse the shared
+   * recursive projector before these details are retained in React state.
+   */
+  /*
+   * SSE attributes are transport data, not a browser display contract. The
+   * shared projector keeps only reviewed progress, mapping, approval, and
+   * Specialist fields, so an added backend diagnostic cannot surface merely
+   * because its field name was not present in a local denylist.
+   */
+  const publicAttributes = projectAgentSseAttributes(event.attributes);
   const requestScope = event.requestId?.slice(0, 12) || "current";
   const publicContent = typeof event.attributes?.publicContent === "string"
-    ? event.attributes.publicContent
+    ? publicAgentSummary(event.attributes.publicContent, "")
     : undefined;
-  const stableStreamId = event.eventType === "model_public_output_stream_updated"
+  const specialistIdentity = specialistStreamIdentity(event);
+  const stableStreamId = specialistIdentity
+    ? `${event.eventType}-${specialistIdentity.key}-${event.sequence ?? eventAttributeText(event, "eventId", "event_id", "actionId", "action_id") ?? event.stage}`
+    : event.eventType === "model_public_output_stream_updated"
     ? `${event.eventType}-${event.stage}-${String(event.attributes?.turn || "CURRENT")}`
     : `${event.eventType}-${event.sequence ?? event.stage}`;
   return {
     id: `live-${requestScope}-${stableStreamId}`,
     category: presentation.category,
     stage: event.stage,
-    status: eventFailed ? "FAILED" : presentation.status || (eventWarning ? "FALLBACK" : "SUCCEEDED"),
+    status: eventFailed
+      ? "FAILED"
+      : presentation.status
+        || (explicitStatus && /FAILED|ERROR/.test(explicitStatus) ? "FAILED" : undefined)
+        || (explicitStatus && /WAITING[._-]?APPROVAL|APPROVAL[._-]?REQUIRED/.test(explicitStatus)
+          ? "WAITING_APPROVAL"
+          : undefined)
+        || (explicitStatus && /WAITING[._-]?(FOR[._-]?)?INPUT|REQUIRED[._-]?INPUT/.test(explicitStatus)
+          ? "WAITING_INPUT"
+          : undefined)
+        || (explicitStatus && /RUNNING|PROCESSING|EXECUTING|STARTED/.test(explicitStatus)
+          ? "RUNNING"
+          : undefined)
+        || (eventWarning ? "FALLBACK" : specialistActionRecorded || !specialistEvent ? "SUCCEEDED" : "RUNNING"),
     title: presentation.title,
-    summary: publicContent || event.message,
+    summary: publicContent || publicAgentSummary(
+      event.message,
+      "Agent is processing the current governed step.",
+    ),
     details: {
       ...publicAttributes,
+      ...(specialistIdentity ? {
+        specialistIdentity: specialistIdentity.key,
+        agentRole: specialistIdentity.agentRole,
+        agentId: specialistIdentity.agentId,
+        turnId: specialistIdentity.turnId,
+      } : {}),
       occurredAt: event.createdAt,
     },
   };
@@ -582,30 +1399,63 @@ function formatAgentProcessElapsed(elapsedMs: number) {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
+/**
+ * Build the compact summary shown on a collapsed Agent-process card.
+ *
+ * The full action list remains available after expansion, but the collapsed
+ * line must still tell a user whether a model replied, how many Specialist
+ * Agents contributed, whether governed tools ran, and whether human action is
+ * outstanding.  Counting from the normalized action model keeps live and
+ * historical cards consistent without exposing internal orchestration nodes.
+ */
 function agentProcessActionSummaries(items: AgentActionItem[]) {
   const modelCount = items.filter((item) => item.kind === "MODEL_OUTPUT").length;
   const toolCount = items.filter((item) => ["API_CALL", "CONFIG_CHANGE"].includes(item.kind)).length;
-  const completedCount = items.filter((item) => ["SUCCEEDED", "FAILED"].includes(item.status)).length;
+  const specialistCount = items.filter((item) => item.targetService === "specialist-agent-runtime").length;
+  const completedCount = items.filter((item) => (
+    ["SUCCEEDED", "PARTIALLY_SUCCEEDED", "FAILED", "PARTIALLY_FAILED", "CANCELLED"].includes(item.status)
+  )).length;
   const waitingCount = items.filter((item) => ["WAITING_INPUT", "WAITING_APPROVAL"].includes(item.status)).length;
   return [
     modelCount ? `${modelCount} 次模型公开回复` : undefined,
+    specialistCount ? `${specialistCount} 个专业 Agent 结果` : undefined,
     toolCount ? `${toolCount} 个受控工具动作` : undefined,
     completedCount ? `${completedCount} 项已有结果` : undefined,
     waitingCount ? `${waitingCount} 项等待你处理` : undefined,
   ].filter((item): item is string => Boolean(item));
 }
 
-const actionHiddenKey = /(password|secret|token|credential|authorization|cookie|rawpayload|rawrow|sampledata)/i;
+const actionHiddenKey = /(password|secret|token|credential|authorization|cookie|rawpayload|rawrow|sampledata|(^|[_-])logs?($|[_-])|runtimelog|executionlog|rawlog|fulllog|logcontent|logdetail|stacktrace|errorstack)/i;
 const actionReviewedConfigKey = /(sql|wherecondition|filtercondition)/i;
 
+/**
+ * 判断一个过程字段是否属于模型内部上下文。
+ *
+ * Agent 过程可以展示公开摘要、工具动作和证据，但不能把 system prompt、原始
+ * prompt、思维链或内部调试字段当成“过程详情”泄露给用户。这里同时兼容 camelCase
+ * 和 snake_case，并保留 `promptTokens` 这类公开计量字段，因为它们并不是 prompt 正文。
+ */
+function isHiddenAgentDetailKey(key: string): boolean {
+  return isHiddenAgentPresentationKey(key);
+}
+
+/**
+ * 递归清理用户协作时间线中允许展开的输入、输出与证据。
+ *
+ * Agent 页面需要可审计性，但不能成为模型提示词、凭据、SQL 条件或完整运行日志
+ * 的旁路展示通道。该函数按字段名识别敏感信息和内部模型字段，再限制对象深度、
+ * 数组数量与字符串长度；调用方仍应优先传递后端低敏 DTO，本函数只是浏览器侧的
+ * 最后一层防线，而不是替代服务端访问控制。
+ */
 function sanitizeAgentActionPayload(value: unknown, key = "", depth = 0): unknown {
   if (actionHiddenKey.test(key)) return "[已隐藏]";
+  if (isHiddenAgentDetailKey(key)) return "[内部模型内容已隐藏]";
   if (actionReviewedConfigKey.test(key)) return "[请在任务配置审核中查看]";
   if (value === null || value === undefined || typeof value === "boolean" || typeof value === "number") {
     return value;
   }
   if (typeof value === "string") {
-    return value.length > 500 ? `${value.slice(0, 500)}…` : value;
+    return sanitizeAgentPresentationValue(value, key, depth);
   }
   if (depth >= 5) return "[内容已折叠]";
   if (Array.isArray(value)) {
@@ -631,13 +1481,21 @@ function agentToolHttpMethod(toolCode: string) {
   return "POST";
 }
 
-function resolvedAgentEndpoint(endpoint: string | undefined, argumentsValue: Record<string, unknown>) {
+/**
+ * Render an API operation without resolving runtime arguments into its path.
+ *
+ * The real tool receives its arguments only inside the governed backend call.
+ * Replacing `{taskId}` or other placeholders in the browser makes an audit
+ * line unnecessarily disclose input values and can also leak a bad adapter's
+ * connection string.  A validated template still tells the user which API was
+ * used while preserving the boundary between process visibility and arguments.
+ */
+function visibleAgentEndpoint(endpoint: string | undefined) {
   if (!endpoint) return undefined;
-  return Object.entries(argumentsValue).reduce((current, [key, value]) => (
-    ["string", "number"].includes(typeof value)
-      ? current.split(`{${key}}`).join(encodeURIComponent(String(value)))
-      : current
-  ), endpoint);
+  const template = endpoint.split("?", 1)[0].replace(/\{[^}]+\}/g, ":value");
+  return template.startsWith("/") && /^[A-Za-z0-9_./:-]{1,240}$/.test(template)
+    ? template
+    : undefined;
 }
 
 function agentActionElapsedMs(startedAt?: string, completedAt?: string) {
@@ -654,7 +1512,7 @@ function agentActionStatus(state: string) {
 }
 
 function agentActionKind(audit: AgentToolExecutionAudit): AgentActionKind {
-  if (audit.state === "WAITING_APPROVAL") return "APPROVAL";
+  if (isPendingApprovalAudit(audit)) return "APPROVAL";
   if (audit.toolCode === "sync.task.draft.save" || audit.toolCode.endsWith(".repair.apply")) {
     return "CONFIG_CHANGE";
   }
@@ -663,7 +1521,7 @@ function agentActionKind(audit: AgentToolExecutionAudit): AgentActionKind {
 
 function agentToolActionTitle(audit: AgentToolExecutionAudit) {
   const baseName = humanReadableToolName(audit.toolCode);
-  if (audit.state === "WAITING_APPROVAL") return `等待确认：${baseName}`;
+  if (isPendingApprovalAudit(audit)) return `等待确认：${baseName}`;
   if (audit.state === "PLANNED") return `准备调用：${baseName}`;
   if (audit.state === "EXECUTING") return `正在执行：${baseName}`;
   if (audit.state === "FAILED") return `执行失败：${baseName}`;
@@ -675,19 +1533,30 @@ function auditToAgentAction(
   audit: AgentToolExecutionAudit,
   result?: AgentToolExecutionResult,
 ): AgentActionItem {
-  const endpoint = resolvedAgentEndpoint(audit.targetEndpoint, audit.planArguments);
+  const endpoint = visibleAgentEndpoint(audit.targetEndpoint);
   const changedFields = agentActionKind(audit) === "CONFIG_CHANGE"
     ? Object.keys(audit.planArguments).filter((key) => !actionHiddenKey.test(key))
     : undefined;
   return {
     id: `action-${audit.auditId}`,
     kind: agentActionKind(audit),
-    status: agentActionStatus(audit.state),
+    status: isPendingApprovalAudit(audit) ? "WAITING_APPROVAL" : agentActionStatus(audit.state),
     title: agentToolActionTitle(audit),
-    summary: audit.outputSummary || audit.message || audit.planReason || "工具已进入受控执行链路。",
+    summary: publicAgentSummary(
+      audit.outputSummary || audit.message || audit.planReason,
+      "The governed tool action has progressed to the recorded lifecycle state.",
+    ),
     operation: endpoint ? `${agentToolHttpMethod(audit.toolCode)} ${endpoint}` : audit.toolCode,
     targetService: audit.targetService,
-    safeInput: sanitizeAgentActionPayload(audit.planArguments),
+    /*
+     * The timeline may explain which input fields were involved, but never
+     * render tool argument values.  Users can inspect the reviewed task form
+     * or approval card when a value is needed for a decision.
+     */
+    safeInput: {
+      argumentFields: Object.keys(audit.planArguments)
+        .filter((key) => !actionHiddenKey.test(key) && !isHiddenAgentDetailKey(key)),
+    },
     safeOutput: result ? sanitizeAgentActionPayload(result.output) : undefined,
     changedFields,
     evidence: {
@@ -702,6 +1571,328 @@ function auditToAgentAction(
     startedAt: audit.executionStartTime || audit.createTime,
     completedAt: audit.executionFinishTime,
     elapsedMs: agentActionElapsedMs(audit.executionStartTime, audit.executionFinishTime),
+  };
+}
+
+/** Business labels for the six Specialist roles shown in the collaboration stream. */
+const specialistAgentRoleLabels: Readonly<Record<string, string>> = {
+  DATASOURCE_AGENT: "数据源 Agent",
+  DATA_SOURCE_AGENT: "数据源 Agent",
+  DATA_SYNC_AGENT: "同步规划 Agent",
+  PRECHECK_AGENT: "预检查 Agent",
+  PRE_CHECK_AGENT: "预检查 Agent",
+  KNOWLEDGE_AGENT: "知识检索 Agent",
+  RECOVERY_AGENT: "故障恢复 Agent",
+  MONITOR_AGENT: "运行监控 Agent",
+};
+
+/**
+ * Turn a technical Specialist role into a stable product label.
+ *
+ * The backend may introduce an additional role before the frontend has a
+ * translation.  Falling back to the normalized role code makes the activity
+ * auditable instead of hiding it behind an empty label or a misleading known
+ * role name.
+ */
+function specialistAgentRoleLabel(role: string): string {
+  const normalized = role.trim().toUpperCase() || "SPECIALIST_AGENT";
+  return specialistAgentRoleLabels[normalized] || normalized.replace(/_AGENT$/, " Agent").replace(/_/g, " ");
+}
+
+/**
+ * Convert one Specialist status into the shared collaboration-timeline state.
+ *
+ * The panel and the main timeline must agree about whether a result is running,
+ * waiting for the user, failed, or terminal.  This converter deliberately gives
+ * explicit failure and approval facts precedence over a generic `COMPLETED`
+ * turn status, because a completed planning turn can still be waiting for a
+ * high-risk Java approval.
+ */
+function specialistActionStatus(
+  status: string,
+  hasFailure: boolean,
+  waitsForApproval: boolean,
+  waitsForInput: boolean,
+): string {
+  const classified = classifySpecialistLifecycleState(status, {
+    hasFailure,
+    waitsForApproval,
+    waitsForInput,
+  });
+  return classified === "WAITING_FOR_INPUT" ? "WAITING_INPUT" : classified;
+}
+
+/**
+ * 将专业 Agent 执行快照投影为用户可见的协作时间线动作。
+ *
+ * 详情面板负责展示汇总卡片，而此函数把每个真实角色的低敏事实放入与模型输出、
+ * Java 受控工具相同的 Codex 式过程流中。它只读取公开摘要、字段名、证据引用和
+ * 工具活动摘要；原始提示词、隐藏推理、凭据、SQL 值、完整日志及工具参数在展开
+ * 前仍必须经过 `sanitizeAgentActionPayload` 二次过滤。`verification` 批次来自任务
+ * 创建成功后的后置复核，因此同一转换器可以一致展示 PRECHECK_AGENT 与
+ * MONITOR_AGENT，而不会把 LangGraph 内部节点混入用户协作流。
+ */
+function specialistExecutionToAgentActions(
+  execution: SpecialistAgentExecutionInput | undefined,
+  scope: string,
+): AgentActionItem[] {
+  if (!execution || typeof execution !== "object" || Array.isArray(execution)) return [];
+  const snapshot = execution as Record<string, unknown>;
+  const batches: Array<{ scope: string; value: Record<string, unknown> | undefined }> = [
+    { scope: "initial", value: snapshot },
+    {
+      scope: "verification",
+      value: recordFromCompatibleFields(
+        snapshot,
+        "specialistVerificationExecution",
+        "specialist_verification_execution",
+      ),
+    },
+  ];
+  const actions: AgentActionItem[] = [];
+
+  batches.forEach((batch) => {
+    const results = arrayFromCompatibleFields(
+      batch.value,
+      "results",
+      "specialistResults",
+      "specialist_results",
+      "agentResults",
+      "agent_results",
+    );
+    results.forEach((rawResult, index) => {
+      if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) return;
+      const result = rawResult as Record<string, unknown>;
+      const role = textFromCompatibleFields(result, "agentRole", "agent_role", "role") || "SPECIALIST_AGENT";
+      /*
+       * This converter is also used by the historical action timeline, which
+       * can receive a snapshot before `specialistExecutionSnapshot` has had a
+       * chance to normalize a legacy payload.  Apply the same allowlist here
+       * as a second boundary: after confirmation, only deterministic precheck
+       * and monitor facts may become user-visible actions.
+       */
+      if (batch.scope === "verification" && !isPostConfirmVerificationRole(role)) return;
+      const agentId = textFromCompatibleFields(result, "agentId", "agent_id") || `${role.toLowerCase()}-${index + 1}`;
+      const turnId = textFromCompatibleFields(result, "turnId", "turn_id") || `turn-${index + 1}`;
+      const rawStatus = (textFromCompatibleFields(result, "status", "state") || "UNKNOWN").toUpperCase();
+      const rawPublicSummary = textFromCompatibleFields(
+        result,
+        "publicSummary",
+        "public_summary",
+        "summary",
+        "message",
+      );
+      const publicSummary = publicAgentSummary(
+        rawPublicSummary,
+        "该专业 Agent 已返回受控执行事实。",
+      );
+      const structuredOutput = sanitizeAgentPresentationValue(
+        recordFromCompatibleFields(
+          result,
+          "structuredOutput",
+          "structured_output",
+          "output",
+        ) || {},
+        "structuredOutput",
+      ) as Record<string, unknown>;
+      const approvalRequest = recordFromCompatibleFields(
+        structuredOutput,
+        "approvalRequest",
+        "approval_request",
+      );
+      const approvalRequired = booleanFromCompatibleFields(
+        approvalRequest,
+        "required",
+        "approvalRequired",
+        "approval_required",
+      ) === true;
+      const approvalStatus = (textFromCompatibleFields(approvalRequest, "status", "state") || "").toUpperCase();
+      const requiredInputFields = arrayFromCompatibleFields(
+        result,
+        "requiredInputFields",
+        "required_input_fields",
+        "missingFields",
+        "missing_fields",
+      ).flatMap((field) => typeof field === "string" && field.trim() ? [field.trim()] : []);
+      const errorCode = textFromCompatibleFields(result, "errorCode", "error_code");
+      const approvalFailed = approvalRequired && isSpecialistFailureStatus(approvalStatus);
+      const hasFailure = Boolean(errorCode) || approvalFailed || isSpecialistFailureStatus(rawStatus);
+      const waitsForApproval = approvalRequired
+        && !isTerminalSpecialistApprovalStatus(approvalStatus);
+      const waitsForInput = !waitsForApproval && (
+        requiredInputFields.length > 0 || /WAITING.*INPUT|REQUIRED.*INPUT/.test(rawStatus)
+      );
+      const status = specialistActionStatus(rawStatus, hasFailure, waitsForApproval, waitsForInput);
+      const kind: AgentActionKind = waitsForApproval
+        ? "APPROVAL"
+        : waitsForInput
+          ? "USER_INPUT"
+          : "RESULT";
+      const rawDuration = firstCompatibleField(result, "durationMs", "duration_ms");
+      const duration = typeof rawDuration === "number" ? rawDuration : Number(rawDuration);
+      const toolActivities = arrayFromCompatibleFields(
+        result,
+        "toolActivities",
+        "tool_activities",
+        "tools",
+      ).flatMap((rawActivity) => {
+        if (!rawActivity || typeof rawActivity !== "object" || Array.isArray(rawActivity)) return [];
+        const activity = rawActivity as Record<string, unknown>;
+        return [{
+          toolName: textFromCompatibleFields(activity, "toolName", "tool_name", "name") || "受控工具活动",
+          status: textFromCompatibleFields(activity, "status", "state") || "UNKNOWN",
+          publicSummary: publicAgentSummary(
+            textFromCompatibleFields(
+              activity,
+              "publicSummary",
+              "public_summary",
+              "summary",
+              "message",
+            ),
+            "已记录一次受控工具活动。",
+          ),
+          durationMs: firstCompatibleField(activity, "durationMs", "duration_ms"),
+        }];
+      });
+      const evidenceReferences = arrayFromCompatibleFields(
+        result,
+        "evidenceReferences",
+        "evidence_references",
+        "evidence",
+      ).flatMap((reference) => {
+        if (typeof reference !== "string" && typeof reference !== "number") return [];
+        const safeReference = publicAgentSummary(String(reference), "");
+        return safeReference ? [safeReference] : [];
+      });
+      const modelInvocationSummary = sanitizeAgentPresentationValue(
+        recordFromCompatibleFields(
+          result,
+          "modelInvocationSummary",
+          "model_invocation_summary",
+          "model",
+        ) || {},
+        "modelInvocationSummary",
+      ) as Record<string, unknown>;
+      const title = hasFailure
+        ? `${specialistAgentRoleLabel(role)}执行失败`
+        : waitsForApproval
+          ? `${specialistAgentRoleLabel(role)}等待审批`
+          : waitsForInput
+            ? `${specialistAgentRoleLabel(role)}需要补充信息`
+            : status === "RUNNING"
+              ? `${specialistAgentRoleLabel(role)}正在处理`
+              : isSpecialistPartiallySuccessfulStatus(status)
+                ? `${specialistAgentRoleLabel(role)}部分完成，仍需关注剩余结果`
+                : `${specialistAgentRoleLabel(role)}已完成处理`;
+      actions.push({
+        id: `specialist-${scope}-${batch.scope}-${agentId}-${turnId}`,
+        kind,
+        status,
+        title,
+        summary: publicSummary,
+        operation: `SPECIALIST ${role}`,
+        targetService: "specialist-agent-runtime",
+        safeInput: sanitizeAgentActionPayload({
+          requiredInputFields: requiredInputFields.length ? requiredInputFields : undefined,
+          approvalRequired: approvalRequired || undefined,
+          approvalStatus: approvalStatus || undefined,
+        }),
+        safeOutput: sanitizeAgentActionPayload({
+          structuredOutput,
+          toolActivities,
+          modelInvocationSummary,
+        }),
+        evidence: {
+          specialistRole: role,
+          agentId,
+          turnId,
+          errorCode,
+          evidenceReferences,
+          batch: batch.scope,
+        },
+        elapsedMs: Number.isFinite(duration) && duration >= 0 ? duration : undefined,
+      });
+    });
+  });
+
+  const postBridgeAction = postBridgeVerificationToAgentAction(snapshot, scope);
+  if (postBridgeAction) actions.push(postBridgeAction);
+
+  return actions;
+}
+
+/**
+ * 为确认执行完成后的资源复核生成一个低敏边界动作。
+ *
+ * 专业批次中的 PRECHECK_AGENT 与 MONITOR_AGENT 会分别由
+ * `specialistExecutionToAgentActions` 展开为真实角色动作；本函数只补充“基于哪一
+ * 个已提交资源进行复核”的边界事实。它显式白名单任务编号、执行编号、批次状态
+ * 和实际角色，绝不展示资源指纹、完整运行日志、模型推理或后端内部编排节点。
+ * 这样用户可以理解复核确实发生在任务提交之后，同时不会误以为 Agent 又创建了
+ * 一个可重复确认的任务计划。
+ */
+function postBridgeVerificationToAgentAction(
+  snapshot: Readonly<Record<string, unknown>>,
+  scope: string,
+): AgentActionItem | undefined {
+  const bridge = recordFromCompatibleFields(
+    snapshot,
+    "postBridgeVerification",
+    "post_bridge_verification",
+  );
+  if (!bridge) return undefined;
+  const rawStatus = (
+    textFromCompatibleFields(bridge, "status", "state", "batchStatus", "batch_status")
+    || "COMPLETED"
+  ).toUpperCase();
+  const status = specialistActionStatus(
+    rawStatus,
+    isSpecialistFailureStatus(rawStatus),
+    false,
+    false,
+  );
+  const taskId = findNumericField(bridge, ["taskId", "task_id"]);
+  const executionId = findNumericField(bridge, ["executionId", "execution_id"]);
+  const executedRoles = arrayFromCompatibleFields(bridge, "executedRoles", "executed_roles")
+    .flatMap((role) => (
+      typeof role === "string" && isPostConfirmVerificationRole(role)
+        ? [role.trim().toUpperCase()]
+        : []
+    ))
+    .slice(0, 8);
+  const batchStatus = textFromCompatibleFields(bridge, "batchStatus", "batch_status");
+  const resourceChanged = booleanFromCompatibleFields(bridge, "resourceChanged", "resource_changed");
+  const verificationFailed = isSpecialistFailureStatus(rawStatus);
+  const roleSummary = executedRoles.length
+    ? `已执行：${executedRoles.map(specialistAgentRoleLabel).join("、")}。`
+    : "已根据提交后的真实任务资源完成复核。";
+  const resourceSummary = [
+    taskId ? `任务 #${taskId}` : undefined,
+    executionId ? `执行 #${executionId}` : undefined,
+  ].filter((item): item is string => Boolean(item)).join("，");
+  return {
+    id: `specialist-${scope}-post-confirm-${taskId ?? "task"}-${executionId ?? "execution"}`,
+    kind: "RESULT",
+    status,
+    title: verificationFailed ? "任务提交后的专业复核发现异常" : "任务提交后的专业复核已完成",
+    summary: `${resourceSummary ? `${resourceSummary}已进入` : "任务已进入"}后置复核。${roleSummary}`,
+    operation: "POST_CONFIRM_SPECIALIST_VERIFICATION",
+    targetService: "agent-runtime",
+    safeOutput: sanitizeAgentActionPayload({
+      status: rawStatus,
+      batchStatus,
+      resourceChanged,
+      taskId,
+      executionId,
+      executedRoles: executedRoles.length ? executedRoles : undefined,
+    }),
+    evidence: {
+      verificationPhase: "POST_CONFIRM",
+      taskId,
+      executionId,
+      batchStatus,
+      executedRoles: executedRoles.length ? executedRoles : undefined,
+    },
   };
 }
 
@@ -725,9 +1916,17 @@ function agentActionKindLabel(kind: AgentActionKind) {
   }[kind];
 }
 
+/**
+ * Convert an already-low-sensitive payload into the expandable detail text.
+ *
+ * Callers normally sanitize before assigning `safeInput` or `safeOutput`, but
+ * this final guard prevents a future action type from accidentally rendering a
+ * raw nested value merely because it skipped one of those call sites.
+ */
 function actionPayloadText(value: unknown) {
   if (value === undefined) return undefined;
-  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const safeValue = sanitizeAgentPresentationValue(value);
+  return typeof safeValue === "string" ? safeValue : JSON.stringify(safeValue, null, 2);
 }
 
 /**
@@ -755,15 +1954,18 @@ function historicalModelAction(run: AgentRun): AgentActionItem | undefined {
   const proposedTools = toolPlans
     .map((item) => textField(item, "toolCode"))
     .filter((item): item is string => Boolean(item));
-  const responseSummary = textField(variables, "responseSummary")
+  const responseSummary = publicAgentSummary(
+    textField(variables, "responseSummary")
     || textField(variables, "modelIntentSummary")
-    || run.message;
+    || run.message,
+    "The model completed a governed planning decision.",
+  );
   const provider = textField(selectedRoute, "provider_name")
     || textField(selectedRoute, "providerName")
     || textField(governanceAttributes, "selectedProvider");
   const model = textField(selectedRoute, "model_name")
     || textField(selectedRoute, "modelName");
-  if (!responseSummary && !provider && !model && !proposedTools.length) return undefined;
+  if (!provider && !model && !proposedTools.length && responseSummary === "The model completed a governed planning decision.") return undefined;
   return {
     id: `history-model-${run.runId}`,
     kind: "MODEL_OUTPUT",
@@ -772,15 +1974,16 @@ function historicalModelAction(run: AgentRun): AgentActionItem | undefined {
     summary: responseSummary || `模型提出了 ${proposedTools.length} 个受控工具动作。`,
     operation: `Responses API${model ? ` · ${model}` : ""}`,
     targetService: provider || "model-gateway",
-    safeInput: sanitizeAgentActionPayload({
-      // 表单、审批和自动续跑的 userInputPreview 只是跨运行时摘要，并不是一条新的用户发言。
-      // 仅真实 USER_MESSAGE 在模型动作详情中使用“用户输入”语义，避免展开后再次误读初始目标。
-      userInputPreview: !interactionOrigin || interactionOrigin === "USER_MESSAGE"
-        ? run.userInputPreview
-        : undefined,
+    /*
+     * The conversation bubble already retains the user's own message.  Do not
+     * copy it, the prompt envelope, or the runtime state trace into the model
+     * action detail, because those values are not required to audit the
+     * decision and can expose private context after a historical reload.
+     */
+    safeInput: {
       interactionOrigin,
-      stateTrace: Array.isArray(variables.stateTrace) ? variables.stateTrace : undefined,
-    }),
+      contextPolicy: "The conversation message is not duplicated in model-action details.",
+    },
     safeOutput: sanitizeAgentActionPayload({
       publicDecisionSummary: responseSummary,
       proposedTools,
@@ -815,16 +2018,20 @@ function historicalRunInteractionLabel(run: AgentRun) {
 
 /** 根据 Run 与工具终态计算历史折叠条状态，避免把“等待审批”误显示成已经成功。 */
 function historicalRunDisplayStatus(process: HistoricalAgentRunProcess) {
-  const auditStates = process.audits.map((audit) => audit.state);
-  if (process.run.state === "CANCELLED" || auditStates.includes("CANCELLED")) return "CANCELLED";
-  if (process.run.state === "FAILED" || auditStates.includes("FAILED")) return "FAILED";
+  const auditStates = process.audits.map((audit) => audit.state.toUpperCase());
+  const runState = process.run.state.toUpperCase();
+  if (runState === "CANCELLED" || auditStates.includes("CANCELLED")) return "CANCELLED";
+  if (runState === "FAILED" || auditStates.includes("FAILED")) return "FAILED";
   if (auditStates.includes("EXECUTING")) return "RUNNING";
-  if (auditStates.includes("WAITING_APPROVAL")) return "WAITING_APPROVAL";
+  if (process.audits.some(isPendingApprovalAudit)
+    || specialistExecutionHasPendingApproval(process.specialistAgentExecution)) {
+    return "WAITING_APPROVAL";
+  }
   if (auditStates.includes("PLANNED") || auditStates.includes("APPROVED")) return "PENDING";
   if (process.audits.length && auditStates.every((state) => ["SUCCEEDED", "SKIPPED"].includes(state))) {
     return "SUCCEEDED";
   }
-  return agentActionStatus(process.run.state);
+  return agentActionStatus(runState);
 }
 
 /** 取 Run 或最后一个工具事实的结束时间，用于恢复真实处理耗时。 */
@@ -844,11 +2051,25 @@ function historicalRunElapsedMs(process: HistoricalAgentRunProcess) {
  * 默认只显示“已处理/失败/等待 + 耗时”；展开后才展示模型公开决策、真实工具/API、脱敏参数、结果与审计证据。
  * 该组件只消费服务端事实，不会执行工具，也不会改变 Run 状态。
  */
-function HistoricalAgentRunProcessPlayback({ process }: { process: HistoricalAgentRunProcess }) {
+function HistoricalAgentRunProcessPlayback({
+  process,
+  specialistActions,
+}: {
+  process: HistoricalAgentRunProcess;
+  specialistActions: SpecialistPanelActions;
+}) {
   const resultByAuditId = new Map(process.results.map((item) => [item.audit.auditId, item]));
   const modelAction = historicalModelAction(process.run);
+  // A persisted Specialist snapshot is a first-class execution fact.  Include it
+  // in the same collapsed stream as model and Java-tool actions so history does
+  // not degrade into a final answer plus a disconnected specialist-only card.
+  const specialistActionItems = specialistExecutionToAgentActions(
+    process.specialistAgentExecution,
+    `history-${process.run.runId}`,
+  );
   const actions = [
     ...(modelAction ? [modelAction] : []),
+    ...specialistActionItems,
     ...process.audits.map((audit) => auditToAgentAction(audit, resultByAuditId.get(audit.auditId))),
   ];
   const status = historicalRunDisplayStatus(process);
@@ -932,7 +2153,7 @@ function HistoricalAgentRunProcessPlayback({ process }: { process: HistoricalAge
                             size="small"
                             items={[{
                               key: `${item.id}-history-details`,
-                              label: "查看调用参数、结果与证据",
+                              label: "查看涉及字段、结果与证据",
                               children: (
                                 <Space direction="vertical" size={12} style={{ width: "100%" }}>
                                   {item.changedFields?.length ? (
@@ -971,22 +2192,84 @@ function HistoricalAgentRunProcessPlayback({ process }: { process: HistoricalAge
           ),
         }]}
       />
+      {process.specialistAgentExecution ? (
+        <div className="agent-turn-specialist-panel">
+          <SpecialistAgentExecutionPanel
+            specialistAgentExecution={process.specialistAgentExecution}
+            title={process.specialistAgentExecutionSource === "DURABLE_FACT"
+              ? "本回合专业 Agent（Durable 事实回放）"
+              : "本回合专业 Agent"}
+            {...specialistActions}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
 
-/** 统一渲染用户与 Agent 消息，避免历史区和实时区继续维护两套聊天气泡。 */
-function AgentConversationMessageBubble({ item }: { item: AgentChatMessage }) {
+/**
+ * 统一渲染用户与 Agent 消息，避免历史区和实时区继续维护两套聊天气泡。
+ * 专业 Agent 结果属于对应助手回合的一部分，因此紧跟该回合文本展示；用户消息永远不会渲染执行面板。
+ */
+function AgentConversationMessageBubble({
+  item,
+  specialistActions,
+}: {
+  item: AgentChatMessage;
+  specialistActions: SpecialistPanelActions;
+}) {
   return (
     <div className={`agent-message-row ${item.role === "USER" ? "is-user" : "is-agent"}`}>
       <div className="agent-message-meta">{item.role === "USER" ? "你" : "Agent"}</div>
       <div className={`agent-message-bubble${item.role === "AGENT" ? " is-final" : ""}`}>
         <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-          {item.content}
+          {item.role === "AGENT"
+            ? publicAgentSummary(item.content, "Agent returned a governed result.")
+            : item.content}
         </Typography.Paragraph>
       </div>
+      {item.role === "AGENT" && item.specialistAgentExecution ? (
+        <div className="agent-message-specialist-panel">
+          <SpecialistAgentExecutionPanel
+            specialistAgentExecution={item.specialistAgentExecution}
+            title="本回合专业 Agent"
+            {...specialistActions}
+          />
+        </div>
+      ) : null}
     </div>
   );
+}
+
+/**
+ * 去重历史消息，同时保留同一 messageId 上更完整的关联信息。
+ *
+ * 服务端在消息投影、Run 回放和旧版本迁移期间可能把同一条消息返回两次；
+ * 这里按真实 messageId 去重，而不是按文本去重，因此用户连续两次发送完全
+ * 相同的问题仍会保留。若重复记录中只有一条带 runId 或专业快照，优先合并
+ * 这些字段，避免过程入口因为投影顺序不同而消失。
+ */
+function deduplicateHistoricalMessages(messages: AgentChatMessage[]): AgentChatMessage[] {
+  const byId = new Map<string, AgentChatMessage>();
+  messages.forEach((message) => {
+    const existing = byId.get(message.id);
+    if (!existing) {
+      byId.set(message.id, message);
+      return;
+    }
+    const existingHasSnapshot = hasSpecialistExecutionSnapshot(existing.specialistAgentExecution);
+    const candidateHasSnapshot = hasSpecialistExecutionSnapshot(message.specialistAgentExecution);
+    byId.set(message.id, {
+      ...existing,
+      content: existing.content || message.content,
+      runId: existing.runId || message.runId,
+      createTime: existing.createTime || message.createTime,
+      specialistAgentExecution: candidateHasSnapshot && !existingHasSnapshot
+        ? message.specialistAgentExecution
+        : existing.specialistAgentExecution,
+    });
+  });
+  return [...byId.values()];
 }
 
 /**
@@ -1001,16 +2284,18 @@ function buildHistoricalConversationTranscript(
   processes: HistoricalAgentRunProcess[],
   objective: string,
 ) {
-  const originByRunId = new Map(processes.map((process) => [
+  // Run ID 是 Durable 聚合的唯一键；重复投影只保留第一份，避免历史时间线重复出现同一个过程折叠条。
+  const uniqueProcesses = [...new Map(processes.map((process) => [process.run.runId, process])).values()];
+  const originByRunId = new Map(uniqueProcesses.map((process) => [
     process.run.runId,
     textField(process.run.variables, "interactionOrigin") as AgentInteractionOrigin | undefined,
   ]));
-  const latestUserMessageByRunId = new Map(processes.map((process) => [
+  const latestUserMessageByRunId = new Map(uniqueProcesses.map((process) => [
     process.run.runId,
     textField(process.run.variables, "latestUserMessage"),
   ]));
   let initialObjectiveMessageSeen = false;
-  const visibleMessages = messages.filter((message) => {
+  const visibleMessages = deduplicateHistoricalMessages(messages).filter((message) => {
     if (message.role !== "USER" || message.content.trim() !== objective.trim()) return true;
     const origin = message.runId ? originByRunId.get(message.runId) : undefined;
     if (origin === "USER_MESSAGE") {
@@ -1033,9 +2318,9 @@ function buildHistoricalConversationTranscript(
     initialObjectiveMessageSeen = true;
     return true;
   });
-  const processRunIds = new Set(processes.map((process) => process.run.runId));
+  const processRunIds = new Set(uniqueProcesses.map((process) => process.run.runId));
   const entries: HistoricalTranscriptEntry[] = [];
-  processes.forEach((process) => {
+  uniqueProcesses.forEach((process) => {
     const runMessages = visibleMessages
       .filter((message) => message.runId === process.run.runId)
       .sort((left, right) => {
@@ -1045,13 +2330,32 @@ function buildHistoricalConversationTranscript(
     runMessages.filter((message) => message.role === "USER").forEach((message) => {
       entries.push({ key: message.id, kind: "MESSAGE", message });
     });
+    const hasFullMessageSnapshot = runMessages.some((message) => (
+      message.role === "AGENT" && hasSpecialistExecutionSnapshot(message.specialistAgentExecution)
+    ));
+    const processUsesFullSnapshot = Boolean(
+      process.specialistAgentExecution
+      && process.specialistAgentExecutionSource !== "DURABLE_FACT",
+    );
     entries.push({
       key: `process-${process.run.runId}`,
       kind: "PROCESS",
-      process,
+      process: hasFullMessageSnapshot && !processUsesFullSnapshot
+        ? { ...process, specialistAgentExecution: undefined, specialistAgentExecutionSource: undefined }
+        : process,
     });
     runMessages.filter((message) => message.role === "AGENT").forEach((message) => {
-      entries.push({ key: message.id, kind: "MESSAGE", message });
+      /*
+       * 同一个专业 Agent 快照可能同时被投影到 Run variables 和最终助手消息。过程折叠条优先承载 Run 快照，
+       * 因为它与 runId 的审计关系更稳定；消息副本仅保留文本，避免历史回放出现两块完全相同的面板。
+       */
+      entries.push({
+        key: message.id,
+        kind: "MESSAGE",
+        message: processUsesFullSnapshot
+          ? { ...message, specialistAgentExecution: undefined }
+          : message,
+      });
     });
   });
   return {
@@ -1348,7 +2652,7 @@ function buildHistoricalRecoverySnapshot(
       const parameter = historicalMissingParameter(audit.toolCode, rawField);
       if (parameter) missing.add(parameter);
     });
-    if (audit.state !== "FAILED") return;
+    if (audit.state.toUpperCase() !== "FAILED") return;
     const failureText = `${audit.errorCode || ""} ${audit.message || ""}`;
     if (audit.toolCode === "sync.task.draft.save" && /(重名|重复|duplicate|already exists)/i.test(failureText)) {
       duplicateTaskNameFailure = true;
@@ -1384,8 +2688,9 @@ function buildHistoricalRecoverySnapshot(
   if (objectMappings.length && !hasIncompleteFieldMappings) missing.delete("fieldMappings");
   else if (hasIncompleteFieldMappings) missing.add("fieldMappings");
 
-  const failedAudit = [...latestProcess.audits].reverse().find((audit) => audit.state === "FAILED");
-  const waitingForApproval = latestProcess.audits.some((audit) => audit.state === "WAITING_APPROVAL");
+  const failedAudit = [...latestProcess.audits].reverse().find((audit) => audit.state.toUpperCase() === "FAILED");
+  const waitingForApproval = latestProcess.audits.some(isPendingApprovalAudit)
+    || specialistExecutionHasPendingApproval(latestProcess.specialistAgentExecution);
   const hasFailure = latestProcess.run.state === "FAILED" || Boolean(failedAudit);
   const missingParameters = [...missing];
   const failureText = `${failedAudit?.errorCode || ""} ${failedAudit?.message || latestProcess.run.message || ""}`;
@@ -1614,7 +2919,14 @@ function observationDetailsTitle(category: string) {
   }[category] || "查看详情";
 }
 
-function formatObservationValue(value: unknown, key?: string) {
+/**
+ * Render one diagnostic field after applying the same low-sensitive projection
+ * used by the action timeline.  Diagnostics are intentionally detailed, but
+ * they are still a browser view of untrusted runtime facts and must never act
+ * as a fallback channel for SQL, connection data, prompt text, or raw output.
+ */
+function formatObservationValue(input: unknown, key?: string) {
+  const value = sanitizeAgentPresentationValue(input, key || "");
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "boolean") return value ? "是" : "否";
   if ((key === "latencyMs" || key === "providerLatencyMs") && typeof value === "number") return `${value} ms`;
@@ -1642,7 +2954,10 @@ function formatObservationValue(value: unknown, key?: string) {
 }
 
 function scrollToAgentSection(sectionId: string) {
-  document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const element = document.getElementById(sectionId);
+  if (!element) return false;
+  element.scrollIntoView({ behavior: "smooth", block: "start" });
+  return true;
 }
 
 function findArtifactRef(value: unknown, depth = 0): string | undefined {
@@ -1741,6 +3056,8 @@ function UserAgentAssistant() {
   const [controlPlane, setControlPlane] = useState<{ sessionId: string; runId: string }>();
   const [plan, setPlan] = useState<AgentPlanResponse>();
   const [liveObservationItems, setLiveObservationItems] = useState<AgentObservationTimelineItem[]>([]);
+  /** 当前 SSE 回合尚未返回最终计划时，保存专业 Agent 的低敏增量快照供主时间线实时展示。 */
+  const [liveSpecialistAgentExecution, setLiveSpecialistAgentExecution] = useState<Record<string, unknown>>();
   const [liveRequestId, setLiveRequestId] = useState<string>();
   const [processStatus, setProcessStatus] = useState<AgentProcessStatus>("IDLE");
   const [processStartedAt, setProcessStartedAt] = useState<number>();
@@ -1748,6 +3065,15 @@ function UserAgentAssistant() {
   const [processExpanded, setProcessExpanded] = useState(true);
   const [executionInProgress, setExecutionInProgress] = useState(false);
   const [executionResults, setExecutionResults] = useState<AgentToolExecutionResult[]>([]);
+  /**
+   * 保存一次已确认任务在提交后获得的专业复核快照。
+   *
+   * 该状态与规划阶段的 `liveSpecialistAgentExecution` 分离：前者只属于已经
+   * 成功跨过 Java 控制面提交边界的真实任务，后者仅用于 SSE 规划过程。这样
+   * 终态页面既能展示 PRECHECK/MONITOR 的事实，又不会重新打开旧计划的编辑或
+   * 确认入口。
+   */
+  const [postConfirmSpecialistExecution, setPostConfirmSpecialistExecution] = useState<SpecialistAgentExecutionInput>();
   const [executionAnswer, setExecutionAnswer] = useState<ExecutionAnswer>();
   const [planFailure, setPlanFailure] = useState<AgentPlanFailure>();
   const [taskImportArtifact, setTaskImportArtifact] = useState<SyncTaskImportArtifact>();
@@ -1758,6 +3084,8 @@ function UserAgentAssistant() {
   const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
   const [historicalRunProcesses, setHistoricalRunProcesses] = useState<HistoricalAgentRunProcess[]>([]);
   const [historyPlaybackWarning, setHistoryPlaybackWarning] = useState<string>();
+  /** 当前确认卡绑定的后续 Durable Run；只用于让新审批边界回到既有人工 UI。 */
+  const pendingManualConfirmationRunIdRef = useRef<string>();
   const autoAdvanceTurnRef = useRef<string>();
   const mappingDefaultsPromptTurnRef = useRef<string>();
   const processStartedAtRef = useRef<number>();
@@ -1777,6 +3105,13 @@ function UserAgentAssistant() {
     reviewConfirmed: boolean;
   }>();
   const historyProjectRef = useRef(selectedProjectId);
+  /** 防止快速切换历史会话时，先发出的慢响应覆盖后选择的会话。 */
+  const sessionLoadRequestTokenRef = useRef<string>();
+
+  /** 新建会话或切换项目时使尚未返回的历史加载响应失效。 */
+  const invalidateSessionLoad = () => {
+    sessionLoadRequestTokenRef.current = undefined;
+  };
 
   /**
    * 项目是会话、数据源和任务的可见性边界。切换项目时必须停止旧请求并清空所有运行态，不能让旧项目的
@@ -1785,6 +3120,7 @@ function UserAgentAssistant() {
   useEffect(() => {
     if (historyProjectRef.current === selectedProjectId) return;
     historyProjectRef.current = selectedProjectId;
+    invalidateSessionLoad();
     activePlanAbortControllerRef.current?.abort();
     setAgentConversationSessionId(crypto.randomUUID());
     setActiveAgentRuntimeSessionId(undefined);
@@ -1795,6 +3131,8 @@ function UserAgentAssistant() {
     setPlan(undefined);
     setControlPlane(undefined);
     setLiveObservationItems([]);
+    setLiveSpecialistAgentExecution(undefined);
+    setPostConfirmSpecialistExecution(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
     setPlanFailure(undefined);
@@ -1852,7 +3190,11 @@ function UserAgentAssistant() {
    */
   const sessionHistoryQuery = useQuery({
     queryKey: ["agent-assistant-session-history", projectId, showArchivedSessions],
-    queryFn: () => api.listAgentSessions({ archived: showArchivedSessions, limit: 100 }),
+    queryFn: () => api.listAgentSessions({
+      archived: showArchivedSessions,
+      limit: 100,
+      projectId,
+    }),
     enabled: Boolean(projectId && session?.actorId),
     retry: false,
   });
@@ -1866,10 +3208,47 @@ function UserAgentAssistant() {
      * 一次加载完整会话后，再按 Run 并行读取审计和批量结果。
      * 单个旧 Run 的过程接口失败不会阻断整个会话，页面仍展示消息并明确提示哪些过程事实未恢复。
      */
-    mutationFn: async (sessionId: string) => {
+      mutationFn: async ({ sessionId }: { sessionId: string; requestToken: string }) => {
       const sessionResult = await api.getAgentSession(sessionId);
       let failedRunCount = 0;
-      const processes = await Promise.all(sessionResult.data.runs.map(async (run) => {
+      const sessionFactsResult = (await Promise.allSettled([
+        api.listAgentSpecialistTurnFactsBySession(sessionId),
+      ]))[0];
+      const sessionFacts = sessionFactsResult.status === "fulfilled"
+        ? sessionFactsResult.value.data
+        : [];
+      const factsByRun = new Map<string, AgentSpecialistTurnFact[]>();
+      sessionFacts.forEach((fact) => {
+        const facts = factsByRun.get(fact.runId) ?? [];
+        // 一个 Run 可能包含同 turnId 的不同 specialist 事实；角色和 Agent ID
+        // 也是事实身份的一部分，不能只按 turnId 去重，否则历史页会少展示专业 Agent。
+        if (!facts.some((item) => (
+          item.turnId === fact.turnId
+          && item.agentId === fact.agentId
+          && item.role === fact.role
+        ))) facts.push(fact);
+        factsByRun.set(fact.runId, facts);
+      });
+      const loadedProcesses = await Promise.all(sessionResult.data.runs.map(async (run) => {
+        const fullSnapshot = specialistExecutionSnapshot(run.variables);
+        const hasFullSnapshot = hasSpecialistExecutionSnapshot(fullSnapshot);
+        let facts = factsByRun.get(run.runId) ?? [];
+        let runFactsFailed = false;
+        /*
+         * 正常情况下 session 接口一次返回当前会话的全部事实。若某个旧 Run
+         * 没有完整快照且 session 结果中没有它的事实，再使用精确 Run 接口；
+         * 这样既支持单 Run 回放，也不会为已经成功恢复的 Run 重复请求。
+         */
+        if (!hasFullSnapshot && (sessionFactsResult.status === "rejected" || !factsByRun.has(run.runId))) {
+          const runFactsResult = (await Promise.allSettled([
+            api.listAgentSpecialistTurnFactsByRun(run.runId),
+          ]))[0];
+          if (runFactsResult.status === "fulfilled") {
+            facts = runFactsResult.value.data;
+          } else {
+            runFactsFailed = true;
+          }
+        }
         const [auditsResult, resultsResult] = await Promise.allSettled([
           api.listAgentToolExecutions(sessionId, run.runId),
           api.listAgentToolExecutionResults(sessionId, run.runId),
@@ -1877,23 +3256,41 @@ function UserAgentAssistant() {
         if (auditsResult.status === "rejected" || resultsResult.status === "rejected") {
           failedRunCount += 1;
         }
+        const specialistAgentExecution = hasFullSnapshot
+          ? fullSnapshot
+          : specialistExecutionFromDurableFacts(facts);
         return {
           run,
           audits: auditsResult.status === "fulfilled" ? auditsResult.value.data : [],
           results: resultsResult.status === "fulfilled" ? resultsResult.value.data : [],
-        } satisfies HistoricalAgentRunProcess;
+          specialistAgentExecution,
+          specialistAgentExecutionSource: hasFullSnapshot
+            ? "FULL_SNAPSHOT"
+            : specialistAgentExecution
+              ? "DURABLE_FACT"
+              : undefined,
+          runFactsFailed,
+        } satisfies HistoricalAgentRunProcess & { runFactsFailed: boolean };
       }));
+      const factFailureCount = loadedProcesses.filter((item) => item.runFactsFailed).length;
+      const processes = loadedProcesses.map((item) => {
+        const { runFactsFailed, ...process } = item;
+        void runFactsFailed;
+        return process;
+      });
       processes.sort((left, right) => (
         new Date(left.run.createTime || 0).getTime() - new Date(right.run.createTime || 0).getTime()
       ));
-      return { sessionResult, processes, failedRunCount };
+      return { sessionResult, processes, failedRunCount, factFailureCount };
     },
-    onMutate: () => {
+    onMutate: ({ requestToken }) => {
+      sessionLoadRequestTokenRef.current = requestToken;
       // 切换历史会话前停止旧页面流，防止旧请求结束后把计划和消息写入刚打开的另一个会话。
       activePlanAbortControllerRef.current?.abort();
       processOwnerRef.current = undefined;
     },
-    onSuccess: (result) => {
+    onSuccess: (result, variables) => {
+      if (sessionLoadRequestTokenRef.current !== variables.requestToken) return;
       const historicalSession = result.sessionResult.data;
       const recoverySnapshot = buildHistoricalRecoverySnapshot(
         result.processes,
@@ -1910,11 +3307,20 @@ function UserAgentAssistant() {
         content: item.content,
         runId: item.runId,
         createTime: item.createTime,
+        specialistAgentExecution: hasSpecialistExecutionSnapshot(item.specialistAgentExecution)
+          ? item.specialistAgentExecution
+          : undefined,
       })));
       setHistoricalRunProcesses(result.processes);
       setHistoryPlaybackWarning(result.failedRunCount
         ? `有 ${result.failedRunCount} 个旧 Run 的部分过程事实暂时无法读取，消息与其余过程已正常恢复。`
         : undefined);
+      if (result.factFailureCount) {
+        setHistoryPlaybackWarning((current) => [
+          current,
+          "部分专业 Agent 的 Durable 低敏事实暂时无法恢复，已保留可用的历史消息；这不会阻断当前聊天。",
+        ].filter(Boolean).join(" "));
+      }
       // Incomplete history remains actionable, but successful task creation is a
       // terminal business result. The recovery reducer deliberately omits the old
       // plan/control-plane contract in that case so reopening history cannot submit it twice.
@@ -1924,6 +3330,8 @@ function UserAgentAssistant() {
       setExecutionAnswer(recoverySnapshot?.executionAnswer);
       setPlanFailure(recoverySnapshot?.failure);
       setLiveObservationItems([]);
+      setLiveSpecialistAgentExecution(undefined);
+      setPostConfirmSpecialistExecution(undefined);
       setLiveRequestId(undefined);
       setFollowUpMessage("");
       setProcessStatus("IDLE");
@@ -1942,7 +3350,9 @@ function UserAgentAssistant() {
         quickClarificationForm.setFieldsValue(recoverySnapshot.formValues);
       }
     },
-    onError: (error) => message.error(errorMessage(error)),
+    onError: (error, variables) => {
+      if (sessionLoadRequestTokenRef.current === variables.requestToken) message.error(errorMessage(error));
+    },
   });
   /** 修改置顶后使当前项目的两个历史分区缓存同时失效，以便服务端排序立即生效。 */
   const pinSessionMutation = useMutation({
@@ -1976,10 +3386,13 @@ function UserAgentAssistant() {
    */
   const rejectAgentRunMutation = useMutation({
     mutationFn: async () => {
-      if (!controlPlane) throw new Error("当前没有可拒绝的 Agent 计划");
-      return api.cancelAgentRun(controlPlane.sessionId, controlPlane.runId);
+      if (activeSessionArchived) throw new Error("当前会话已归档，请先恢复会话后再拒绝方案。");
+      const rejectionControlPlane = controlPlane ?? observedControlPlane;
+      if (!rejectionControlPlane) throw new Error("当前没有可拒绝的 Agent 计划");
+      return api.cancelAgentRun(rejectionControlPlane.sessionId, rejectionControlPlane.runId);
     },
     onSuccess: (result) => {
+      pendingManualConfirmationRunIdRef.current = undefined;
       setControlPlane(undefined);
       setConfigurationReviewConfirmed(false);
       setConversationMessages((current) => [...current, {
@@ -2191,19 +3604,18 @@ function UserAgentAssistant() {
 
   const observedControlPlane = useMemo(() => {
     if (controlPlane) return controlPlane;
-    const durableTurn = [...(plan?.agentDurableModelToolLoop?.turns ?? [])]
-      .reverse()
-      .find((turn) => turn.sessionId && turn.runId);
-    const ingestion = plan?.controlPlaneIngestion;
-    const hasCompleteLifecyclePlan = (plan?.plan?.toolPlans ?? [])
-      .some((item) => item.toolName === "sync.task.draft.save");
-    const sessionId = hasCompleteLifecyclePlan
-      ? textField(ingestion, "sessionId") || durableTurn?.sessionId
-      : durableTurn?.sessionId || textField(ingestion, "sessionId");
-    const runId = hasCompleteLifecyclePlan
-      ? textField(ingestion, "runId") || durableTurn?.runId
-      : durableTurn?.runId || textField(ingestion, "runId");
-    return sessionId && runId ? { sessionId, runId } : undefined;
+    /*
+     * A complete lifecycle plan can carry two valid-looking control-plane
+     * references. `controlPlaneIngestion` belongs to the first metadata Run,
+     * while the final durable turn is the only Run that owns the draft, precheck,
+     * approval, and submit tools. Always delegate the ordering rule to the
+     * shared selector so the audit query cannot observe one Run while the
+     * confirmation button later submits another.
+     */
+    return selectLatestAgentControlPlane(
+      plan?.agentDurableModelToolLoop?.turns,
+      plan?.controlPlaneIngestion,
+    );
   }, [controlPlane, plan]);
 
   const auditsQuery = useQuery({
@@ -2286,7 +3698,10 @@ function UserAgentAssistant() {
           stage: "wait_recovery_execution",
           status: "RUNNING",
           title: "恢复执行状态暂时不可用",
-          summary: `${errorMessage(error)}；Agent 会继续重试读取真实执行账本。`,
+          summary: `${publicAgentSummary(
+            errorMessage(error),
+            "The recovery execution status is temporarily unavailable.",
+          )}；Agent 会继续重试读取真实执行账本。`,
           details: { taskId, expectedExecutionId, pollAttempt: attempt },
         });
       }
@@ -2332,10 +3747,21 @@ function UserAgentAssistant() {
       return;
     }
     if (frame.type !== "progress" || !frame.event) return;
+    setLiveSpecialistAgentExecution((current) => (
+      mergeSpecialistAgentStreamEvent(current, frame.event!, frame.elapsedMs)
+    ));
     const item = streamEventToObservation(frame.event);
+    const specialistIdentity = textField(item.details, "specialistIdentity");
     setLiveObservationItems((current) => {
       const next = current.map((candidate) => (
-        candidate.status === "RUNNING" && candidate.stage === item.stage
+        candidate.id !== item.id
+        && candidate.status === "RUNNING"
+        && candidate.stage === item.stage
+        && (
+          specialistIdentity
+            ? textField(candidate.details, "specialistIdentity") === specialistIdentity
+            : candidate.category === item.category
+        )
           ? { ...candidate, status: "SUCCEEDED" }
           : candidate
       ));
@@ -2354,6 +3780,9 @@ function UserAgentAssistant() {
    */
   const planMutation = useMutation({
     mutationFn: async (submission: PlanSubmission) => {
+      if (activeSessionArchived && !submission.startNewSession) {
+        throw new Error("当前会话已归档，请先恢复会话后再继续处理。");
+      }
       if (!session?.tenantId || !projectId || !session.actorId) {
         throw new Error("缺少登录租户、项目或操作者上下文，请先选择项目");
       }
@@ -2511,9 +3940,12 @@ function UserAgentAssistant() {
       // A new natural-language turn or form submission may change the task
       // definition. The previous control-plane confirmation must never remain
       // executable while the latest configuration is being resolved.
+      pendingManualConfirmationRunIdRef.current = undefined;
       setControlPlane(undefined);
       setConfigurationReviewConfirmed(false);
       setPlanFailure(undefined);
+      setLiveSpecialistAgentExecution(undefined);
+      setPostConfirmSpecialistExecution(undefined);
       if (!submission.preserveTimeline) {
         setLiveObservationItems([]);
         setLiveRequestId(undefined);
@@ -2535,14 +3967,17 @@ function UserAgentAssistant() {
           stage: "execute_java_tool",
           status: audit.state,
           title: `调用工具：${humanReadableToolName(audit.toolCode)}`,
-          summary: audit.message || audit.planReason || "Java Agent Runtime 已处理该工具节点。",
+          summary: publicAgentSummary(
+            audit.message || audit.planReason,
+            "Java Agent Runtime processed the governed tool step.",
+          ),
           details: {
             auditId: audit.auditId,
             toolCode: audit.toolCode,
             targetService: audit.targetService,
             riskLevel: audit.riskLevel,
             requiresHumanApproval: audit.requiresApproval,
-            outputSummary: audit.outputSummary,
+            outputSummary: sanitizeAgentPresentationValue(audit.outputSummary, "outputSummary"),
             errorCode: audit.errorCode,
           },
         } satisfies AgentObservationTimelineItem));
@@ -2552,7 +3987,10 @@ function UserAgentAssistant() {
           stage: "tool_result_received",
           status: item.audit.state,
           title: `工具结果：${humanReadableToolName(item.audit.toolCode)}`,
-          summary: item.audit.message || item.audit.outputSummary || "工具已返回受治理结果。",
+          summary: publicAgentSummary(
+            item.audit.message || item.audit.outputSummary,
+            "The governed tool returned a recorded result.",
+          ),
           details: {
             toolCode: item.audit.toolCode,
             result: item.output,
@@ -2565,10 +4003,23 @@ function UserAgentAssistant() {
         });
       }
       setPlan(nextPlan);
-      const ingestedRuntimeSessionId = textField(nextPlan.controlPlaneIngestion, "sessionId");
-      const ingestedRuntimeRunId = textField(nextPlan.controlPlaneIngestion, "runId");
-      if (ingestedRuntimeSessionId) {
-        setActiveAgentRuntimeSessionId(ingestedRuntimeSessionId);
+      setLiveSpecialistAgentExecution(undefined);
+      const specialistSnapshot = specialistExecutionSnapshotFromPlan(nextPlan);
+      /*
+       * Bind both the visible conversation and its in-page message timeline to
+       * the same lifecycle Run that will be confirmed later.  Using the ingress
+       * Run here would make history/audits look valid but leave the actual draft
+       * approval Run detached, which is exactly the E2E mismatch this selector
+       * prevents.
+       */
+      const planControlPlane = selectLatestAgentControlPlane(
+        nextPlan.agentDurableModelToolLoop?.turns,
+        nextPlan.controlPlaneIngestion,
+      );
+      const selectedRuntimeSessionId = planControlPlane?.sessionId;
+      const selectedRuntimeRunId = planControlPlane?.runId;
+      if (selectedRuntimeSessionId) {
+        setActiveAgentRuntimeSessionId(selectedRuntimeSessionId);
         setActiveSessionArchived(false);
       }
       setLiveObservationItems((current) => current.map((item) => (
@@ -2589,7 +4040,7 @@ function UserAgentAssistant() {
           const associatedMessages = [...current];
           // 新回合提交时，用户消息先在浏览器即时出现；Java Run ID 要到流式规划结束后才产生。
           // 这里把最后一条尚未关联的用户消息补上真实 Run ID，使当前页面与稍后重新加载的历史排序一致。
-          if (ingestedRuntimeRunId && planSubmissionInteractionOrigin(submission) === "USER_MESSAGE") {
+          if (selectedRuntimeRunId && planSubmissionInteractionOrigin(submission) === "USER_MESSAGE") {
             let userIndex = -1;
             for (let index = associatedMessages.length - 1; index >= 0; index -= 1) {
               if (associatedMessages[index].role === "USER" && !associatedMessages[index].runId) {
@@ -2598,7 +4049,7 @@ function UserAgentAssistant() {
               }
             }
             if (userIndex >= 0) {
-              associatedMessages[userIndex] = { ...associatedMessages[userIndex], runId: ingestedRuntimeRunId };
+              associatedMessages[userIndex] = { ...associatedMessages[userIndex], runId: selectedRuntimeRunId };
             }
           }
           const existingIndex = associatedMessages.findIndex((item) => item.id === messageId);
@@ -2606,7 +4057,8 @@ function UserAgentAssistant() {
             associatedMessages[existingIndex] = {
               ...associatedMessages[existingIndex],
               content: conversation.assistantMessage,
-              runId: ingestedRuntimeRunId || associatedMessages[existingIndex].runId,
+              runId: selectedRuntimeRunId || associatedMessages[existingIndex].runId,
+              specialistAgentExecution: specialistSnapshot,
             };
             return associatedMessages;
           }
@@ -2614,7 +4066,8 @@ function UserAgentAssistant() {
             id: messageId,
             role: "AGENT",
             content: conversation.assistantMessage,
-            runId: ingestedRuntimeRunId,
+            runId: selectedRuntimeRunId,
+            specialistAgentExecution: specialistSnapshot,
           }];
         });
       }
@@ -2709,23 +4162,22 @@ function UserAgentAssistant() {
       const durableTurn = [...(nextPlan.agentDurableModelToolLoop?.turns ?? [])]
         .reverse()
         .find((turn) => turn.sessionId && turn.runId);
-      const ingestion = nextPlan.controlPlaneIngestion;
       const hasCompleteLifecyclePlan = (nextPlan.plan?.toolPlans ?? [])
         .some((item) => item.toolName === "sync.task.draft.save");
-      const sessionId = hasCompleteLifecyclePlan
-        ? textField(ingestion, "sessionId") || durableTurn?.sessionId
-        : durableTurn?.sessionId || textField(ingestion, "sessionId");
-      const runId = hasCompleteLifecyclePlan
-        ? textField(ingestion, "runId") || durableTurn?.runId
-        : durableTurn?.runId || textField(ingestion, "runId");
-      if (!sessionId || !runId) {
+      /*
+       * Never let the initial datasource/metadata ingestion Run win over a
+       * later full lifecycle Run.  The durable turn owns the reviewable tools
+       * and the user approval.  Falling back to ingestion is allowed only for
+       * older responses that genuinely have no durable session/run pair.
+       */
+      if (!planControlPlane) {
         setControlPlane(undefined);
         message.error("参数已补齐，但 Java 控制面未返回 sessionId/runId，请检查计划接入状态");
         return;
       }
-      setControlPlane({ sessionId, runId });
-      setActiveAgentRuntimeSessionId(sessionId);
-      setAgentConversationSessionId(sessionId);
+      setControlPlane(planControlPlane);
+      setActiveAgentRuntimeSessionId(planControlPlane.sessionId);
+      setAgentConversationSessionId(planControlPlane.sessionId);
       setActiveSessionArchived(false);
       void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
       setShowAdvancedClarification(false);
@@ -2739,6 +4191,7 @@ function UserAgentAssistant() {
     onError: (error) => {
       if (planStopRequestedRef.current || isAgentPlanAbort(error)) {
         finishAgentProcess("PLAN", "CANCELLED");
+        setLiveSpecialistAgentExecution((current) => finalizeLiveSpecialistExecution(current, "CANCELLED"));
         setControlPlane(undefined);
         setConversationMessages((current) => [...current, {
           id: `agent-cancelled-${crypto.randomUUID()}`,
@@ -2763,6 +4216,7 @@ function UserAgentAssistant() {
         return;
       }
       finishAgentProcess("PLAN", "FAILED");
+      setLiveSpecialistAgentExecution((current) => finalizeLiveSpecialistExecution(current, "FAILED"));
       const summary = errorMessage(error);
       setPlanFailure(agentPlanFailure(error));
       setConversationMessages((current) => [...current, {
@@ -2824,14 +4278,18 @@ function UserAgentAssistant() {
 
   const executeMutation = useMutation({
     mutationFn: async () => {
-      if (!controlPlane) throw new Error("请先生成 Agent 计划");
+      if (activeSessionArchived) throw new Error("当前会话已归档，请先恢复会话后再执行。");
+      const executionControlPlane = controlPlane ?? observedControlPlane;
+      if (!executionControlPlane) throw new Error("请先生成 Agent 计划");
+      const currentActorId = session?.actorId == null ? undefined : String(session.actorId);
+      if (!currentActorId) throw new Error("当前操作者会话已失效，请重新登录后再执行。");
       const approvedToolCodes = new Set((plan?.plan?.toolPlans ?? []).map((item) => item.toolName));
       const approvedSyncMode = normalizeUserSyncMode(
         clarificationForm.getFieldValue("syncMode") || plan?.agentConversation?.structuredIntent.syncMode,
       );
       const resultByAuditId = new Map<string, AgentToolExecutionResult>();
       const visitedRunIds = new Set<string>();
-      let currentRunId = controlPlane.runId;
+      let currentRunId = executionControlPlane.runId;
       let totalPlanned = 0;
       let totalSucceeded = 0;
       let totalFailed = 0;
@@ -2842,9 +4300,10 @@ function UserAgentAssistant() {
         }
         visitedRunIds.add(currentRunId);
         const pendingRepair = executionAnswer?.repairProposal;
-        const result = await api.confirmAndExecuteAgentRun(controlPlane.sessionId, currentRunId, {
-          confirmed: true,
-          comment: batchIndex === 0
+          const result = await api.confirmAndExecuteAgentRun(executionControlPlane.sessionId, currentRunId, {
+            confirmed: true,
+            idempotencyKey: `agent-confirm:${executionControlPlane.sessionId}:${currentRunId}`,
+            comment: batchIndex === 0
             ? pendingRepair?.kind === "DUPLICATE_TASK_NAME"
               ? `用户确认将任务名称从“${pendingRepair.originalTaskName}”改为“${pendingRepair.proposedTaskName}”，并同意重新保存、预检查、发布和执行`
               : "用户已审核完整同步任务配置，同意执行本次计划"
@@ -2871,6 +4330,7 @@ function UserAgentAssistant() {
             succeededCount: totalSucceeded,
             failedCount: totalFailed,
             toolResults: combinedResults,
+            awaitingManualConfirmation: undefined as ManualConfirmationControlPlane | undefined,
           },
         };
         if (result.data.failedCount > 0 || taskSubmissionReached) {
@@ -2882,20 +4342,67 @@ function UserAgentAssistant() {
         if (!nextRunId) {
           return aggregateResult;
         }
-        if (continuation.sessionId && continuation.sessionId !== controlPlane.sessionId) {
+        if (continuation.sessionId && continuation.sessionId !== executionControlPlane.sessionId) {
           throw new Error("Agent continuation 返回了不同会话，已阻止跨会话自动执行");
         }
 
         // One review may cover several Durable batches, but never tools that
         // were absent from the configuration plan shown to the user.
-        const nextAudits = (await api.listAgentToolExecutions(controlPlane.sessionId, nextRunId)).data;
+        const nextAudits = (await api.listAgentToolExecutions(executionControlPlane.sessionId, nextRunId)).data;
+        const continuationSession = (await api.getAgentSession(executionControlPlane.sessionId)).data;
+        const sameTenant = continuationSession.tenantId == null
+          || String(continuationSession.tenantId) === String(session?.tenantId);
+        const sameProject = continuationSession.projectId == null
+          || String(continuationSession.projectId) === String(projectId);
+        if (
+          continuationSession.sessionId !== executionControlPlane.sessionId
+          || String(continuationSession.actorId) !== currentActorId
+          || !sameTenant
+          || !sameProject
+        ) {
+          throw new Error("Agent continuation 返回了不属于当前会话所有者或项目的 Durable session，已阻止自动执行");
+        }
+        const nextDurableRun = continuationSession.runs.find((run) => run.runId === nextRunId);
+        if (nextDurableRun && nextDurableRun.sessionId !== executionControlPlane.sessionId) {
+          throw new Error("Agent continuation 的 Durable Run 不属于当前 session，已阻止自动执行");
+        }
+        const outOfScopeAudit = nextAudits.find((audit) => (
+          audit.sessionId !== executionControlPlane.sessionId
+          || audit.runId !== nextRunId
+          || (audit.actorId && String(audit.actorId) !== currentActorId)
+        ));
+        if (outOfScopeAudit) {
+          throw new Error("Agent continuation 返回了不属于当前 session-owner 的工具审计，已阻止自动执行");
+        }
         const unexpectedTools = [...new Set(nextAudits
           .map((audit) => audit.toolCode)
           .filter((toolCode) => !approvedToolCodes.has(toolCode)))];
-        if (!nextAudits.length || unexpectedTools.length) {
-          throw new Error(unexpectedTools.length
-            ? `下一批出现未审核工具：${unexpectedTools.join("、")}，需要重新生成并确认计划`
-            : "下一批 Agent Run 没有可执行工具，已停止自动续跑");
+        if (unexpectedTools.length) {
+          throw new Error(`下一批出现未审核工具：${unexpectedTools.join("、")}，需要重新生成并确认计划`);
+        }
+
+        const nextDurableRunStatus = nextDurableRun?.state?.trim().toUpperCase() || "";
+        const nextRunHasPendingConfirmation = nextDurableRunStatus === "WAITING_CONFIRMATION"
+          || (nextDurableRun?.requireHumanApproval === true
+            && ["WAITING_APPROVAL", "APPROVAL_REQUIRED", "PENDING", "PLANNED"].includes(nextDurableRunStatus));
+        const nextRunNeedsManualConfirmation = continuationNeedsManualConfirmation(
+          continuation,
+          nextAudits.some(isPendingApprovalAudit) || nextRunHasPendingConfirmation,
+        );
+        if (nextRunNeedsManualConfirmation) {
+          return {
+            ...aggregateResult,
+            data: {
+              ...aggregateResult.data,
+              awaitingManualConfirmation: {
+                sessionId: executionControlPlane.sessionId,
+                runId: nextRunId,
+              },
+            },
+          };
+        }
+        if (!nextAudits.length) {
+          throw new Error("下一批 Agent Run 没有可执行工具，已停止自动续跑");
         }
         currentRunId = nextRunId;
       }
@@ -2915,7 +4422,10 @@ function UserAgentAssistant() {
           stage: "tool_result_received",
           status: item.audit.state,
           title: `工具结果：${humanReadableToolName(item.audit.toolCode)}`,
-          summary: item.audit.message || item.audit.outputSummary || "工具已返回受治理结果。",
+          summary: publicAgentSummary(
+            item.audit.message || item.audit.outputSummary,
+            "The governed tool returned a recorded result.",
+          ),
           details: {
             toolCode: item.audit.toolCode,
             result: item.output,
@@ -2923,12 +4433,59 @@ function UserAgentAssistant() {
         }));
         return [...merged.values()];
       });
+      const awaitingManualConfirmation = result.data.awaitingManualConfirmation;
+      if (awaitingManualConfirmation) {
+        /*
+         * The previous `confirmed: true` has now been consumed.  Rebind the
+         * existing review surface to the newly durable Run and stop here; the
+         * next request may only be sent after the user reviews this boundary.
+         */
+        pendingManualConfirmationRunIdRef.current = awaitingManualConfirmation.runId;
+        setControlPlane(awaitingManualConfirmation);
+        setActiveAgentRuntimeSessionId(awaitingManualConfirmation.sessionId);
+        setAgentConversationSessionId(awaitingManualConfirmation.sessionId);
+        setActiveSessionArchived(false);
+        setConfigurationReviewConfirmed(false);
+        setShowAdvancedClarification(false);
+        setPlanFailure(undefined);
+        setPostConfirmSpecialistExecution(undefined);
+        setExecutionAnswer(undefined);
+        reviewEditSnapshotRef.current = undefined;
+        setLiveObservationItems((current) => [...current, {
+          id: `continuation-confirmation-required-${awaitingManualConfirmation.runId}`,
+          category: "PERMISSION",
+          stage: "agent_continuation_confirmation_required",
+          status: "WAITING_APPROVAL",
+          title: "后续 Agent 计划等待新的人工确认",
+          summary: "后端返回了新的待确认 Durable Run，自动续跑已停止。",
+          details: {
+            sourceRunId: result.data.runId,
+            nextRunId: awaitingManualConfirmation.runId,
+          },
+        }]);
+        message.info("后端返回了新的待确认计划，请重新审核后确认");
+        void queryClient.invalidateQueries({ queryKey: ["agent-assistant-session-history", projectId] });
+        return;
+      }
+      pendingManualConfirmationRunIdRef.current = undefined;
       const succeededToolCodes = new Set(result.data.toolResults
         .filter((item) => item.audit.state === "SUCCEEDED")
         .map((item) => item.audit.toolCode));
       const taskLifecycleReached = succeededToolCodes.has("sync.task.run")
         || (["SCHEDULED_BATCH", "SCHEDULED_FULL", "CDC_STREAMING"].includes(reviewSyncMode)
           && succeededToolCodes.has("sync.task.publish"));
+      /*
+       * 只有任务已真实提交且本轮没有 Java 工具失败时，才接受后端返回的
+       * post-confirm 专业复核。这样不会把故障恢复、只读发现或上一轮残留的
+       * Specialist 结果误标为“任务已完成后的复核”；快照适配器还会在进入页面
+       * 前删除资源指纹、内部编排和原始日志等不属于用户协作流的信息。
+       */
+      const postConfirmSpecialistSnapshot = taskLifecycleReached && result.data.failedCount === 0
+        ? buildPostConfirmSpecialistSnapshot(result.data.continuation)
+        : undefined;
+      if (postConfirmSpecialistSnapshot) {
+        setPostConfirmSpecialistExecution(postConfirmSpecialistSnapshot);
+      }
       const createdTaskId = [...result.data.toolResults]
         .reverse()
         .map((item) => findNumericField(item.output, ["taskId", "syncTaskId"]))
@@ -2969,6 +4526,7 @@ function UserAgentAssistant() {
           // Crossing the task lifecycle boundary consumes the current approval scope.
           // Keep the process/result history, but remove every mutable surface tied to
           // the old Run so the same task cannot be created or submitted a second time.
+          pendingManualConfirmationRunIdRef.current = undefined;
           setControlPlane(undefined);
           setConfigurationReviewConfirmed(false);
           setShowAdvancedClarification(false);
@@ -2983,7 +4541,10 @@ function UserAgentAssistant() {
       if (result.data.failedCount > 0) {
         const firstFailure = result.data.failures?.[0];
         message.error(firstFailure
-          ? `${humanReadableToolName(firstFailure.toolCode)}失败：${firstFailure.message}`
+          ? `${humanReadableToolName(firstFailure.toolCode)}失败：${publicAgentSummary(
+            firstFailure.message,
+            "The governed tool action failed; the Agent can continue diagnosis.",
+          )}`
           : `工具执行失败 ${result.data.failedCount} 个，Agent 已进入失败诊断`);
         const failureContinuation = result.data.continuation;
         if (failureContinuation?.assistantReply) {
@@ -2993,7 +4554,10 @@ function UserAgentAssistant() {
             stage: "failure_diagnosis_completed",
             status: failureContinuation.requiresConfirmation ? "WAITING_APPROVAL" : "SUCCEEDED",
             title: "Agent 已分析失败事实",
-            summary: failureContinuation.assistantReply || "Agent 已完成失败事实分析。",
+            summary: publicAgentSummary(
+              failureContinuation.assistantReply,
+              "Agent completed a governed failure analysis.",
+            ),
             details: {
               sourceRunId: result.data.runId,
               recoveryRunId: failureContinuation.nextRunId,
@@ -3115,6 +4679,10 @@ function UserAgentAssistant() {
    */
   const continueConversation = () => {
     const latestMessage = followUpMessage.trim();
+    if (activeSessionArchived) {
+      message.info("当前会话已归档，请先恢复会话后再继续对话。");
+      return;
+    }
     if (!latestMessage || planMutation.isPending) return;
     const clarification: Partial<ClarificationFormValues> = {
       ...clarificationForm.getFieldsValue(true),
@@ -3157,12 +4725,17 @@ function UserAgentAssistant() {
    * 进入 variables.dataSyncRequest。startNewSession 只决定是否复用 Java 控制面会话，不会清空当前配置。
    */
   const retryPlanWithCurrentConfiguration = (startNewSession = false) => {
+    if (activeSessionArchived && !startNewSession) {
+      message.info("当前会话已归档，请先恢复会话后再重新核对配置。");
+      return;
+    }
     if (planMutation.isPending) return;
     const clarification: Partial<ClarificationFormValues> = {
       ...clarificationForm.getFieldsValue(true),
       ...definedFormValues(quickClarificationForm.getFieldsValue(true)),
     };
     if (startNewSession) {
+      invalidateSessionLoad();
       setAgentConversationSessionId(crypto.randomUUID());
       setActiveAgentRuntimeSessionId(undefined);
       setHistoricalRunProcesses([]);
@@ -3189,6 +4762,10 @@ function UserAgentAssistant() {
    * Agent process but never fabricates a USER bubble.
    */
   const continueAgentDiagnosis = () => {
+    if (activeSessionArchived) {
+      message.info("当前会话已归档，请先恢复会话后再继续诊断。");
+      return;
+    }
     if (planMutation.isPending) return;
     const clarification: Partial<ClarificationFormValues> = {
       ...clarificationForm.getFieldsValue(true),
@@ -3210,6 +4787,10 @@ function UserAgentAssistant() {
    * 展示数据源、对象映射、字段映射和 WHERE，并要求用户再次确认，从而同时满足可恢复性与高风险写操作授权边界。
    */
   const regenerateTaskNameRepairPlan = () => {
+    if (activeSessionArchived) {
+      message.info("当前会话已归档，请先恢复会话后再生成更名修复计划。");
+      return;
+    }
     const proposedTaskName = executionAnswer?.repairProposal?.proposedTaskName?.trim();
     if (!proposedTaskName || planMutation.isPending) return;
     clarificationForm.setFieldValue("taskName", proposedTaskName);
@@ -3229,6 +4810,10 @@ function UserAgentAssistant() {
 
   /** 打开当前页高级配置并滚动到真实元数据驱动的表单，不丢弃已有选择。 */
   const openRetainedAdvancedConfiguration = () => {
+    if (activeSessionArchived) {
+      message.info("当前会话已归档，请先恢复会话后再修改配置。");
+      return;
+    }
     setShowAdvancedClarification(true);
     window.setTimeout(() => scrollToAgentSection("agent-clarification-card"), 0);
   };
@@ -3344,19 +4929,43 @@ function UserAgentAssistant() {
     && !executionAnswer.recoveryRunId
     && executionAnswer.recoveryRunUnavailableReason,
   );
+  const continuationManualConfirmationActive = Boolean(
+    controlPlane?.runId
+    && pendingManualConfirmationRunIdRef.current === controlPlane.runId,
+  );
+  const pendingAuditToolNames = [...new Set(
+    audits.filter(isPendingApprovalAudit).map((audit) => audit.toolCode),
+  )];
   const activeToolNames = failureRecoveryPlanActive
     ? [...new Set(audits.map((audit) => audit.toolCode))]
+    : continuationManualConfirmationActive && pendingAuditToolNames.length
+    ? pendingAuditToolNames
     : latestDurableTurn?.submittedToolNames?.length
     ? latestDurableTurn.submittedToolNames
     : planItems.map((item) => item.toolName);
   const activeRequiresConfirmation = failureRecoveryPlanActive
     ? Boolean(executionAnswer?.recoveryRequiresConfirmation)
-      && audits.some((audit) => ["WAITING_APPROVAL", "PLANNED"].includes(audit.state))
-    : latestDurableTurn
-    ? ["WAITING_APPROVAL", "HUMAN_TAKEOVER_REQUIRED"].includes(
-        plan?.agentDurableModelToolLoop?.stoppedReason ?? "",
-      )
-    : planItems.some((item) => item.requiresHumanApproval);
+      && audits.some(isPendingApprovalAudit)
+    : continuationManualConfirmationActive
+      || audits.some(isPendingApprovalAudit)
+      || (latestDurableTurn
+        ? ["WAITING_APPROVAL", "WAITING_CONFIRMATION", "HUMAN_TAKEOVER_REQUIRED"].includes(
+            plan?.agentDurableModelToolLoop?.stoppedReason ?? "",
+          )
+        : planItems.some((item) => item.requiresHumanApproval)
+          || specialistExecutionHasPendingApproval(plan?.specialistAgentExecution));
+  /**
+   * A Specialist result can report `WAITING_APPROVAL` before the durable Java
+   * control plane has restored the corresponding approval card.  The result
+   * panel is an observation surface, not a second approval implementation, so
+   * it may expose a navigation action only when the real, currently rendered
+   * plan card has a complete session/run boundary and at least one governed
+   * tool to review.  This is especially important for Recovery: no pending
+   * Specialist fact may be mistaken for permission to approve a repair.
+   */
+  const hasRealApprovalEntry = Boolean(
+    observedControlPlane && activeToolNames.length && activeRequiresConfirmation,
+  );
   const confirmationButtonLabel = taskNameRepairActive
     ? `确认改名为“${executionAnswer?.repairProposal?.proposedTaskName}”并重新执行`
     : failureRecoveryPlanActive
@@ -3390,7 +4999,11 @@ function UserAgentAssistant() {
   const targetSchemaOptional = isMysqlLikeConnector(selectedTargetDatasource?.type);
   const resolverMode = textField(conversation?.intentResolver, "mode");
   const modelProvider = textField(conversation?.intentResolver, "modelProvider");
-  const modelName = textField(conversation?.intentResolver, "modelName");
+  // Prefer the execution-provenance field. `modelName` remains the compatible
+  // fallback for older runtimes that did not yet emit an explicit actual name.
+  const actualModelName = textField(conversation?.intentResolver, "actualModelName")
+    || textField(conversation?.intentResolver, "selectedModelName")
+    || textField(conversation?.intentResolver, "modelName");
   const requestedModelName = textField(conversation?.intentResolver, "requestedModelName");
   const modelInvoked = booleanField(conversation?.intentResolver, "providerInvokedForCurrentTurn");
   const modelSucceeded = booleanField(conversation?.intentResolver, "providerSucceededForCurrentTurn");
@@ -3398,7 +5011,18 @@ function UserAgentAssistant() {
   const modelTotalTokens = numberField(conversation?.intentResolver, "totalTokens");
   const modelFallbackReason = textField(conversation?.intentResolver, "fallbackReasonCode");
   const observationItems = useMemo<AgentObservationTimelineItem[]>(() => {
-    const planningItems = plan?.agentObservationTimeline?.items ?? [];
+    /*
+     * Final-plan observations are durable backend facts rather than the live
+     * stream handled above.  Project them separately before merging so a
+     * rolling backend cannot reintroduce raw model text, SQL, connection
+     * diagnostics, or tool payload values through the historical timeline.
+     */
+    const planningItems = (plan?.agentObservationTimeline?.items ?? []).map((item) => ({
+      ...item,
+      title: publicAgentSummary(item.title, "Agent recorded a governed update."),
+      summary: publicAgentSummary(item.summary, "Agent recorded a governed status update."),
+      details: sanitizeAgentPresentationValue(item.details, "observationDetails") as Record<string, unknown>,
+    }));
     const finalizedStages = new Set(planningItems.map((item) => item.stage));
     // 最终响应中的产品化摘要替换同阶段的临时事件；上下文等未被聚合覆盖的节点继续保留，便于完整回放。
     const retainedLiveItems = liveObservationItems.filter((item) => (
@@ -3410,7 +5034,10 @@ function UserAgentAssistant() {
       stage: "execute_java_tool",
       status: audit.state,
       title: `调用工具：${audit.toolCode}`,
-      summary: audit.message || audit.planReason || "Java Agent Runtime 正在处理工具节点。",
+      summary: publicAgentSummary(
+        audit.message || audit.planReason,
+        "Java Agent Runtime is processing the governed tool step.",
+      ),
       details: {
         auditId: audit.auditId,
         targetService: audit.targetService,
@@ -3419,7 +5046,7 @@ function UserAgentAssistant() {
         requiresHumanApproval: audit.requiresApproval,
         readOnly: audit.readOnly,
         idempotent: audit.idempotent,
-        outputSummary: audit.outputSummary,
+        outputSummary: sanitizeAgentPresentationValue(audit.outputSummary, "outputSummary"),
         errorCode: audit.errorCode,
       },
     } satisfies AgentObservationTimelineItem));
@@ -3463,17 +5090,25 @@ function UserAgentAssistant() {
           : responseSource === "DATASMART_RESULT_CACHE"
             ? "从会话缓存取得模型公开回复"
             : "模型已完成目标理解与工具决策",
-        summary: modelItem.summary || "正在等待模型返回公开内容。",
+        summary: publicAgentSummary(
+          modelItem.summary,
+          "The model is preparing a governed public response.",
+        ),
         operation: `${responseSource === "DATASMART_RESULT_CACHE" ? "DataSmart response cache" : "Responses API"}`
           + `${actualModel ? ` · ${String(actualModel)}` : ""}`,
         targetService: provider ? String(provider) : "model-gateway",
+        /*
+         * The live event may carry the user's objective, system-instruction
+         * summary, and normalized task baseline so the model gateway can make
+         * its decision.  Those are prompt-context fields, not process facts.
+         * The visible conversation already shows the user's own message; keep
+         * only the governed tool names here so the timeline explains what the
+         * model could act on without recreating a second prompt disclosure.
+         */
         safeInput: sanitizeAgentActionPayload({
-          objective: details.modelRequestObjective,
-          instructionSummary: details.modelInstructionSummary,
           visibleTools: details.modelVisibleToolNames,
-          structuredBaseline: details.modelStructuredBaseline,
         }),
-        safeOutput: sanitizeAgentActionPayload(modelItem.summary),
+        safeOutput: sanitizeAgentActionPayload(modelItem.summary, "modelPublicResponse"),
         evidence: {
           requestId: liveRequestId,
           responseSource,
@@ -3486,6 +5121,25 @@ function UserAgentAssistant() {
         },
       });
     }
+
+    /*
+     * Specialist actions arrive from two channels: the low-latency stream and
+     * the final durable plan/message snapshot.  Later sources are more complete
+     * and intentionally replace an earlier action with the same stable role /
+     * turn identity.  This gives the user live progress first, then the final
+     * result without rendering each of the six Agents twice.
+     */
+    const latestSpecialistActions = new Map<string, AgentActionItem>();
+    [
+      liveSpecialistAgentExecution,
+      specialistExecutionSnapshotFromPlan(plan),
+      postConfirmSpecialistExecution,
+    ].forEach((snapshot) => {
+      specialistExecutionToAgentActions(snapshot, "current").forEach((item) => {
+        latestSpecialistActions.set(item.id, item);
+      });
+    });
+    actions.push(...latestSpecialistActions.values());
 
     audits.forEach((audit) => {
       actions.push(auditToAgentAction(audit, resultByAuditId.get(audit.auditId)));
@@ -3501,12 +5155,20 @@ function UserAgentAssistant() {
         kind: item.category === "USER_ACTION" ? "USER_INPUT" : "APPROVAL",
         status: item.status,
         title: item.title,
-        summary: item.summary,
+        summary: publicAgentSummary(item.summary, "The Agent is waiting for the next governed user action."),
         safeInput: sanitizeAgentActionPayload(item.details),
       });
     });
     return actions;
-  }, [audits, executionResults, liveRequestId, observationItems]);
+  }, [
+    audits,
+    executionResults,
+    liveRequestId,
+    liveSpecialistAgentExecution,
+    observationItems,
+    plan,
+    postConfirmSpecialistExecution,
+  ]);
 
   const diagnosticItems = useMemo(() => observationItems.filter((item) => (
     !item.id.startsWith("execution-")
@@ -3683,6 +5345,7 @@ function UserAgentAssistant() {
    * 避免“新建任务”错误续接到此前历史会话。
    */
   const submitObjective = (values: ObjectiveFormValues) => {
+    invalidateSessionLoad();
     const browserSessionId = crypto.randomUUID();
     setAgentConversationSessionId(browserSessionId);
     setActiveAgentRuntimeSessionId(undefined);
@@ -3693,6 +5356,7 @@ function UserAgentAssistant() {
     setLiveRequestId(undefined);
     setControlPlane(undefined);
     setExecutionResults([]);
+    setPostConfirmSpecialistExecution(undefined);
     setExecutionAnswer(undefined);
     setPlanFailure(undefined);
     setFollowUpMessage("");
@@ -3721,6 +5385,7 @@ function UserAgentAssistant() {
    * 仅重置当前协作工作台，不删除或归档服务端历史。正在进行的流式请求会先被取消，随后恢复默认输入态。
    */
   const startNewConversation = () => {
+    invalidateSessionLoad();
     activePlanAbortControllerRef.current?.abort();
     const browserSessionId = crypto.randomUUID();
     setAgentConversationSessionId(browserSessionId);
@@ -3734,6 +5399,7 @@ function UserAgentAssistant() {
     setPlan(undefined);
     setControlPlane(undefined);
     setExecutionResults([]);
+    setPostConfirmSpecialistExecution(undefined);
     setExecutionAnswer(undefined);
     setPlanFailure(undefined);
     setLiveObservationItems([]);
@@ -3749,6 +5415,7 @@ function UserAgentAssistant() {
       message.warning("请先上传 CSV 或 XLSX 任务文件");
       return;
     }
+    invalidateSessionLoad();
     setObjective(taskImportObjective);
     setAgentConversationSessionId(crypto.randomUUID());
     setActiveAgentRuntimeSessionId(undefined);
@@ -3814,6 +5481,10 @@ function UserAgentAssistant() {
   };
 
   const startConfigurationReviewEdit = () => {
+    if (activeSessionArchived) {
+      message.info("当前会话已归档，请先恢复会话后再修改配置。");
+      return;
+    }
     reviewEditSnapshotRef.current = {
       values: clarificationForm.getFieldsValue(true),
       controlPlane,
@@ -3965,6 +5636,108 @@ function UserAgentAssistant() {
   const currentConversationHistoryMessages = currentConversationMessages.filter(
     (_, index) => index !== currentTurnAgentMessageIndex,
   );
+
+  /**
+   * 打开真实同步任务详情，并把 executionId 作为初始选中执行传给数据同步页。
+   * Agent 只能使用控制面或 data-sync 返回的正整数 ID；不会根据任务名称猜测资源。
+   */
+  const openSyncTaskDetails = (locator: SpecialistTaskDetailLocator) => {
+    if (!locator.taskId) {
+      message.info("当前结果没有可用的真实 taskId，暂时无法打开同步任务详情。");
+      return;
+    }
+    navigate("/sync", {
+      state: {
+        agentTaskLocator: {
+          taskId: locator.taskId,
+          executionId: locator.executionId,
+          source: "AGENT_RESULT",
+        },
+      },
+    });
+  };
+
+  /**
+   * 将专业 Agent 的人工动作接到页面已经存在的真实工作流。
+   * 补参打开同一个任务配置表单；审批定位到既有执行计划；失败创建同 session 的诊断 Run；任务结果跳转到
+   * 数据同步页面。面板仅在对应回调存在时显示按钮，因此历史只读记录不会出现点击后无反应的伪入口。
+   */
+  const specialistPanelActions: SpecialistPanelActions = {
+    // Once the lifecycle tool has created and submitted the task, the old plan
+    // is an audit artifact.  Keep detail navigation available below, but never
+    // expose a stale form/approval callback that could submit the same task a
+    // second time after a history reload or an out-of-order Specialist event.
+    onRequiredInput: taskWorkflowCompleted ? undefined : () => {
+      if (conversation?.phase === "WAITING_CLARIFICATION" || showAdvancedClarification) {
+        window.setTimeout(() => scrollToAgentSection("agent-clarification-card"), 0);
+        return;
+      }
+      openRetainedAdvancedConfiguration();
+    },
+    onApproval: taskWorkflowCompleted || !hasRealApprovalEntry ? undefined : (result) => {
+      const isRecoveryApproval = result.agentRole.trim().toUpperCase() === "RECOVERY_AGENT";
+      /*
+       * This callback is navigation only.  In particular, a recovery proposal
+       * can contain a retry, data cleanup, or schema-change blueprint, so the
+       * browser must never call the confirmation mutation from a Specialist
+       * card.  The user is sent to the durable Java approval card, where the
+       * exact Run, delegation, and approval facts are revalidated server-side.
+       */
+      if (isRecoveryApproval) {
+        message.info("修复方案尚未执行，已为你定位到需要人工确认的审批计划。", 4);
+      }
+      if (observedControlPlane) {
+        window.setTimeout(() => {
+          if (scrollToAgentSection("agent-execution-plan-card")) return;
+          window.setTimeout(() => {
+            if (!scrollToAgentSection("agent-execution-plan-card")) {
+              message.warning("审批请求已恢复，但真实 Java 审批卡尚未生成；请查看当前会话的执行计划或重新加载会话。", 5);
+            }
+          }, 250);
+        }, 0);
+        return;
+      }
+      /*
+       * 不隐藏一个已经被结构化结果明确标记为待审批的入口。若历史快照缺少
+       * Java sessionId/runId，页面无法安全构造审批请求，因此给出明确恢复动作，
+       * 而不是渲染一个点击后无反应的按钮或伪造控制面标识。
+       */
+      if (activeAgentRuntimeSessionId) {
+        message.warning("检测到待审批动作，但当前会话的 Java 审批上下文未恢复；请重新打开历史会话后再定位审批入口。", 5);
+        loadSessionMutation.mutate({ sessionId: activeAgentRuntimeSessionId, requestToken: crypto.randomUUID() });
+      } else {
+        message.warning("检测到待审批动作，但没有真实 Java sessionId/runId，暂时无法安全定位审批入口。", 5);
+      }
+    },
+    onFailure: !taskWorkflowCompleted && activeAgentRuntimeSessionId && !planMutation.isPending
+      ? () => continueAgentDiagnosis()
+      : undefined,
+    onViewTaskDetails: (result) => {
+      openSyncTaskDetails({
+        taskId: findNumericField(result.structuredOutput, ["taskId", "task_id", "syncTaskId", "sync_task_id"]),
+        executionId: findNumericField(result.structuredOutput, ["executionId", "execution_id"]),
+      });
+    },
+    onViewTaskLocator: openSyncTaskDetails,
+  };
+
+  /**
+   * 当前最终助手消息已经携带完整 specialistAgentExecution 时由消息气泡负责展示；流式处理中、规划失败后，
+   * 或没有 assistantMessage 的兼容响应则留在过程区域。这样同一回合始终只有一块专业 Agent 面板。
+   */
+  const currentPlanSpecialistExecution = useMemo(
+    () => specialistExecutionSnapshotFromPlan(plan),
+    [plan],
+  );
+  const currentProcessSpecialistExecution = hasSpecialistExecutionSnapshot(currentTurnAgentMessage?.specialistAgentExecution)
+    ? undefined
+    : planMutation.isPending
+      ? liveSpecialistAgentExecution
+      : planFailure && liveSpecialistAgentExecution
+        ? liveSpecialistAgentExecution
+        : hasSpecialistExecutionSnapshot(currentPlanSpecialistExecution)
+          ? currentPlanSpecialistExecution
+          : undefined;
   const processActionSummaries = agentProcessActionSummaries(agentActions);
   const currentProcessItem = [...agentActions].reverse().find((item) => item.status === "RUNNING")
     || agentActions[agentActions.length - 1];
@@ -4061,7 +5834,7 @@ function UserAgentAssistant() {
                             size="small"
                             items={[{
                               key: `${item.id}-details`,
-                              label: "查看调用参数、结果与证据",
+                              label: "查看涉及字段、结果与证据",
                               children: (
                                 <Space direction="vertical" size={12} style={{ width: "100%" }}>
                                   {item.changedFields?.length ? (
@@ -4074,7 +5847,7 @@ function UserAgentAssistant() {
                                   ) : null}
                                   {safeInputText ? (
                                     <div>
-                                      <Typography.Text type="secondary">脱敏调用参数</Typography.Text>
+                                      <Typography.Text type="secondary">涉及输入字段</Typography.Text>
                                       <pre className="agent-action-payload">{safeInputText}</pre>
                                     </div>
                                   ) : null}
@@ -4124,7 +5897,9 @@ function UserAgentAssistant() {
       message="本轮处理未完成，当前会话和配置已保留"
       description={(
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
-          <Typography.Text>{planFailure.message}</Typography.Text>
+          <Typography.Text>
+            {publicAgentSummary(planFailure.message, "The Agent could not complete this governed step.")}
+          </Typography.Text>
           <Space wrap>
             {effectiveSourceDatasourceId ? <Tag color="green">源端 #{effectiveSourceDatasourceId}</Tag> : <Tag>源端未选择</Tag>}
             {effectiveTargetDatasourceId ? <Tag color="green">目标端 #{effectiveTargetDatasourceId}</Tag> : <Tag>目标端未选择</Tag>}
@@ -4142,7 +5917,11 @@ function UserAgentAssistant() {
               : "当前任务配置已恢复完整。你可以让 Agent 根据失败证据自我诊断，或进入高级配置人工调整；所有操作都沿用当前历史会话。"}
           </Typography.Text>
           {planFailure.suggestions.length ? (
-            <Typography.Text type="secondary">建议：{planFailure.suggestions.join("；")}</Typography.Text>
+            <Typography.Text type="secondary">
+              建议：{planFailure.suggestions
+                .map((suggestion) => publicAgentSummary(suggestion, "Review the retained task configuration."))
+                .join("；")}
+            </Typography.Text>
           ) : null}
           <Space wrap>
             <Button
@@ -4205,11 +5984,11 @@ function UserAgentAssistant() {
               role="button"
               tabIndex={0}
               className={`agent-session-item${activeAgentRuntimeSessionId === item.sessionId ? " is-active" : ""}`}
-              onClick={() => loadSessionMutation.mutate(item.sessionId)}
+              onClick={() => loadSessionMutation.mutate({ sessionId: item.sessionId, requestToken: crypto.randomUUID() })}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
-                  loadSessionMutation.mutate(item.sessionId);
+                  loadSessionMutation.mutate({ sessionId: item.sessionId, requestToken: crypto.randomUUID() });
                 }
               }}
             >
@@ -4233,6 +6012,8 @@ function UserAgentAssistant() {
                     type="text"
                     size="small"
                     icon={item.pinned ? <PushpinFilled /> : <PushpinOutlined />}
+                    aria-label={item.pinned ? "取消置顶会话" : "置顶会话"}
+                    title={item.pinned ? "取消置顶会话" : "置顶会话"}
                     onClick={(event) => {
                       event.stopPropagation();
                       pinSessionMutation.mutate({ sessionId: item.sessionId, enabled: !item.pinned });
@@ -4244,6 +6025,8 @@ function UserAgentAssistant() {
                     type="text"
                     size="small"
                     icon={item.archived ? <HistoryOutlined /> : <InboxOutlined />}
+                    aria-label={item.archived ? "恢复会话" : "归档会话"}
+                    title={item.archived ? "恢复会话" : "归档会话"}
                     onClick={(event) => {
                       event.stopPropagation();
                       archiveSessionMutation.mutate({ sessionId: item.sessionId, enabled: !item.archived });
@@ -4352,24 +6135,47 @@ function UserAgentAssistant() {
           ) : null}
           <div className="agent-message-list">
             {historicalTranscript.entries.map((entry) => entry.kind === "MESSAGE" ? (
-              <AgentConversationMessageBubble key={entry.key} item={entry.message} />
+              <AgentConversationMessageBubble
+                key={entry.key}
+                item={entry.message}
+                specialistActions={specialistPanelActions}
+              />
             ) : (
               <div key={entry.key} className="agent-message-row is-agent agent-process-message-row">
                 <div className="agent-message-meta">Agent</div>
-                <HistoricalAgentRunProcessPlayback process={entry.process} />
+                <HistoricalAgentRunProcessPlayback
+                  process={entry.process}
+                  specialistActions={specialistPanelActions}
+                />
               </div>
             ))}
             {currentConversationHistoryMessages.map((item) => (
-              <AgentConversationMessageBubble key={item.id} item={item} />
+              <AgentConversationMessageBubble
+                key={item.id}
+                item={item}
+                specialistActions={specialistPanelActions}
+              />
             ))}
-            {processPanel ? (
+            {processPanel || currentProcessSpecialistExecution ? (
               <div className="agent-message-row is-agent agent-process-message-row">
                 <div className="agent-message-meta">Agent</div>
-                {processPanel}
+                <div className="agent-turn-process-stack">
+                  {processPanel}
+                  {currentProcessSpecialistExecution ? (
+                    <SpecialistAgentExecutionPanel
+                      specialistAgentExecution={currentProcessSpecialistExecution}
+                      title="本回合专业 Agent"
+                      {...specialistPanelActions}
+                    />
+                  ) : null}
+                </div>
               </div>
             ) : null}
             {currentTurnAgentMessage ? (
-              <AgentConversationMessageBubble item={currentTurnAgentMessage} />
+              <AgentConversationMessageBubble
+                item={currentTurnAgentMessage}
+                specialistActions={specialistPanelActions}
+              />
             ) : null}
           </div>
           {planFailurePanel}
@@ -4470,24 +6276,47 @@ function UserAgentAssistant() {
           ) : null}
           <div className="agent-message-list">
             {historicalTranscript.entries.map((entry) => entry.kind === "MESSAGE" ? (
-              <AgentConversationMessageBubble key={entry.key} item={entry.message} />
+              <AgentConversationMessageBubble
+                key={entry.key}
+                item={entry.message}
+                specialistActions={specialistPanelActions}
+              />
             ) : (
               <div key={entry.key} className="agent-message-row is-agent agent-process-message-row">
                 <div className="agent-message-meta">Agent</div>
-                <HistoricalAgentRunProcessPlayback process={entry.process} />
+                <HistoricalAgentRunProcessPlayback
+                  process={entry.process}
+                  specialistActions={specialistPanelActions}
+                />
               </div>
             ))}
             {currentConversationHistoryMessages.map((item) => (
-              <AgentConversationMessageBubble key={item.id} item={item} />
+              <AgentConversationMessageBubble
+                key={item.id}
+                item={item}
+                specialistActions={specialistPanelActions}
+              />
             ))}
-            {processPanel ? (
+            {processPanel || currentProcessSpecialistExecution ? (
               <div className="agent-message-row is-agent agent-process-message-row">
                 <div className="agent-message-meta">Agent</div>
-                {processPanel}
+                <div className="agent-turn-process-stack">
+                  {processPanel}
+                  {currentProcessSpecialistExecution ? (
+                    <SpecialistAgentExecutionPanel
+                      specialistAgentExecution={currentProcessSpecialistExecution}
+                      title="本回合专业 Agent"
+                      {...specialistPanelActions}
+                    />
+                  ) : null}
+                </div>
               </div>
             ) : null}
             {currentTurnAgentMessage ? (
-              <AgentConversationMessageBubble item={currentTurnAgentMessage} />
+              <AgentConversationMessageBubble
+                item={currentTurnAgentMessage}
+                specialistActions={specialistPanelActions}
+              />
             ) : null}
           </div>
           {planFailurePanel}
@@ -4500,8 +6329,8 @@ function UserAgentAssistant() {
               {modelSucceeded ? "真实模型已参与" : modelInvoked ? "模型失败，规则降级" : "仅规则解析"}
             </Tag>
             {modelProvider ? <Tag color="geekblue">{modelProvider}</Tag> : null}
-            {modelName ? <Tag color="blue">{modelName}</Tag> : null}
-            {requestedModelName && requestedModelName !== modelName ? (
+            {actualModelName ? <Tag color="blue">{actualModelName}</Tag> : null}
+            {requestedModelName && requestedModelName !== actualModelName ? (
               <Tag>{`请求模型：${requestedModelName}`}</Tag>
             ) : null}
             {modelLatencyMs !== undefined ? <Tag>{modelLatencyMs} ms</Tag> : null}
@@ -4531,7 +6360,7 @@ function UserAgentAssistant() {
                     {mapping.targetObjectName}
                   </Typography.Text>
                   {mapping.whereCondition ? (
-                    <Tag color="cyan">WHERE {mapping.whereCondition}</Tag>
+                    <Tag color="cyan">已设置 WHERE 条件</Tag>
                   ) : null}
                   {mapping.fieldMappings.length ? (
                     <Tag>{mapping.fieldMappings.length} 个字段</Tag>
@@ -5387,7 +7216,7 @@ function UserAgentAssistant() {
         </Card>
       ) : null}
 
-      {!taskWorkflowCompleted && controlPlane && activeToolNames.length && activeRequiresConfirmation ? (
+      {!taskWorkflowCompleted && observedControlPlane && activeToolNames.length && activeRequiresConfirmation ? (
         <Card id="agent-execution-plan-card" title="可观测执行计划" className="compact-card">
           {isSyncTaskCreationReview && !failureRecoveryPlanActive ? (
             <div className="agent-configuration-review">
@@ -5482,7 +7311,7 @@ function UserAgentAssistant() {
                           <div className="agent-configuration-mapping-label">
                             <Typography.Text strong>{sourceName} → {targetName}</Typography.Text>
                             <Space wrap>
-                              {mapping.whereCondition ? <Tag color="cyan">WHERE {mapping.whereCondition}</Tag> : <Tag>无 WHERE</Tag>}
+                              {mapping.whereCondition ? <Tag color="cyan">已设置 WHERE 条件</Tag> : <Tag>无 WHERE</Tag>}
                               <Tag color="blue">同步 {enabledFields.length} 个字段</Tag>
                               {disabledFieldCount ? <Tag>忽略 {disabledFieldCount} 个字段</Tag> : null}
                             </Space>
@@ -5555,12 +7384,14 @@ function UserAgentAssistant() {
             size="small"
             items={activeToolNames.map((toolName) => ({
               title: humanReadableToolName(toolName),
-              description: planItems.find((item) => item.toolName === toolName)?.reason
-                || "模型基于真实工具结果提出该动作，已通过平台工具与状态治理，等待你的明确授权。",
+              description: publicAgentSummary(
+                planItems.find((item) => item.toolName === toolName)?.reason,
+                "The model proposed this governed action from verified tool facts and it is waiting for your approval.",
+              ),
               status: "wait",
             }))}
           />
-          {audits.filter((audit) => audit.state === "WAITING_APPROVAL" || audit.requiresApproval).map((audit) => {
+          {audits.filter(isPendingApprovalAudit).map((audit) => {
             const patches = Array.isArray(audit.planArguments.patches) ? audit.planArguments.patches : [];
             return (
               <Card key={audit.auditId} size="small" title={humanReadableToolName(audit.toolCode)} style={{ marginTop: 12 }}>
@@ -5575,35 +7406,12 @@ function UserAgentAssistant() {
                   ]}
                 />
                 {patches.length ? (
-                  <Space direction="vertical" style={{ width: "100%", marginTop: 12 }}>
-                    {patches.map((patch, index) => {
-                      const item = patch && typeof patch === "object" ? patch as Record<string, unknown> : {};
-                      return (
-                        <Alert
-                          key={`${audit.auditId}-patch-${index}`}
-                          type="warning"
-                          showIcon
-                          message={`第 ${String(item.rowNumber ?? "-")} 行 · ${String(item.columnName ?? "未知列")}`}
-                          description={`建议改为：${String(item.replacementValue ?? "空值")}`}
-                        />
-                      );
-                    })}
-                  </Space>
-                ) : null}
-                {failureRecoveryPlanActive ? (
-                  <Collapse
-                    ghost
-                    size="small"
-                    style={{ marginTop: 8 }}
-                    items={[{
-                      key: `${audit.auditId}-repair-arguments`,
-                      label: "查看本次修复动作参数",
-                      children: (
-                        <pre className="agent-configuration-sql">
-                          {JSON.stringify(sanitizeAgentActionPayload(audit.planArguments), null, 2)}
-                        </pre>
-                      ),
-                    }]}
+                  <Alert
+                    type="warning"
+                    showIcon
+                    style={{ marginTop: 12 }}
+                    message={`本次受控修复包含 ${patches.length} 项变更`}
+                    description="为避免通过 Agent 过程泄露工具参数或数据内容，具体行、字段和值只在受权限保护的配置审核与审批服务中查看。"
                   />
                 ) : null}
               </Card>
@@ -5648,7 +7456,8 @@ function UserAgentAssistant() {
             danger
             icon={<ArrowRightOutlined />}
             loading={executeMutation.isPending}
-            disabled={(Boolean(executionAnswer) && !failureRecoveryPlanActive)
+                  disabled={(Boolean(executionAnswer) && !failureRecoveryPlanActive)
+              || activeSessionArchived
               || planMutation.isPending
               || showAdvancedClarification
               || (isSyncTaskCreationReview && !failureRecoveryPlanActive && !taskConfigurationReady)
@@ -5660,7 +7469,7 @@ function UserAgentAssistant() {
           <Button
             icon={<StopOutlined />}
             loading={rejectAgentRunMutation.isPending}
-            disabled={executeMutation.isPending || rejectAgentRunMutation.isPending}
+            disabled={activeSessionArchived || executeMutation.isPending || rejectAgentRunMutation.isPending}
             onClick={() => rejectAgentRunMutation.mutate()}
           >
             拒绝本次方案
@@ -5676,10 +7485,15 @@ function UserAgentAssistant() {
           <Alert
             showIcon
             type={executionAnswer.status === "ERROR" ? "error" : "success"}
-            message={executionAnswer.status === "ERROR" ? "本轮执行未完成" : executionAnswer.content}
+            message={executionAnswer.status === "ERROR"
+              ? "本轮执行未完成"
+              : publicAgentSummary(executionAnswer.content, "The governed task was created and submitted.")}
             description={executionAnswer.status === "ERROR" ? (
               <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-                {executionAnswer.content}
+                {publicAgentSummary(
+                  executionAnswer.content,
+                  "The execution did not complete; the retained configuration can be reviewed or repaired.",
+                )}
               </Typography.Paragraph>
             ) : undefined}
           />
@@ -5694,14 +7508,16 @@ function UserAgentAssistant() {
                 <Typography.Text type="secondary">{failure.toolCode}</Typography.Text>
               </Space>
               <Typography.Paragraph style={{ marginBottom: failure.details.length ? 8 : 0 }}>
-                {failure.message}
+                {publicAgentSummary(failure.message, "The governed tool action failed.")}
               </Typography.Paragraph>
               {failure.details.length ? (
                 <div style={{ marginBottom: 8 }}>
                   <Typography.Text strong>具体问题</Typography.Text>
                   <Space direction="vertical" size={2} style={{ display: "flex", marginTop: 4 }}>
                     {failure.details.map((detail) => (
-                      <Typography.Text key={detail}>• {detail}</Typography.Text>
+                      <Typography.Text key={detail}>
+                        • {publicAgentSummary(detail, "A protected detail is available in the governed review flow.")}
+                      </Typography.Text>
                     ))}
                   </Space>
                 </div>
@@ -5711,7 +7527,9 @@ function UserAgentAssistant() {
                   <Typography.Text strong>建议解决方法</Typography.Text>
                   <Space direction="vertical" size={2} style={{ display: "flex", marginTop: 4 }}>
                     {failure.suggestions.map((suggestion) => (
-                      <Typography.Text key={suggestion}>• {suggestion}</Typography.Text>
+                      <Typography.Text key={suggestion}>
+                        • {publicAgentSummary(suggestion, "Review the retained task configuration before continuing.")}
+                      </Typography.Text>
                     ))}
                   </Space>
                 </div>
@@ -5726,7 +7544,10 @@ function UserAgentAssistant() {
               description={(
                 <div>
                   <Typography.Paragraph style={{ marginBottom: 8 }}>
-                    {executionAnswer.repairProposal.summary}
+                    {publicAgentSummary(
+                      executionAnswer.repairProposal.summary,
+                      "Agent prepared a governed repair proposal that still requires review.",
+                    )}
                   </Typography.Paragraph>
                   <Descriptions
                     size="small"
@@ -5763,7 +7584,10 @@ function UserAgentAssistant() {
                   : "Agent 已创建后续诊断 Run")
                 : "Agent 已完成失败分析，但尚未形成可执行修复动作"}
               description={taskNameRepairNeedsRegeneration
-                ? `${executionAnswer.recoveryRunUnavailableReason} 建议名称与当前完整任务配置均已保留；重新生成后仍需你审核确认，系统不会直接保存或执行。`
+                ? `${publicAgentSummary(
+                  executionAnswer.recoveryRunUnavailableReason,
+                  "The previous governed repair run is no longer available.",
+                )} 建议名称与当前完整任务配置均已保留；重新生成后仍需你审核确认，系统不会直接保存或执行。`
                 : executionAnswer.recoveryRunId
                 ? executionAnswer.repairProposal?.kind === "DUPLICATE_TASK_NAME"
                   ? `后续 Run：${executionAnswer.recoveryRunId}。请在上方核对精确名称变更并确认；确认前不会重新保存或执行任务。`
@@ -5781,10 +7605,58 @@ function UserAgentAssistant() {
               style={{ marginTop: 12 }}
             />
           ) : null}
+          {executionAnswer.status === "ERROR" ? (
+            <Space wrap style={{ marginTop: 12 }}>
+              {executionAnswer.recoveryRunId && observedControlPlane ? (
+                <Button
+                  type="primary"
+                  onClick={() => scrollToAgentSection("agent-execution-plan-card")}
+                  disabled={activeSessionArchived}
+                >
+                  查看修复确认入口
+                </Button>
+              ) : (
+                <Button
+                  type="primary"
+                  icon={<RobotOutlined />}
+                  loading={planMutation.isPending}
+                  onClick={continueAgentDiagnosis}
+                  disabled={activeSessionArchived || planMutation.isPending}
+                >
+                  让 Agent 继续诊断
+                </Button>
+              )}
+              <Button
+                icon={<EditOutlined />}
+                onClick={openRetainedAdvancedConfiguration}
+                disabled={activeSessionArchived}
+              >
+                人工补全或修改配置
+              </Button>
+              <Button
+                onClick={() => scrollToAgentSection("agent-conversation-composer")}
+                disabled={activeSessionArchived}
+              >
+                继续补充或纠偏
+              </Button>
+            </Space>
+          ) : null}
           <Space wrap style={{ marginTop: 12 }}>
             {executionAnswer.taskId ? <Tag color="blue">任务 ID：{executionAnswer.taskId}</Tag> : null}
             {executionAnswer.executionId ? <Tag>执行 ID：{executionAnswer.executionId}</Tag> : null}
             {executionAnswer.continuationStatus ? <Tag>诊断状态：{executionAnswer.continuationStatus}</Tag> : null}
+            {executionAnswer.taskId ? (
+              <Button
+                type="link"
+                icon={<FileExcelOutlined />}
+                onClick={() => openSyncTaskDetails({
+                  taskId: executionAnswer.taskId,
+                  executionId: executionAnswer.executionId,
+                })}
+              >
+                查看任务与执行详情
+              </Button>
+            ) : null}
             {executionAnswer.status === "SUCCESS" ? (
               <Button type="primary" icon={<DatabaseOutlined />} onClick={() => navigate("/sync")}>
                 查看同步任务列表
