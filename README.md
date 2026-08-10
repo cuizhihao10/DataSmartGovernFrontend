@@ -131,6 +131,7 @@ OIDC 模式使用 Authorization Code + PKCE，登录后前端只把 `Authorizati
 
 - 每个 Durable Run 都必须经过当前用户的明确确认；续跑发现新的 `WAITING_CONFIRMATION`、`requiresConfirmation=true` 或待审批工具时会停止自动链路，并把新的 Run 留回现有审核入口，不复用首轮确认。
 - Agent Console 的会话、运行、Specialist durable fact 查询都带当前项目范围；切换项目会清理旧的活动选择，避免跨项目复用浏览器缓存。
-- Console 通过 `/api/agent/events/ws` 接收低敏运行事件，使用订阅、ack、断线重连和 REST 回放作为同一运行时间线的实时补偿；原始 prompt、SQL、工具参数、连接信息和模型正文不进入页面。
+- Console 通过运行事件 WebSocket `/api/agent/events/ws` 接收低敏事件。握手协商 `datasmart-agent-events-v1` 子协议；存在 OIDC access token 时，第二个子协议为 `datasmart-bearer-v1.<base64url-access-token>`。令牌不会出现在 URL（包括查询参数）或控制帧中。
+- WebSocket 错误会通过错误回调报告。连接关闭、Socket 不可用或 access token 获取失败时，客户端先进行 REST 回放，再按指数退避重连；REST 回放失败会报告错误并使当前项目范围的运行事件查询失效。订阅、ack 和回放共同补偿同一运行时间线；原始 prompt、SQL、工具参数、连接信息和模型正文不进入页面。
 - DataSync 的 Agent 任务深链只在任务详情成功加载后消费；网关或服务短暂失败提供重试，`401/403/404` 则按项目权限/资源不存在的稳定结果处理。
-- 可执行回归测试：`npm run test:agent-confirmation-gate`、`npm run test:agent-console-live-contract`、`npm run test:data-sync-agent-locator`，以及既有的 `npm run test:agent-control-plane` 和 `npm run test:agent-specialist-audit`。
+- 可执行回归测试：`npm run test:api-adapter-contract`、`npm run test:agent-confirmation-gate`、`npm run test:agent-console-live-contract`、`npm run test:data-sync-agent-locator`，以及既有的 `npm run test:agent-control-plane` 和 `npm run test:agent-specialist-audit`。

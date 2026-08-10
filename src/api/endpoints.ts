@@ -683,13 +683,9 @@ export interface CreateAgentPlanPayload {
   tenant_id?: string;
   project_id?: string;
   actor_id?: string;
-  tenantId?: string | number;
-  projectId?: string | number;
-  actorId?: string | number;
   objective: string;
   variables?: Record<string, unknown>;
   preferred_workload?: string;
-  preferredWorkload?: string;
   locale?: string;
   request_id?: string;
 }
@@ -1066,6 +1062,7 @@ function normalizeAuthorizationSubjectCandidate(value: unknown, index: number): 
 
 function normalizeTaskStatus(value: unknown): LifecycleStatus {
   const status = readString(value, "DRAFT").toUpperCase();
+  const normalizedStatus = status === "SUCCESS" ? "SUCCEEDED" : status;
   const knownStatuses: LifecycleStatus[] = [
     "DRAFT",
     "PENDING",
@@ -1081,7 +1078,9 @@ function normalizeTaskStatus(value: unknown): LifecycleStatus {
     "CANCELLED",
     "ARCHIVED",
   ];
-  return knownStatuses.includes(status as LifecycleStatus) ? (status as LifecycleStatus) : "DRAFT";
+  return knownStatuses.includes(normalizedStatus as LifecycleStatus)
+    ? (normalizedStatus as LifecycleStatus)
+    : "DRAFT";
 }
 
 function normalizeTaskPriority(value: unknown): GovernanceTask["priority"] {

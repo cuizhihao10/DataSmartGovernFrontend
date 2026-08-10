@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host localhost",
     "lint": "eslint .",
+    "test:api-adapter-contract": "node scripts/api-adapter-contract.test.mjs",
     "test:agent-control-plane": "node scripts/agent-control-plane-selection.test.mjs",
     "test:agent-specialist-audit": "node scripts/agent-specialist-audit.test.mjs",
     "test:agent-confirmation-gate": "node scripts/agent-confirmation-gate.test.mjs",
