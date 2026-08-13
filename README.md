@@ -129,7 +129,10 @@ OIDC 模式使用 Authorization Code + PKCE，登录后前端只把 `Authorizati
 
 ## 受治理执行与实时审计（2026-08-09）
 
-- 每个 Durable Run 都必须经过当前用户的明确确认；续跑发现新的 `WAITING_CONFIRMATION`、`requiresConfirmation=true` 或待审批工具时会停止自动链路，并把新的 Run 留回现有审核入口，不复用首轮确认。
+- 首次创建并执行任务仍必须由当前用户明确确认；如果首次确认同时固化了有界 `autopilotPolicy`，后续只允许服务端在原 tenant/project/task、低风险动作白名单、有效期、循环次数、总时长、证据和幂等边界内自动修复与重跑。新的高风险、越权、扩域、授权过期或证据不足 Run 仍会停在 `WAITING_CONFIRMATION`、`WAITING_APPROVAL` 或 `ATTENTION_REQUIRED`，前端不会用旧确认扩大授权。
+- 前端只展示服务端公开的恢复状态与检索投影：`retrievalDecision`、`retrievalStrategy`、`retrievalEvidenceCount`、`retrievalEvidenceDigest`。`SEARCH`/`SKIP` 是模型对是否需要知识检索的决策，不是前端触发 RAG 的开关，也不是执行授权；页面不显示 RAG 正文、原始日志、prompt、SQL、凭据或模型隐藏推理。
+- 已确认的当前执行器只会在首次授权盒内处理低风险 `RETRY_EXECUTION`，以及具有真实 preview、精确 selector 和 durable receipt 的 `APPLY_QUARANTINE`；`CHANGE_SCHEMA`、`CHANGE_CREDENTIAL`、`DELETE_DATA`、`OVERWRITE_TARGET`、`EXPAND_DATA_SCOPE` 始终保留审批停点。`ATTENTION_REQUIRED` 是可继续观察和人工接管的公开状态，不应由浏览器自行重提、扩大授权或假定恢复成功。
+- DataSync 恢复状态中的 `executionId` 表示根失败执行，`currentExecutionId` 表示当前恢复尝试所关联的执行；页面对非终态恢复继续轮询。2026-08-10 的只读 Recovery 历史 E2E 已验证后置 PRECHECK/MONITOR 展示，但 Autopilot 写动作完成后的 durable PRECHECK/MONITOR 复核仍待后端主线和真实 E2E 验证，因此页面不会把它显示成已完成保证。
 - Agent Console 的会话、运行、Specialist durable fact 查询都带当前项目范围；切换项目会清理旧的活动选择，避免跨项目复用浏览器缓存。
 - Console 通过运行事件 WebSocket `/api/agent/events/ws` 接收低敏事件。握手协商 `datasmart-agent-events-v1` 子协议；存在 OIDC access token 时，第二个子协议为 `datasmart-bearer-v1.<base64url-access-token>`。令牌不会出现在 URL（包括查询参数）或控制帧中。
 - WebSocket 错误会通过错误回调报告。连接关闭、Socket 不可用或 access token 获取失败时，客户端先进行 REST 回放，再按指数退避重连；REST 回放失败会报告错误并使当前项目范围的运行事件查询失效。订阅、ack 和回放共同补偿同一运行时间线；原始 prompt、SQL、工具参数、连接信息和模型正文不进入页面。

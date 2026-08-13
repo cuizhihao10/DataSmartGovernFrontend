@@ -9,8 +9,11 @@ import {
   routePolicies,
   serviceHealth,
 } from "@/api/mockData";
+import { DEFAULT_AUTOPILOT_POLICY } from "@/types/domain";
 import type {
   ApprovalCenterRecord,
+  AutopilotPolicyInput,
+  AutopilotSnapshot,
   AgentModelRoute,
   AgentObservationTimeline,
   AgentPlanCore,
@@ -69,6 +72,7 @@ import type {
   SyncExecutionLog,
   SyncExecutionPolicy,
   SyncExecutionPolicySnapshot,
+  SyncAutopilotRecoveryStatus,
   SyncIncident,
   SyncObjectExecution,
   SyncTaskBatchOperationResult,
@@ -425,7 +429,18 @@ export interface SyncTaskDefinitionPayload {
   timeoutPolicy?: string;
 }
 
-export interface SyncTaskCreateWizardDraftPayload extends Omit<SyncTaskDefinitionPayload, "name"> {
+/**
+ * Exact request body accepted by the progressive data-sync draft endpoint.
+ *
+ * The backend derives primary-key and incremental-field facts during precheck,
+ * so the browser must not imply that this draft-save API accepts manual values
+ * for either field. Keeping that boundary in the type prevents a future form
+ * change from silently sending properties that the current Java DTO ignores.
+ */
+export interface SyncTaskCreateWizardDraftPayload extends Omit<
+  SyncTaskDefinitionPayload,
+  "name" | "primaryKeyField" | "incrementalField"
+> {
   taskId?: number;
   stepCode?: string;
   taskName?: string;
@@ -746,6 +761,8 @@ export interface ConfirmAgentRunPayload {
   comment?: string;
   /** Stable retry key for one durable Run confirmation boundary. */
   idempotencyKey?: string;
+  /** Only the initial user confirmation may create this server-enforced policy. */
+  autopilotPolicy?: AutopilotPolicyInput;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -814,6 +831,51 @@ function readActionArray(value: unknown) {
     .split(",")
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
+}
+
+/**
+ * Normalize only the public AUTOPILOT state needed by the browser. Tool arguments,
+ * backend policy internals, and privileged resource scopes intentionally stay out of
+ * this DTO even when a rolling backend exposes extra fields.
+ */
+function normalizeAutopilotSnapshot(value: unknown): AutopilotSnapshot | undefined {
+  const record = readRecord(value);
+  if (!Object.keys(record).length) return undefined;
+  const nestedPolicy = readRecord(record.policy ?? record.autopilotPolicy ?? record.autopilot_policy);
+  const source = { ...nestedPolicy, ...record };
+  const executionMode = readString(
+    source.executionMode ?? source.execution_mode,
+    "AUTOPILOT",
+  ).toUpperCase();
+  const maxRecoveryCycles = Math.max(1, readNumber(
+    source.maxRecoveryCycles ?? source.max_recovery_cycles,
+    DEFAULT_AUTOPILOT_POLICY.maxRecoveryCycles,
+  ));
+  return {
+    policyId: readOptionalString(source.policyId ?? source.policy_id),
+    policyVersion: readOptionalString(source.policyVersion ?? source.policy_version),
+    executionMode: executionMode === "AUTOPILOT" ? "AUTOPILOT" : undefined,
+    state: readString(source.state ?? source.status, "ACTIVE").toUpperCase(),
+    rootSessionId: readOptionalString(source.rootSessionId ?? source.root_session_id),
+    rootRunId: readOptionalString(source.rootRunId ?? source.root_run_id),
+    maxRecoveryCycles,
+    maxTotalDurationMinutes: Math.max(5, readNumber(
+      source.maxTotalDurationMinutes ?? source.max_total_duration_minutes,
+      DEFAULT_AUTOPILOT_POLICY.maxTotalDurationMinutes,
+    )),
+    maxAutomaticRiskLevel: normalizeRisk(
+      source.maxAutomaticRiskLevel ?? source.max_automatic_risk_level,
+    ),
+    allowedRecoveryActions: readStringArray(
+      source.allowedRecoveryActions
+      ?? source.allowed_recovery_actions,
+    ),
+    requireApprovalFor: readStringArray(
+      source.requireApprovalFor ?? source.require_approval_for,
+    ),
+    issuedAt: readOptionalString(source.issuedAt ?? source.issued_at),
+    expiresAt: readOptionalString(source.expiresAt ?? source.expires_at),
+  };
 }
 
 function readOptionalString(value: unknown) {
@@ -1458,6 +1520,56 @@ function normalizeSyncExecution(value: unknown, index: number): SyncExecution {
   };
 }
 
+/**
+ * Convert the public Autopilot recovery response into the small shape used by DataSync.
+ *
+ * A recovery case can be absent for an execution, and rolling backends can return
+ * incomplete data while a case is being created. This adapter therefore accepts only
+ * the documented low-sensitive fields and treats every missing or malformed value as
+ * absent. It deliberately ignores authorization material, event payloads, raw logs,
+ * and model output even if a server accidentally includes them.
+ */
+function normalizeSyncAutopilotRecoveryStatus(value: unknown): SyncAutopilotRecoveryStatus {
+  const record = readRecord(value);
+  return {
+    available: readOptionalBoolean(record.available) ?? false,
+    syncTaskId: readOptionalNumber(record.syncTaskId ?? record.sync_task_id),
+    rootExecutionId: readOptionalNumber(record.rootExecutionId ?? record.root_execution_id),
+    currentExecutionId: readOptionalNumber(record.currentExecutionId ?? record.current_execution_id),
+    executionState: readOptionalString(record.executionState ?? record.execution_state)?.toUpperCase(),
+    executionFinishedAt: readOptionalString(record.executionFinishedAt ?? record.execution_finished_at),
+    caseId: readOptionalNumber(record.caseId ?? record.case_id),
+    caseState: readOptionalString(record.caseState ?? record.case_state)?.toUpperCase(),
+    cycle: readOptionalNumber(record.cycle),
+    maxCycles: readOptionalNumber(record.maxCycles ?? record.max_cycles),
+    recoveryAction: readOptionalString(record.recoveryAction ?? record.recovery_action)?.toUpperCase(),
+    riskLevel: readOptionalString(record.riskLevel ?? record.risk_level)?.toUpperCase(),
+    attentionReason: readOptionalString(record.attentionReason ?? record.attention_reason),
+    deadlineAt: readOptionalString(record.deadlineAt ?? record.deadline_at),
+    version: readOptionalNumber(record.version),
+    caseCreatedAt: readOptionalString(record.caseCreatedAt ?? record.case_created_at),
+    caseUpdatedAt: readOptionalString(record.caseUpdatedAt ?? record.case_updated_at),
+    outboxState: readOptionalString(record.outboxState ?? record.outbox_state)?.toUpperCase(),
+    outboxAttemptCount: readOptionalNumber(record.outboxAttemptCount ?? record.outbox_attempt_count),
+    outboxMaxAttemptCount: readOptionalNumber(record.outboxMaxAttemptCount ?? record.outbox_max_attempt_count),
+    outboxLastErrorCode: readOptionalString(record.outboxLastErrorCode ?? record.outbox_last_error_code),
+    producerDeliveryStatus: readOptionalString(record.producerDeliveryStatus ?? record.producer_delivery_status)?.toUpperCase(),
+    producerDeliveryReasonCode: readOptionalString(record.producerDeliveryReasonCode ?? record.producer_delivery_reason_code),
+    consumerResultStatus: readOptionalString(record.consumerResultStatus ?? record.consumer_result_status)?.toUpperCase(),
+    consumerResultReasonCode: readOptionalString(record.consumerResultReasonCode ?? record.consumer_result_reason_code),
+    consumerResultAt: readOptionalString(record.consumerResultAt ?? record.consumer_result_at),
+    retrievalDecision: readOptionalString(record.retrievalDecision ?? record.retrieval_decision)?.toUpperCase(),
+    retrievalStrategy: readOptionalString(record.retrievalStrategy ?? record.retrieval_strategy)?.toUpperCase(),
+    retrievalEvidenceCount: readOptionalNumber(record.retrievalEvidenceCount ?? record.retrieval_evidence_count),
+    retrievalEvidenceDigest: readOptionalString(record.retrievalEvidenceDigest ?? record.retrieval_evidence_digest),
+    quarantineSelectedCount: readOptionalNumber(record.quarantineSelectedCount ?? record.quarantine_selected_count),
+    quarantineAffectedCount: readOptionalNumber(record.quarantineAffectedCount ?? record.quarantine_affected_count),
+    quarantineOperationState: readOptionalString(record.quarantineOperationState ?? record.quarantine_operation_state)?.toUpperCase(),
+    quarantineReceiptState: readOptionalString(record.quarantineReceiptState ?? record.quarantine_receipt_state)?.toUpperCase(),
+    quarantineUpdatedAt: readOptionalString(record.quarantineUpdatedAt ?? record.quarantine_updated_at),
+  };
+}
+
 function normalizeSyncExecutionLog(value: unknown, index: number): SyncExecutionLog {
   const record = isRecord(value) ? value : {};
   return {
@@ -1941,6 +2053,7 @@ function normalizeAgentExecutionMode(value: unknown) {
   const modeMap: Record<string, string> = {
     ASYNC: "ASYNC",
     ASYNC_TASK: "ASYNC_TASK",
+    AUTOPILOT: "AUTOPILOT",
     DRAFT_ONLY: "DRAFT_ONLY",
     APPROVAL_REQUIRED: "APPROVAL_REQUIRED",
     HUMAN_APPROVAL: "HUMAN_APPROVAL",
@@ -2009,6 +2122,7 @@ function normalizeAgentToolBinding(value: unknown, index: number): AgentToolBind
 
 function normalizeAgentRun(value: unknown, index: number): AgentRun {
   const record = isRecord(value) ? value : {};
+  const variables = readRecord(record.variables ?? record.run_variables);
   return {
     runId: readString(record.runId ?? record.run_id, `run-${index + 1}`),
     sessionId: readString(record.sessionId ?? record.session_id),
@@ -2018,7 +2132,11 @@ function normalizeAgentRun(value: unknown, index: number): AgentRun {
     dryRun: readBoolean(record.dryRun ?? record.dry_run, true),
     requireHumanApproval: readBoolean(record.requireHumanApproval ?? record.require_human_approval),
     nextActions: readStringArray(record.nextActions ?? record.next_actions),
-    variables: readRecord(record.variables ?? record.run_variables),
+    variables,
+    autopilotSnapshot: normalizeAutopilotSnapshot(
+      variables.autopilotAuthorization
+      ?? variables.autopilot_authorization,
+    ),
     createTime: readOptionalString(record.createTime ?? record.create_time),
     updateTime: readOptionalString(record.updateTime ?? record.update_time),
     finishTime: readOptionalString(record.finishTime ?? record.finish_time),
@@ -2209,6 +2327,7 @@ function normalizeAgentSession(value: unknown, index: number): AgentSession {
     ?? record.message_list;
   const rawToolBindings = record.toolBindings ?? record.tool_bindings ?? record.bindings;
   const delegation = readFirstRecord(record, "delegation", "delegationSnapshot", "delegation_snapshot");
+  const runs = Array.isArray(rawRuns) ? rawRuns.map(normalizeAgentRun) : [];
   return {
     sessionId: readString(record.sessionId ?? record.session_id, `session-${index + 1}`),
     agentId: readOptionalString(record.agentId ?? record.agent_id),
@@ -2223,7 +2342,8 @@ function normalizeAgentSession(value: unknown, index: number): AgentSession {
     toolBindings: Array.isArray(rawToolBindings)
       ? rawToolBindings.map(normalizeAgentToolBinding)
       : [],
-    runs: Array.isArray(rawRuns) ? rawRuns.map(normalizeAgentRun) : [],
+    runs,
+    autopilotSnapshot: [...runs].reverse().map((run) => run.autopilotSnapshot).find(Boolean),
     delegation: Object.keys(delegation).length ? {
       delegationId: readString(delegation.delegationId ?? delegation.delegation_id),
       agentId: readString(delegation.agentId ?? delegation.agent_id),
@@ -2786,6 +2906,13 @@ function normalizeAgentToolExecutionFailure(value: unknown, index: number): Agen
   };
 }
 
+/**
+ * Converts the confirmation response into the stable shape used by the page.
+ *
+ * The backend supplies `autopilotSnapshot` as a safe public view of persisted
+ * authorization. It can describe the current recovery boundary, but it is not
+ * a browser-issued permission to execute another Agent Run.
+ */
 function normalizeAgentRunConfirmedExecutionResponse(
   value: unknown,
 ): AgentRunConfirmedExecutionResponse {
@@ -2821,6 +2948,9 @@ function normalizeAgentRunConfirmedExecutionResponse(
       record.modelProviderStatus ?? record.model_provider_status,
     ),
     ...(continuation ? { continuation } : {}),
+    autopilotSnapshot: normalizeAutopilotSnapshot(
+      record.autopilotSnapshot ?? record.autopilot_snapshot,
+    ),
   };
 }
 
@@ -3320,6 +3450,19 @@ export const api = {
       `/sync/sync-tasks/${taskId}/executions/${executionId}/policy-snapshot`,
     );
     return { ...result, data: normalizeSyncExecutionPolicySnapshot(result.data) };
+  },
+  /**
+   * Read the server-owned Autopilot recovery summary for one execution.
+   *
+   * This is a read-only observability call. The browser uses it only to explain
+   * what the control plane has already recorded; it never sends the response back
+   * as a recovery command, authorization, or retry request.
+   */
+  getSyncAutopilotRecoveryStatus: async (taskId: number, executionId: number) => {
+    const result = await request<unknown>(
+      `/sync/sync-tasks/${taskId}/executions/${executionId}/autopilot-recovery`,
+    );
+    return { ...result, data: normalizeSyncAutopilotRecoveryStatus(result.data) };
   },
   listSyncObjectExecutions: (taskId: number, executionId: number) =>
     pageEndpoint<SyncObjectExecution>(

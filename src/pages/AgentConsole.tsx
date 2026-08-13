@@ -64,6 +64,7 @@ import type {
   AgentRagQueryResult,
   AgentRun,
   AgentSession,
+  AutopilotSnapshot,
   AgentSpecialistTurnFact,
   AgentTool,
   AgentToolExecutionAudit,
@@ -96,6 +97,11 @@ const runStateColor: Record<string, string> = {
   RUNNING: "processing",
   WAITING_HUMAN: "gold",
   WAITING_APPROVAL: "gold",
+  ACTIVE: "blue",
+  RECOVERING: "processing",
+  ATTENTION_REQUIRED: "volcano",
+  EXPIRED: "default",
+  COMPLETED: "success",
   SUCCEEDED: "success",
   FAILED: "error",
   CANCELLED: "default",
@@ -251,6 +257,16 @@ function modeTag(value?: string) {
 function statusTag(value?: string) {
   const state = value || "UNKNOWN";
   return <Tag color={runStateColor[state] ?? "default"}>{labelOf(state, statusLabels)}</Tag>;
+}
+
+function autopilotStatusTag(snapshot?: AutopilotSnapshot) {
+  if (!snapshot) return "-";
+  return (
+    <Space size={4} wrap>
+      {statusTag(snapshot.state)}
+      <Typography.Text type="secondary">最多 {snapshot.maxRecoveryCycles} 轮</Typography.Text>
+    </Space>
+  );
 }
 
 function workloadToPython(value?: string) {
@@ -839,6 +855,7 @@ export function AgentConsole() {
       ),
     },
     { title: "状态", dataIndex: "state", render: statusTag },
+    { title: "自动恢复", render: (_, record) => autopilotStatusTag(record.autopilotSnapshot) },
     { title: "任务类型", dataIndex: "workloadType", render: (value) => labelOf(value, agentWorkloadLabels) },
     { title: "人工确认", dataIndex: "requireHumanApproval", render: (value) => <BooleanTag value={Boolean(value)} trueLabel="需要" falseLabel="不需要" /> },
     { title: "创建时间", dataIndex: "createTime", render: (value) => formatDateTime(value) },

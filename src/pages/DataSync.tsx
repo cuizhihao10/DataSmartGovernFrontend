@@ -91,6 +91,7 @@ import type {
   SyncExecution,
   SyncExecutionLog,
   SyncExecutionPolicy,
+  SyncAutopilotRecoveryStatus,
   SyncIncident,
   SyncObjectExecution,
   SyncTask,
@@ -110,6 +111,7 @@ import {
   labelOf,
   optionsOf,
   priorityLabels,
+  riskLabels,
   statusLabels,
   syncExecutionStateLabels,
   syncModeLabels,
@@ -244,6 +246,61 @@ const stateColor: Record<string, string> = {
   ARCHIVED: "default",
   DELETED: "default",
   SKIPPED: "default",
+};
+
+const autopilotRecoveryCaseStateLabels: Record<string, string> = {
+  AUTO_APPROVED: "自动批准",
+  WAITING_APPROVAL: "等待审批",
+  MANUALLY_APPROVED: "已人工批准",
+  RECOVERY_STARTED: "恢复已启动",
+  RECOVERED: "已恢复",
+  REJECTED: "已拒绝",
+  ATTENTION_REQUIRED: "需要人工处理",
+  CANCELLED: "已取消",
+};
+
+const autopilotRecoveryCaseStateColor: Record<string, string> = {
+  AUTO_APPROVED: "blue",
+  WAITING_APPROVAL: "gold",
+  MANUALLY_APPROVED: "cyan",
+  RECOVERY_STARTED: "processing",
+  RECOVERED: "success",
+  REJECTED: "error",
+  ATTENTION_REQUIRED: "volcano",
+  CANCELLED: "default",
+};
+
+const autopilotRecoveryOutboxLabels: Record<string, string> = {
+  PENDING: "待投递",
+  DISPATCHING: "投递中",
+  RETRY_WAIT: "等待重试",
+  DELIVERED: "已投递",
+  DEAD_LETTER: "死信",
+};
+
+const autopilotRecoveryOutboxColor: Record<string, string> = {
+  PENDING: "cyan",
+  DISPATCHING: "processing",
+  RETRY_WAIT: "gold",
+  DELIVERED: "success",
+  DEAD_LETTER: "error",
+};
+
+const autopilotRecoveryConsumerLabels: Record<string, string> = {
+  ...autopilotRecoveryCaseStateLabels,
+  FAILED: "处理失败",
+};
+
+const autopilotRecoveryConsumerColor: Record<string, string> = {
+  ...autopilotRecoveryCaseStateColor,
+  FAILED: "error",
+};
+
+const autopilotRecoveryRiskColor: Record<string, string> = {
+  LOW: "green",
+  MEDIUM: "blue",
+  HIGH: "orange",
+  CRITICAL: "red",
 };
 
 const executionLogLevelColor: Record<string, string> = {
@@ -728,6 +785,17 @@ function syncGroupVisibleCount(node: UiSyncTaskGroupTreeNode, field: keyof UiSyn
 
 function statusTag(value: string, colorMap: Record<string, string>, labels: Record<string, string> = statusLabels) {
   return <Tag color={colorMap[value] ?? "default"}>{labelOf(value, labels)}</Tag>;
+}
+
+/**
+ * Tell the detail page whether the server has closed the normal recovery lifecycle.
+ *
+ * This is presentation-only classification. The backend remains the authority for
+ * whether a case can transition, so an unfamiliar or missing state stays nonterminal
+ * instead of the browser guessing that recovery has finished.
+ */
+function isTerminalAutopilotRecoveryCase(caseState?: SyncAutopilotRecoveryStatus["caseState"]) {
+  return ["RECOVERED", "REJECTED", "CANCELLED"].includes(String(caseState ?? "").toUpperCase());
 }
 
 function codeFromDataSourceType(type?: string) {
@@ -1259,10 +1327,22 @@ export function DataSync() {
     queryFn: () => api.getSyncExecutionPolicySnapshot(selectedTask!.id, selectedExecutionId!),
     enabled: Boolean(selectedTask?.id && selectedExecutionId && taskDrawerActiveTab === "logs"),
   });
+  const autopilotRecoveryQuery = useQuery({
+    queryKey: ["sync-autopilot-recovery-status", selectedTask?.id, selectedExecutionId],
+    queryFn: () => api.getSyncAutopilotRecoveryStatus(selectedTask!.id, selectedExecutionId!),
+    enabled: Boolean(selectedTask?.id && selectedExecutionId && taskDrawerActiveTab === "logs"),
+    refetchInterval: (query) => {
+      const recovery = query.state.data?.data;
+      return selectedExecutionIsLive || (recovery?.available && !isTerminalAutopilotRecoveryCase(recovery.caseState))
+        ? 3000
+        : false;
+    },
+  });
   const objectExecutions = useMemo(() => sortByIdDesc(objectExecutionQuery.data?.data.records), [objectExecutionQuery.data?.data.records]);
   const executionLogs = useMemo(() => sortByIdDesc(executionLogQuery.data?.data.records), [executionLogQuery.data?.data.records]);
   const executionPolicies = useMemo(() => sortByIdDesc(executionPolicyQuery.data?.data.records), [executionPolicyQuery.data?.data.records]);
   const executionPolicySnapshot = executionPolicySnapshotQuery.data?.data;
+  const autopilotRecoveryStatus = autopilotRecoveryQuery.data?.data;
   const errorSamples = useMemo(() => sortByIdDesc(errorSampleQuery.data?.data.records), [errorSampleQuery.data?.data.records]);
   const checkpoints = useMemo(() => sortByIdDesc(checkpointQuery.data?.data.records), [checkpointQuery.data?.data.records]);
   const auditRecords = useMemo(() => sortByIdDesc(auditQuery.data?.data.records), [auditQuery.data?.data.records]);
@@ -3016,6 +3096,9 @@ export function DataSync() {
       activeTab === "executionPolicies" ? executionPolicyTaskQuery.refetch() : Promise.resolve(),
       selectedTask && selectedExecutionId && taskDrawerActiveTab === "logs"
         ? executionPolicySnapshotQuery.refetch()
+        : Promise.resolve(),
+      selectedTask && selectedExecutionId && taskDrawerActiveTab === "logs"
+        ? autopilotRecoveryQuery.refetch()
         : Promise.resolve(),
       selectedTask ? errorSampleQuery.refetch() : Promise.resolve(),
       selectedTask ? checkpointQuery.refetch() : Promise.resolve(),
@@ -6175,6 +6258,208 @@ export function DataSync() {
                             </div>
                           ) : (
                             <RealEmpty description="尚未加载执行策略快照" />
+                          )}
+                        </Card>
+                      ) : null}
+                      {selectedExecutionId ? (
+                        <Card
+                          className="compact-card"
+                          title={`Autopilot 恢复状态 · execution #${selectedExecutionId}`}
+                          loading={autopilotRecoveryQuery.isLoading || autopilotRecoveryQuery.isFetching}
+                        >
+                          {autopilotRecoveryQuery.isError ? (
+                            <Alert
+                              showIcon
+                              type="warning"
+                              message="当前执行记录的 Autopilot 恢复状态暂不可读取"
+                              description={
+                                autopilotRecoveryQuery.error instanceof Error
+                                  ? autopilotRecoveryQuery.error.message
+                                  : "恢复状态接口暂时不可用。该卡片只展示服务端公开的低敏恢复事实。"
+                              }
+                            />
+                          ) : autopilotRecoveryStatus?.available ? (
+                            <div className="page-stack">
+                              <Alert
+                                showIcon
+                                type={isTerminalAutopilotRecoveryCase(autopilotRecoveryStatus.caseState) ? "success" : "info"}
+                                message={isTerminalAutopilotRecoveryCase(autopilotRecoveryStatus.caseState)
+                                  ? "恢复生命周期已进入终态"
+                                  : "恢复状态由服务端持续更新"}
+                                description="这里仅展示已公开的控制面事实与低敏检索摘要，不展示授权内容、事件标识、原始日志、RAG 正文或模型文本。"
+                              />
+                              <Descriptions bordered size="small" column={3}>
+                                <Descriptions.Item label="状态可用">
+                                  <BooleanTag value={autopilotRecoveryStatus.available} trueLabel="可读取" falseLabel="不可用" />
+                                </Descriptions.Item>
+                                <Descriptions.Item label="恢复案例状态">
+                                  {autopilotRecoveryStatus.caseState
+                                    ? statusTag(
+                                      autopilotRecoveryStatus.caseState,
+                                      autopilotRecoveryCaseStateColor,
+                                      autopilotRecoveryCaseStateLabels,
+                                    )
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="是否终态">
+                                  <BooleanTag
+                                    value={isTerminalAutopilotRecoveryCase(autopilotRecoveryStatus.caseState)}
+                                    trueLabel="已结束"
+                                    falseLabel="未结束"
+                                  />
+                                </Descriptions.Item>
+                                <Descriptions.Item label="恢复轮次">
+                                  {autopilotRecoveryStatus.cycle ?? "-"} / {autopilotRecoveryStatus.maxCycles ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="恢复动作">
+                                  {autopilotRecoveryStatus.recoveryAction
+                                    ? <Tag>{autopilotRecoveryStatus.recoveryAction}</Tag>
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="风险等级">
+                                  {autopilotRecoveryStatus.riskLevel
+                                    ? statusTag(
+                                      autopilotRecoveryStatus.riskLevel,
+                                      autopilotRecoveryRiskColor,
+                                      riskLabels,
+                                    )
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="当前执行状态">
+                                  {autopilotRecoveryStatus.executionState
+                                    ? statusTag(autopilotRecoveryStatus.executionState, stateColor, syncExecutionStateLabels)
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="恢复截止时间">
+                                  {formatDateTime(autopilotRecoveryStatus.deadlineAt)}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="执行完成时间">
+                                  {formatDateTime(autopilotRecoveryStatus.executionFinishedAt)}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="关注原因" span={3}>
+                                  {autopilotRecoveryStatus.attentionReason || "-"}
+                                </Descriptions.Item>
+                              </Descriptions>
+                              <Descriptions bordered size="small" column={3} title="模型检索决策">
+                                <Descriptions.Item label="检索决策">
+                                  {autopilotRecoveryStatus.retrievalDecision
+                                    ? <Tag color={autopilotRecoveryStatus.retrievalDecision === "SEARCH" ? "blue" : "default"}>
+                                      {autopilotRecoveryStatus.retrievalDecision}
+                                    </Tag>
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="检索策略">
+                                  {autopilotRecoveryStatus.retrievalStrategy
+                                    ? <Tag>{autopilotRecoveryStatus.retrievalStrategy}</Tag>
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="证据数量">
+                                  {autopilotRecoveryStatus.retrievalEvidenceCount ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="证据摘要" span={3}>
+                                  {autopilotRecoveryStatus.retrievalEvidenceDigest || "-"}
+                                </Descriptions.Item>
+                              </Descriptions>
+                              <Descriptions bordered size="small" column={3} title="可靠投递与消费者结果">
+                                <Descriptions.Item label="Outbox 状态">
+                                  {autopilotRecoveryStatus.outboxState
+                                    ? statusTag(
+                                      autopilotRecoveryStatus.outboxState,
+                                      autopilotRecoveryOutboxColor,
+                                      autopilotRecoveryOutboxLabels,
+                                    )
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="Outbox 尝试">
+                                  {autopilotRecoveryStatus.outboxAttemptCount ?? "-"} / {autopilotRecoveryStatus.outboxMaxAttemptCount ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="最后错误码">
+                                  {autopilotRecoveryStatus.outboxLastErrorCode || "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="Producer 投递状态">
+                                  {autopilotRecoveryStatus.producerDeliveryStatus
+                                    ? statusTag(
+                                      autopilotRecoveryStatus.producerDeliveryStatus,
+                                      autopilotRecoveryConsumerColor,
+                                      autopilotRecoveryConsumerLabels,
+                                    )
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="Producer 投递原因">
+                                  {autopilotRecoveryStatus.producerDeliveryReasonCode || "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="消费者结果">
+                                  {autopilotRecoveryStatus.consumerResultStatus
+                                    ? statusTag(
+                                      autopilotRecoveryStatus.consumerResultStatus,
+                                      autopilotRecoveryConsumerColor,
+                                      autopilotRecoveryConsumerLabels,
+                                    )
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="消费者原因码">
+                                  {autopilotRecoveryStatus.consumerResultReasonCode || "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="消费者确认时间">
+                                  {formatDateTime(autopilotRecoveryStatus.consumerResultAt)}
+                                </Descriptions.Item>
+                              </Descriptions>
+                              <Descriptions bordered size="small" column={3} title="隔离处置回执">
+                                <Descriptions.Item label="选中记录数">
+                                  {autopilotRecoveryStatus.quarantineSelectedCount ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="受影响记录数">
+                                  {autopilotRecoveryStatus.quarantineAffectedCount ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="应用状态">
+                                  {autopilotRecoveryStatus.quarantineOperationState
+                                    ? <Tag>{autopilotRecoveryStatus.quarantineOperationState}</Tag>
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="回执状态">
+                                  {autopilotRecoveryStatus.quarantineReceiptState
+                                    ? <Tag>{autopilotRecoveryStatus.quarantineReceiptState}</Tag>
+                                    : "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="回执更新时间" span={2}>
+                                  {formatDateTime(autopilotRecoveryStatus.quarantineUpdatedAt)}
+                                </Descriptions.Item>
+                              </Descriptions>
+                              <Descriptions bordered size="small" column={3} title="案例定位">
+                                <Descriptions.Item label="案例 ID">
+                                  {autopilotRecoveryStatus.caseId ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="根执行 ID">
+                                  {autopilotRecoveryStatus.rootExecutionId ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="当前执行 ID">
+                                  {autopilotRecoveryStatus.currentExecutionId ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="案例版本">
+                                  {autopilotRecoveryStatus.version ?? "-"}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="案例创建时间">
+                                  {formatDateTime(autopilotRecoveryStatus.caseCreatedAt)}
+                                </Descriptions.Item>
+                                <Descriptions.Item label="案例更新时间">
+                                  {formatDateTime(autopilotRecoveryStatus.caseUpdatedAt)}
+                                </Descriptions.Item>
+                              </Descriptions>
+                            </div>
+                          ) : (
+                            <div className="page-stack">
+                              <Descriptions bordered size="small" column={3}>
+                                <Descriptions.Item label="状态可用">
+                                  <BooleanTag value={autopilotRecoveryStatus?.available ?? false} trueLabel="可读取" falseLabel="不可用" />
+                                </Descriptions.Item>
+                              </Descriptions>
+                              <Alert
+                                showIcon
+                                type="info"
+                                message="当前执行尚无可展示的 Autopilot 恢复状态"
+                                description="服务端尚未为该 execution 创建公开恢复状态，或该执行不在 Autopilot 恢复流程中。"
+                              />
+                            </div>
                           )}
                         </Card>
                       ) : null}

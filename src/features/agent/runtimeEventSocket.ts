@@ -277,6 +277,21 @@ function mergeCursorMaps(...values: unknown[]): Record<string, number> {
   }, {});
 }
 
+/**
+ * Compare source-level replay bookmarks by value instead of object identity.
+ *
+ * `sourceCursors` belong to external sources such as the Java runtime-event
+ * projection, Redis Streams, or Kafka.  An envelope can advance one of these
+ * bookmarks without adding a browser-facing event or global sequence number.
+ * The client therefore needs an explicit value comparison to decide whether it
+ * must acknowledge the new bookmark and preserve it for the next reconnect.
+ */
+function cursorMapsEqual(left: Record<string, number>, right: Record<string, number>): boolean {
+  const leftEntries = Object.entries(left);
+  if (leftEntries.length !== Object.keys(right).length) return false;
+  return leftEntries.every(([key, cursor]) => right[key] === cursor);
+}
+
 function normalizedScope(scope: RuntimeEventProjectionScope): RuntimeEventProjectionScope {
   return {
     ...scope,
@@ -626,6 +641,7 @@ export function createAgentRuntimeEventSocket(
   let lastSequence = normalizeSequence(subscription.afterSequence);
   let sourceCursors = normalizeCursorMap(subscription.sourceCursors);
   let lastAckSequence = lastSequence;
+  let lastAcknowledgedSourceCursors = { ...sourceCursors };
   let reconnectAttempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -665,25 +681,48 @@ export function createAgentRuntimeEventSocket(
     }
   };
 
+  /**
+   * Acknowledge both coordinates of the replay protocol.
+   *
+   * `lastSequence` is the browser's presentation sequence, while
+   * `sourceCursors` are source-owned bookmarks.  Either coordinate can move
+   * independently, so only checking the global sequence would lose an empty
+   * external replay page and make the next reconnect request it again.
+   */
   const acknowledge = () => {
-    if (!subscriptionId || lastSequence <= lastAckSequence) return;
+    const sequenceAdvanced = lastSequence > lastAckSequence;
+    const sourceCursorsChanged = !cursorMapsEqual(sourceCursors, lastAcknowledgedSourceCursors);
+    if (!subscriptionId || (!sequenceAdvanced && !sourceCursorsChanged)) return;
     if (send(buildAckMessage(subscriptionId, lastSequence, sourceCursors))) {
       lastAckSequence = lastSequence;
+      lastAcknowledgedSourceCursors = { ...sourceCursors };
     }
   };
 
+  /**
+   * Apply one replay or live envelope to the local subscription state.
+   *
+   * The server may return a source cursor even when its visibility policy
+   * filtered every event from the page.  Update the cursor before deciding
+   * whether there is anything to render, then acknowledge it when a socket is
+   * available.  This keeps external replay sources incremental without showing
+   * hidden events or inventing a UI event for an empty envelope.
+   */
   const acceptEnvelope = (
     envelope: ProjectedRuntimeEventEnvelope,
     source: "websocket" | "replay",
     generation: number,
   ) => {
     if (closed || generation !== connectionGeneration) return;
-    if (!envelope.events.length && envelope.lastSequence == null) return;
-    const nextSequence = envelope.lastSequence ?? 0;
-    if (nextSequence > lastSequence) lastSequence = nextSequence;
-    sourceCursors = mergeCursorMaps(sourceCursors, envelope.sourceCursors);
+    const nextSequence = envelope.lastSequence ?? lastSequence;
+    const sequenceAdvanced = nextSequence > lastSequence;
+    const mergedSourceCursors = mergeCursorMaps(sourceCursors, envelope.sourceCursors);
+    const sourceCursorsChanged = !cursorMapsEqual(sourceCursors, mergedSourceCursors);
+    if (sequenceAdvanced) lastSequence = nextSequence;
+    sourceCursors = mergedSourceCursors;
     subscription.afterSequence = lastSequence;
     subscription.sourceCursors = sourceCursors;
+    if (!envelope.events.length && !sequenceAdvanced && !sourceCursorsChanged) return;
     if (envelope.events.length) {
       options.onEvents(envelope.events, { envelope, source });
     }
@@ -738,6 +777,9 @@ export function createAgentRuntimeEventSocket(
     if (closed || generation !== connectionGeneration) return;
     clearHeartbeat();
     connection = undefined;
+    // A physical socket close also destroys the server-side subscription. Never
+    // reconnect it by ID: retain replay cursors, then establish a new subscription.
+    subscriptionId = undefined;
     void replayFromRest(reason, generation).finally(() => scheduleReconnect(reason, generation));
   };
 

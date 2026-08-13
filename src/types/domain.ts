@@ -17,6 +17,76 @@ export type LifecycleStatus =
   | "ARCHIVED";
 
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export type AutopilotState = string;
+
+/**
+ * 用户首次确认 Durable Run 时提交给 Agent Runtime 的自动恢复边界。
+ *
+ * 该对象完全对应 `AgentAutopilotPolicyRequest`。后端会重新校验动作白名单、
+ * 风险级别和授权范围；浏览器不会根据它自行执行下一 Run。
+ */
+export interface AutopilotPolicyInput {
+  executionMode: "AUTOPILOT";
+  maxRecoveryCycles: number;
+  maxTotalDurationMinutes: number;
+  maxAutomaticRiskLevel: "LOW";
+  allowedRecoveryActions: string[];
+  requireApprovalFor: string[];
+  expiresAt?: string;
+}
+
+/** Browser-only switch wrapped around the exact backend authorization payload. */
+export interface AutopilotPolicyDraft extends AutopilotPolicyInput {
+  enabled: boolean;
+}
+
+/** 后端持久化在 Agent Run variables 中的低敏 AUTOPILOT 授权快照。 */
+export interface AutopilotSnapshot {
+  policyId?: string;
+  policyVersion?: string;
+  executionMode?: "AUTOPILOT";
+  state: AutopilotState;
+  rootSessionId?: string;
+  rootRunId?: string;
+  maxRecoveryCycles: number;
+  maxTotalDurationMinutes: number;
+  maxAutomaticRiskLevel: RiskLevel;
+  allowedRecoveryActions: string[];
+  requireApprovalFor: string[];
+  issuedAt?: string;
+  expiresAt?: string;
+}
+
+/**
+ * Agent Runtime 当前已经实现真实自动执行器的恢复动作。
+ *
+ * 这里不是产品路线图。只有同时具备后端执行器、双策略校验、幂等重放和回归测试的动作才能出现在默认授权中；
+ * 尚未实现的动作即使 Recovery Agent 可以提出，也必须停在人工处理状态，不能由浏览器承诺自动执行。
+ */
+export const DEFAULT_AUTOPILOT_RECOVERY_ACTIONS = [
+  "RETRY_EXECUTION",
+  "APPLY_QUARANTINE",
+] as const;
+
+/** 无人值守恢复永远不能跳过的人工确认动作。 */
+export const DEFAULT_AUTOPILOT_APPROVAL_ACTIONS = [
+  "CHANGE_SCHEMA",
+  "CHANGE_CREDENTIAL",
+  "DELETE_DATA",
+  "OVERWRITE_TARGET",
+  "EXPAND_DATA_SCOPE",
+] as const;
+
+export const DEFAULT_AUTOPILOT_POLICY: Readonly<AutopilotPolicyInput> = {
+  executionMode: "AUTOPILOT",
+  maxRecoveryCycles: 5,
+  maxTotalDurationMinutes: 120,
+  maxAutomaticRiskLevel: "LOW",
+  allowedRecoveryActions: [...DEFAULT_AUTOPILOT_RECOVERY_ACTIONS],
+  requireApprovalFor: [...DEFAULT_AUTOPILOT_APPROVAL_ACTIONS],
+};
+
 export type SyncTaskState =
   | "DRAFT"
   | "CONFIGURED"
@@ -604,6 +674,53 @@ export interface SyncExecution {
   updateTime?: string;
 }
 
+/**
+ * 浏览器可展示的一次同步执行 Autopilot 恢复摘要。
+ *
+ * 这是服务端控制面投影，不是恢复命令或授权凭证。除 `available` 外所有字段都可能
+ * 因为执行尚未进入恢复流程、历史数据不完整或当前阶段尚未产生而为空；前端应当只展示
+ * 已返回的低敏事实，不能据此发起新的恢复动作。
+ */
+export interface SyncAutopilotRecoveryStatus {
+  available: boolean;
+  syncTaskId?: number;
+  rootExecutionId?: number;
+  currentExecutionId?: number;
+  executionState?: SyncExecutionState | string;
+  executionFinishedAt?: string;
+  caseId?: number;
+  caseState?: string;
+  cycle?: number;
+  maxCycles?: number;
+  recoveryAction?: string;
+  riskLevel?: RiskLevel | string;
+  attentionReason?: string;
+  deadlineAt?: string;
+  version?: number;
+  caseCreatedAt?: string;
+  caseUpdatedAt?: string;
+  outboxState?: string;
+  outboxAttemptCount?: number;
+  outboxMaxAttemptCount?: number;
+  outboxLastErrorCode?: string;
+  /** Producer-side delivery outcome; separate from a consumer callback. */
+  producerDeliveryStatus?: string;
+  /** Stable low-sensitive reason for producer delivery exhaustion. */
+  producerDeliveryReasonCode?: string;
+  consumerResultStatus?: string;
+  consumerResultReasonCode?: string;
+  consumerResultAt?: string;
+  retrievalDecision?: "SEARCH" | "SKIP" | string;
+  retrievalStrategy?: string;
+  retrievalEvidenceCount?: number;
+  retrievalEvidenceDigest?: string;
+  quarantineSelectedCount?: number;
+  quarantineAffectedCount?: number;
+  quarantineOperationState?: string;
+  quarantineReceiptState?: string;
+  quarantineUpdatedAt?: string;
+}
+
 export interface SyncExecutionLog {
   id: number;
   tenantId?: number;
@@ -1012,6 +1129,7 @@ export type AgentExecutionMode =
   | "SYNC"
   | "ASYNC"
   | "ASYNC_TASK"
+  | "AUTOPILOT"
   | "DRAFT_ONLY"
   | "APPROVAL_REQUIRED"
   | "HUMAN_APPROVAL"
@@ -1081,6 +1199,7 @@ export interface AgentRun {
   requireHumanApproval: boolean;
   nextActions: string[];
   variables: JsonObject;
+  autopilotSnapshot?: AutopilotSnapshot;
   createTime?: string;
   updateTime?: string;
   finishTime?: string;
@@ -1169,6 +1288,8 @@ export interface AgentSession {
   workspace?: AgentWorkspace;
   toolBindings: AgentToolBinding[];
   runs: AgentRun[];
+  /** 当前会话最新的 AUTOPILOT 状态，用于列表页快速恢复。 */
+  autopilotSnapshot?: AutopilotSnapshot;
   /** 本会话当前生效或已失效的委托快照。 */
   delegation?: AgentDelegation;
   /** 按时间顺序恢复的多轮对话上下文。 */
@@ -1500,6 +1621,11 @@ export interface AgentRunConfirmedExecutionResponse {
   answerMode: string;
   modelProviderStatus: string;
   continuation?: AgentPostConfirmContinuation;
+  /**
+   * 后端从已持久化授权生成的公开 AUTOPILOT 快照，只用于展示自动恢复边界。
+   * 浏览器不能把它当作新的执行凭证。
+   */
+  autopilotSnapshot?: AutopilotSnapshot;
 }
 
 export interface AgentToolExecutionFailure {

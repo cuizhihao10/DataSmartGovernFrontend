@@ -30,13 +30,16 @@ import {
   Card,
   Checkbox,
   Collapse,
+  DatePicker,
   Descriptions,
   Form,
   Input,
+  InputNumber,
   Select,
   Space,
   Spin,
   Steps,
+  Switch,
   Tag,
   Timeline,
   Tooltip,
@@ -44,6 +47,7 @@ import {
   Upload,
   message,
 } from "antd";
+import dayjs from "dayjs";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError } from "@/api/client";
@@ -95,7 +99,10 @@ import {
 import { AgentConsole } from "@/pages/AgentConsole";
 import { useAuthStore } from "@/store/authStore";
 import { useUiStore } from "@/store/uiStore";
+import { DEFAULT_AUTOPILOT_POLICY } from "@/types/domain";
 import type {
+  AutopilotPolicyDraft,
+  AutopilotSnapshot,
   AgentPlanResponse,
   AgentObservationTimelineItem,
   AgentRun,
@@ -245,6 +252,7 @@ interface ExecutionAnswer {
   recoveryRequiresConfirmation?: boolean;
   continuationStatus?: string;
   repairProposal?: AgentRepairProposal;
+  autopilotSnapshot?: AutopilotSnapshot;
   /**
    * 后续修复建议仍然有效，但承载该建议的 Durable Run 已不存在时记录原因。
    * 页面据此隐藏失效的确认按钮，并提供重新生成审核计划的持久入口。
@@ -705,6 +713,46 @@ function continuationNeedsManualConfirmation(
     || status === "WAITING_APPROVAL"
     || status === "APPROVAL_REQUIRED"
     || hasPendingDurableConfirmation;
+}
+
+/** A continuation cannot expand the reviewed tool boundary for high-risk work. */
+function isUnexpectedHighRiskAudit(
+  audit: Pick<AgentToolExecutionAudit, "toolCode" | "riskLevel">,
+  approvedToolCodes: ReadonlySet<string>,
+): boolean {
+  return !approvedToolCodes.has(audit.toolCode)
+    && (audit.riskLevel === "HIGH" || audit.riskLevel === "CRITICAL");
+}
+
+/** AUTOPILOT can only be attached to the original human confirmation boundary. */
+function shouldSubmitAutopilotPolicy(
+  enabled: boolean,
+  alreadySubmitted: boolean,
+  isRecoveryConfirmation: boolean,
+  isContinuationConfirmation: boolean,
+): boolean {
+  return enabled && !alreadySubmitted && !isRecoveryConfirmation && !isContinuationConfirmation;
+}
+
+function createDefaultAutopilotPolicy(): AutopilotPolicyDraft {
+  return {
+    enabled: false,
+    ...DEFAULT_AUTOPILOT_POLICY,
+    allowedRecoveryActions: [...DEFAULT_AUTOPILOT_POLICY.allowedRecoveryActions],
+    requireApprovalFor: [...DEFAULT_AUTOPILOT_POLICY.requireApprovalFor],
+    expiresAt: dayjs().add(DEFAULT_AUTOPILOT_POLICY.maxTotalDurationMinutes, "minute").toISOString(),
+  };
+}
+
+function autopilotStateColor(state?: string) {
+  switch (String(state || "").toUpperCase()) {
+    case "ACTIVE": return "blue";
+    case "RECOVERING": return "processing";
+    case "ATTENTION_REQUIRED": return "volcano";
+    case "COMPLETED": return "success";
+    case "EXPIRED": return "default";
+    default: return "default";
+  }
 }
 
 /**
@@ -3080,12 +3128,16 @@ function UserAgentAssistant() {
   const [taskImportRunImmediately, setTaskImportRunImmediately] = useState(false);
   const [showAdvancedClarification, setShowAdvancedClarification] = useState(false);
   const [configurationReviewConfirmed, setConfigurationReviewConfirmed] = useState(false);
+  const [autopilotPolicy, setAutopilotPolicy] = useState<AutopilotPolicyDraft>(createDefaultAutopilotPolicy);
+  const [autopilotSnapshot, setAutopilotSnapshot] = useState<AutopilotSnapshot>();
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
   const [historicalRunProcesses, setHistoricalRunProcesses] = useState<HistoricalAgentRunProcess[]>([]);
   const [historyPlaybackWarning, setHistoryPlaybackWarning] = useState<string>();
   /** 当前确认卡绑定的后续 Durable Run；只用于让新审批边界回到既有人工 UI。 */
   const pendingManualConfirmationRunIdRef = useRef<string>();
+  /** One AUTOPILOT grant belongs to the first human approval of one conversation only. */
+  const autopilotPolicySubmittedRef = useRef(false);
   const autoAdvanceTurnRef = useRef<string>();
   const mappingDefaultsPromptTurnRef = useRef<string>();
   const processStartedAtRef = useRef<number>();
@@ -3135,6 +3187,9 @@ function UserAgentAssistant() {
     setPostConfirmSpecialistExecution(undefined);
     setExecutionResults([]);
     setExecutionAnswer(undefined);
+    setAutopilotPolicy(createDefaultAutopilotPolicy());
+    setAutopilotSnapshot(undefined);
+    autopilotPolicySubmittedRef.current = false;
     setPlanFailure(undefined);
     setFollowUpMessage("");
   }, [selectedProjectId]);
@@ -3292,6 +3347,11 @@ function UserAgentAssistant() {
     onSuccess: (result, variables) => {
       if (sessionLoadRequestTokenRef.current !== variables.requestToken) return;
       const historicalSession = result.sessionResult.data;
+      const historicalAutopilotSnapshot = historicalSession.autopilotSnapshot
+        ?? [...historicalSession.runs]
+          .reverse()
+          .map((run) => run.autopilotSnapshot)
+          .find((snapshot): snapshot is AutopilotSnapshot => Boolean(snapshot));
       const recoverySnapshot = buildHistoricalRecoverySnapshot(
         result.processes,
         historicalSession.objective,
@@ -3328,6 +3388,18 @@ function UserAgentAssistant() {
       setControlPlane(recoverySnapshot?.controlPlane);
       setExecutionResults([]);
       setExecutionAnswer(recoverySnapshot?.executionAnswer);
+      setAutopilotSnapshot(historicalAutopilotSnapshot);
+      setAutopilotPolicy(historicalAutopilotSnapshot ? {
+        enabled: true,
+        executionMode: historicalAutopilotSnapshot.executionMode ?? "AUTOPILOT",
+        allowedRecoveryActions: [...historicalAutopilotSnapshot.allowedRecoveryActions],
+        maxAutomaticRiskLevel: "LOW",
+        maxRecoveryCycles: historicalAutopilotSnapshot.maxRecoveryCycles,
+        maxTotalDurationMinutes: historicalAutopilotSnapshot.maxTotalDurationMinutes,
+        requireApprovalFor: [...historicalAutopilotSnapshot.requireApprovalFor],
+        expiresAt: historicalAutopilotSnapshot.expiresAt,
+      } : createDefaultAutopilotPolicy());
+      autopilotPolicySubmittedRef.current = Boolean(historicalAutopilotSnapshot?.policyId);
       setPlanFailure(recoverySnapshot?.failure);
       setLiveObservationItems([]);
       setLiveSpecialistAgentExecution(undefined);
@@ -4284,135 +4356,146 @@ function UserAgentAssistant() {
       const currentActorId = session?.actorId == null ? undefined : String(session.actorId);
       if (!currentActorId) throw new Error("当前操作者会话已失效，请重新登录后再执行。");
       const approvedToolCodes = new Set((plan?.plan?.toolPlans ?? []).map((item) => item.toolName));
-      const approvedSyncMode = normalizeUserSyncMode(
-        clarificationForm.getFieldValue("syncMode") || plan?.agentConversation?.structuredIntent.syncMode,
+      const isRecoveryConfirmation = Boolean(
+        executionAnswer?.recoveryRunId
+        && executionControlPlane.runId === executionAnswer.recoveryRunId,
       );
-      const resultByAuditId = new Map<string, AgentToolExecutionResult>();
-      const visitedRunIds = new Set<string>();
-      let currentRunId = executionControlPlane.runId;
-      let totalPlanned = 0;
-      let totalSucceeded = 0;
-      let totalFailed = 0;
-
-      for (let batchIndex = 0; batchIndex < 6; batchIndex += 1) {
-        if (visitedRunIds.has(currentRunId)) {
-          throw new Error(`Agent continuation 出现重复 Run：${currentRunId}`);
+      const isContinuationConfirmation = pendingManualConfirmationRunIdRef.current === executionControlPlane.runId;
+      const autopilotPolicyForInitialConfirmation = shouldSubmitAutopilotPolicy(
+        autopilotPolicy.enabled,
+        autopilotPolicySubmittedRef.current,
+        isRecoveryConfirmation,
+        isContinuationConfirmation,
+      ) ? {
+        executionMode: autopilotPolicy.executionMode,
+        maxRecoveryCycles: autopilotPolicy.maxRecoveryCycles,
+        maxTotalDurationMinutes: autopilotPolicy.maxTotalDurationMinutes,
+        maxAutomaticRiskLevel: autopilotPolicy.maxAutomaticRiskLevel,
+        allowedRecoveryActions: [...new Set(
+          autopilotPolicy.allowedRecoveryActions.map((action) => action.trim().toUpperCase()).filter(Boolean),
+        )],
+        requireApprovalFor: [...new Set(
+          autopilotPolicy.requireApprovalFor.map((action) => action.trim().toUpperCase()).filter(Boolean),
+        )],
+        expiresAt: autopilotPolicy.expiresAt,
+      } : undefined;
+      if (autopilotPolicyForInitialConfirmation) {
+        const expiresAt = dayjs(autopilotPolicyForInitialConfirmation.expiresAt);
+        if (!autopilotPolicyForInitialConfirmation.allowedRecoveryActions.length) {
+          throw new Error("请至少选择一项低风险允许动作");
         }
-        visitedRunIds.add(currentRunId);
-        const pendingRepair = executionAnswer?.repairProposal;
-          const result = await api.confirmAndExecuteAgentRun(executionControlPlane.sessionId, currentRunId, {
-            confirmed: true,
-            idempotencyKey: `agent-confirm:${executionControlPlane.sessionId}:${currentRunId}`,
-            comment: batchIndex === 0
-            ? pendingRepair?.kind === "DUPLICATE_TASK_NAME"
-              ? `用户确认将任务名称从“${pendingRepair.originalTaskName}”改为“${pendingRepair.proposedTaskName}”，并同意重新保存、预检查、发布和执行`
-              : "用户已审核完整同步任务配置，同意执行本次计划"
-            : "沿用用户对同一完整同步任务计划的确认，继续执行受控生命周期节点",
-        });
-        result.data.toolResults.forEach((item) => resultByAuditId.set(item.audit.auditId, item));
-        totalPlanned += result.data.plannedCount;
-        totalSucceeded += result.data.succeededCount;
-        totalFailed += result.data.failedCount;
-
-        const combinedResults = [...resultByAuditId.values()];
-        const succeededToolCodes = new Set(combinedResults
-          .filter((item) => item.audit.state === "SUCCEEDED")
-          .map((item) => item.audit.toolCode));
-        const taskSubmissionReached = succeededToolCodes.has("sync.task.run")
-          || (["SCHEDULED_BATCH", "SCHEDULED_FULL", "CDC_STREAMING"].includes(approvedSyncMode)
-            && succeededToolCodes.has("sync.task.publish"));
-        const aggregateResult = {
-          ...result,
-          data: {
-            ...result.data,
-            runId: currentRunId,
-            plannedCount: totalPlanned,
-            succeededCount: totalSucceeded,
-            failedCount: totalFailed,
-            toolResults: combinedResults,
-            awaitingManualConfirmation: undefined as ManualConfirmationControlPlane | undefined,
-          },
-        };
-        if (result.data.failedCount > 0 || taskSubmissionReached) {
-          return aggregateResult;
+        if (!expiresAt.isValid() || !expiresAt.isAfter(dayjs())) {
+          throw new Error("AUTOPILOT 到期时间必须晚于当前时间");
         }
-
-        const continuation = result.data.continuation;
-        const nextRunId = continuation?.nextRunId;
-        if (!nextRunId) {
-          return aggregateResult;
-        }
-        if (continuation.sessionId && continuation.sessionId !== executionControlPlane.sessionId) {
-          throw new Error("Agent continuation 返回了不同会话，已阻止跨会话自动执行");
-        }
-
-        // One review may cover several Durable batches, but never tools that
-        // were absent from the configuration plan shown to the user.
-        const nextAudits = (await api.listAgentToolExecutions(executionControlPlane.sessionId, nextRunId)).data;
-        const continuationSession = (await api.getAgentSession(executionControlPlane.sessionId)).data;
-        const sameTenant = continuationSession.tenantId == null
-          || String(continuationSession.tenantId) === String(session?.tenantId);
-        const sameProject = continuationSession.projectId == null
-          || String(continuationSession.projectId) === String(projectId);
-        if (
-          continuationSession.sessionId !== executionControlPlane.sessionId
-          || String(continuationSession.actorId) !== currentActorId
-          || !sameTenant
-          || !sameProject
-        ) {
-          throw new Error("Agent continuation 返回了不属于当前会话所有者或项目的 Durable session，已阻止自动执行");
-        }
-        const nextDurableRun = continuationSession.runs.find((run) => run.runId === nextRunId);
-        if (nextDurableRun && nextDurableRun.sessionId !== executionControlPlane.sessionId) {
-          throw new Error("Agent continuation 的 Durable Run 不属于当前 session，已阻止自动执行");
-        }
-        const outOfScopeAudit = nextAudits.find((audit) => (
-          audit.sessionId !== executionControlPlane.sessionId
-          || audit.runId !== nextRunId
-          || (audit.actorId && String(audit.actorId) !== currentActorId)
-        ));
-        if (outOfScopeAudit) {
-          throw new Error("Agent continuation 返回了不属于当前 session-owner 的工具审计，已阻止自动执行");
-        }
-        const unexpectedTools = [...new Set(nextAudits
-          .map((audit) => audit.toolCode)
-          .filter((toolCode) => !approvedToolCodes.has(toolCode)))];
-        if (unexpectedTools.length) {
-          throw new Error(`下一批出现未审核工具：${unexpectedTools.join("、")}，需要重新生成并确认计划`);
-        }
-
-        const nextDurableRunStatus = nextDurableRun?.state?.trim().toUpperCase() || "";
-        const nextRunHasPendingConfirmation = nextDurableRunStatus === "WAITING_CONFIRMATION"
-          || (nextDurableRun?.requireHumanApproval === true
-            && ["WAITING_APPROVAL", "APPROVAL_REQUIRED", "PENDING", "PLANNED"].includes(nextDurableRunStatus));
-        const nextRunNeedsManualConfirmation = continuationNeedsManualConfirmation(
-          continuation,
-          nextAudits.some(isPendingApprovalAudit) || nextRunHasPendingConfirmation,
-        );
-        if (nextRunNeedsManualConfirmation) {
-          return {
-            ...aggregateResult,
-            data: {
-              ...aggregateResult.data,
-              awaitingManualConfirmation: {
-                sessionId: executionControlPlane.sessionId,
-                runId: nextRunId,
-              },
-            },
-          };
-        }
-        if (!nextAudits.length) {
-          throw new Error("下一批 Agent Run 没有可执行工具，已停止自动续跑");
-        }
-        currentRunId = nextRunId;
       }
-      throw new Error("Agent 受控续跑批次超过安全上限，请查看运行诊断");
+
+      const pendingRepair = executionAnswer?.repairProposal;
+      const result = await api.confirmAndExecuteAgentRun(executionControlPlane.sessionId, executionControlPlane.runId, {
+        confirmed: true,
+        idempotencyKey: `agent-confirm:${executionControlPlane.sessionId}:${executionControlPlane.runId}`,
+        comment: pendingRepair?.kind === "DUPLICATE_TASK_NAME"
+          ? `用户确认将任务名称从“${pendingRepair.originalTaskName}”改为“${pendingRepair.proposedTaskName}”，并同意重新保存、预检查、发布和执行`
+          : "用户已审核完整同步任务配置，同意执行本次计划",
+        ...(autopilotPolicyForInitialConfirmation ? { autopilotPolicy: autopilotPolicyForInitialConfirmation } : {}),
+      });
+      if (autopilotPolicyForInitialConfirmation) {
+        autopilotPolicySubmittedRef.current = true;
+      }
+
+      const continuation = result.data.continuation;
+      /**
+       * Preserve the safe snapshot returned with the confirmed Run until a verified
+       * continuation provides a newer one. The snapshot is display-only state from
+       * the backend, so this helper must never turn it into browser-side authority.
+       */
+      const withAutopilotSnapshot = (
+        snapshot?: AutopilotSnapshot,
+        awaitingManualConfirmation?: ManualConfirmationControlPlane,
+      ) => ({
+        ...result,
+        data: {
+          ...result.data,
+          autopilotSnapshot: snapshot ?? result.data.autopilotSnapshot,
+          awaitingManualConfirmation,
+        },
+      });
+      const nextRunId = continuation?.nextRunId;
+      if (!nextRunId) {
+        return withAutopilotSnapshot();
+      }
+      if (continuation.sessionId && continuation.sessionId !== executionControlPlane.sessionId) {
+        throw new Error("Agent continuation 返回了不同会话，已阻止跨会话自动执行");
+      }
+
+      // Verify the next Durable Run before presenting its backend-owned AUTOPILOT state.
+      const nextAudits = (await api.listAgentToolExecutions(executionControlPlane.sessionId, nextRunId)).data;
+      const continuationSession = (await api.getAgentSession(executionControlPlane.sessionId)).data;
+      const sameTenant = continuationSession.tenantId == null
+        || String(continuationSession.tenantId) === String(session?.tenantId);
+      const sameProject = continuationSession.projectId == null
+        || String(continuationSession.projectId) === String(projectId);
+      if (
+        continuationSession.sessionId !== executionControlPlane.sessionId
+        || String(continuationSession.actorId) !== currentActorId
+        || !sameTenant
+        || !sameProject
+      ) {
+        throw new Error("Agent continuation 返回了不属于当前会话所有者或项目的 Durable session，已阻止显示自动续跑状态");
+      }
+      const nextDurableRun = continuationSession.runs.find((run) => run.runId === nextRunId);
+      if (nextDurableRun && nextDurableRun.sessionId !== executionControlPlane.sessionId) {
+        throw new Error("Agent continuation 的 Durable Run 不属于当前 session，已阻止显示自动续跑状态");
+      }
+      const outOfScopeAudit = nextAudits.find((audit) => (
+        audit.sessionId !== executionControlPlane.sessionId
+        || audit.runId !== nextRunId
+        || (audit.actorId && String(audit.actorId) !== currentActorId)
+      ));
+      if (outOfScopeAudit) {
+        throw new Error("Agent continuation 返回了不属于当前 session-owner 的工具审计，已阻止显示自动续跑状态");
+      }
+      const unexpectedTools = [...new Set(nextAudits
+        .map((audit) => audit.toolCode)
+        .filter((toolCode) => !approvedToolCodes.has(toolCode)))];
+      const unexpectedHighRiskTools = [...new Set(nextAudits
+        .filter((audit) => isUnexpectedHighRiskAudit(audit, approvedToolCodes))
+        .map((audit) => audit.toolCode))];
+      if (unexpectedTools.length && !unexpectedHighRiskTools.length) {
+        throw new Error(`下一批出现未审核工具：${unexpectedTools.join("、")}，需要重新生成并确认计划`);
+      }
+
+      const nextDurableRunStatus = nextDurableRun?.state?.trim().toUpperCase() || "";
+      const nextRunHasPendingConfirmation = nextDurableRunStatus === "WAITING_CONFIRMATION"
+        || (nextDurableRun?.requireHumanApproval === true
+          && ["WAITING_APPROVAL", "APPROVAL_REQUIRED", "PENDING", "PLANNED"].includes(nextDurableRunStatus));
+      const nextRunNeedsManualConfirmation = continuationNeedsManualConfirmation(
+        continuation,
+        unexpectedHighRiskTools.length > 0
+          || nextAudits.some(isPendingApprovalAudit)
+          || nextRunHasPendingConfirmation,
+      );
+      const continuationSnapshot = nextDurableRun?.autopilotSnapshot
+        ?? continuationSession.autopilotSnapshot;
+      if (nextRunNeedsManualConfirmation) {
+        return withAutopilotSnapshot(continuationSnapshot, {
+          sessionId: executionControlPlane.sessionId,
+          runId: nextRunId,
+        });
+      }
+
+      // The browser must never click confirm for a continuation. The backend either
+      // progresses it under the persisted AUTOPILOT policy or returns a new manual boundary.
+      return withAutopilotSnapshot(continuationSnapshot);
     },
     onMutate: () => {
       beginAgentProcess("EXECUTION");
       setExecutionInProgress(true);
     },
     onSuccess: async (result) => {
+      const returnedAutopilotSnapshot = result.data.autopilotSnapshot;
+      if (returnedAutopilotSnapshot) {
+        setAutopilotSnapshot(returnedAutopilotSnapshot);
+      }
       setExecutionResults(result.data.toolResults);
       setLiveObservationItems((current) => {
         const merged = new Map(current.map((item) => [item.id, item]));
@@ -4455,7 +4538,7 @@ function UserAgentAssistant() {
           id: `continuation-confirmation-required-${awaitingManualConfirmation.runId}`,
           category: "PERMISSION",
           stage: "agent_continuation_confirmation_required",
-          status: "WAITING_APPROVAL",
+          status: "WAITING_CONFIRMATION",
           title: "后续 Agent 计划等待新的人工确认",
           summary: "后端返回了新的待确认 Durable Run，自动续跑已停止。",
           details: {
@@ -4511,6 +4594,7 @@ function UserAgentAssistant() {
           recoveryRequiresConfirmation: Boolean(result.data.continuation?.requiresConfirmation),
           continuationStatus: result.data.continuation?.status,
           repairProposal: result.data.continuation?.repairProposal,
+          autopilotSnapshot: returnedAutopilotSnapshot,
           recoveryRunUnavailableReason: result.data.continuation?.stoppedReason === "NEXT_RUN_NOT_DURABLE"
             ? result.data.continuation.message || result.data.continuation.assistantReply
             : undefined,
@@ -4572,7 +4656,9 @@ function UserAgentAssistant() {
             ? "实时同步任务已创建并交由实时通道运行，可在同步任务列表持续查看"
             : "同步任务已创建并提交执行，可在同步任务列表持续查看进度");
       } else {
-        message.info("本轮只完成只读工具核对，尚未创建或运行同步任务");
+        message.info(result.data.continuation?.nextRunId
+          ? "后续 Durable Run 已建立，浏览器不会重复确认；正在等待服务端返回自动恢复状态。"
+          : "本轮只完成只读工具核对，尚未创建或运行同步任务");
       }
       await auditsQuery.refetch();
       const repairedArtifactRef = result.data.toolResults
@@ -5358,6 +5444,9 @@ function UserAgentAssistant() {
     setExecutionResults([]);
     setPostConfirmSpecialistExecution(undefined);
     setExecutionAnswer(undefined);
+    setAutopilotPolicy(createDefaultAutopilotPolicy());
+    setAutopilotSnapshot(undefined);
+    autopilotPolicySubmittedRef.current = false;
     setPlanFailure(undefined);
     setFollowUpMessage("");
     setShowAdvancedClarification(false);
@@ -5401,6 +5490,9 @@ function UserAgentAssistant() {
     setExecutionResults([]);
     setPostConfirmSpecialistExecution(undefined);
     setExecutionAnswer(undefined);
+    setAutopilotPolicy(createDefaultAutopilotPolicy());
+    setAutopilotSnapshot(undefined);
+    autopilotPolicySubmittedRef.current = false;
     setPlanFailure(undefined);
     setLiveObservationItems([]);
     setFollowUpMessage("");
@@ -5543,6 +5635,20 @@ function UserAgentAssistant() {
   const reviewCustomSqlText = clarificationCustomSqlText || resolvedConfiguration?.customSqlText;
   const isSyncTaskCreationReview = conversation?.structuredIntent.intentType === "CREATE_DATA_SYNC_TASK"
     || activeToolNames.includes("sync.task.draft.save");
+  const autopilotActionOptions = DEFAULT_AUTOPILOT_POLICY.allowedRecoveryActions
+    .map((action) => ({ value: action, label: action }));
+  const autopilotApprovalActionOptions = DEFAULT_AUTOPILOT_POLICY.requireApprovalFor
+    .map((action) => ({ value: action, label: action }));
+  const visibleAutopilotSnapshot = autopilotSnapshot
+    ?? executionAnswer?.autopilotSnapshot
+    ?? [...historicalRunProcesses]
+      .reverse()
+      .map((process) => process.run.autopilotSnapshot)
+      .find((snapshot): snapshot is AutopilotSnapshot => Boolean(snapshot));
+  const canConfigureAutopilot = isSyncTaskCreationReview
+    && !failureRecoveryPlanActive
+    && !continuationManualConfirmationActive
+    && !autopilotPolicySubmittedRef.current;
   const configurationReadinessIssues: string[] = [];
   if (isSyncTaskCreationReview) {
     if (!effectiveSourceDatasourceId) configurationReadinessIssues.push("尚未选择源端数据源");
@@ -7282,6 +7388,93 @@ function UserAgentAssistant() {
                   }] : []),
                 ]}
               />
+              {canConfigureAutopilot ? (
+                <div className="agent-configuration-review-section">
+                  <Space align="center" wrap>
+                    <Typography.Text strong>AUTOPILOT</Typography.Text>
+                    <Switch
+                      size="small"
+                      checked={autopilotPolicy.enabled}
+                      onChange={(enabled) => setAutopilotPolicy((current) => ({
+                        ...current,
+                        enabled,
+                        expiresAt: current.expiresAt
+                          || dayjs().add(current.maxTotalDurationMinutes, "minute").toISOString(),
+                      }))}
+                    />
+                    <Typography.Text type="secondary">仅随本次首次确认提交</Typography.Text>
+                  </Space>
+                  {autopilotPolicy.enabled ? (
+                    <Space wrap size={[8, 8]} style={{ display: "flex", marginTop: 12 }}>
+                      <Select
+                        mode="multiple"
+                        size="small"
+                        aria-label="低风险允许动作"
+                        value={autopilotPolicy.allowedRecoveryActions}
+                        options={autopilotActionOptions}
+                        onChange={(allowedRecoveryActions) => setAutopilotPolicy((current) => ({
+                          ...current,
+                          allowedRecoveryActions: allowedRecoveryActions.map(String),
+                        }))}
+                        style={{ minWidth: 250, maxWidth: 380 }}
+                        placeholder="低风险允许动作"
+                      />
+                      <Tag color="green">仅低风险自动</Tag>
+                      <InputNumber
+                        size="small"
+                        aria-label="最大恢复轮次"
+                        min={1}
+                        max={10}
+                        value={autopilotPolicy.maxRecoveryCycles}
+                        onChange={(maxRecoveryCycles) => {
+                          if (typeof maxRecoveryCycles !== "number") return;
+                          setAutopilotPolicy((current) => ({ ...current, maxRecoveryCycles }));
+                        }}
+                        addonBefore="轮次"
+                        style={{ width: 136 }}
+                      />
+                      <InputNumber
+                        size="small"
+                        aria-label="总时限分钟"
+                        min={5}
+                        max={1440}
+                        value={autopilotPolicy.maxTotalDurationMinutes}
+                        onChange={(maxTotalDurationMinutes) => {
+                          if (typeof maxTotalDurationMinutes !== "number") return;
+                          setAutopilotPolicy((current) => ({ ...current, maxTotalDurationMinutes }));
+                        }}
+                        addonAfter="分钟"
+                        style={{ width: 150 }}
+                      />
+                      <DatePicker
+                        size="small"
+                        showTime
+                        allowClear={false}
+                        value={autopilotPolicy.expiresAt ? dayjs(autopilotPolicy.expiresAt) : null}
+                        onChange={(expiresAt) => setAutopilotPolicy((current) => ({
+                          ...current,
+                          expiresAt: expiresAt?.toISOString(),
+                        }))}
+                        format="MM-DD HH:mm"
+                        style={{ width: 150 }}
+                      />
+                      <Select
+                        mode="multiple"
+                        size="small"
+                        aria-label="高风险仍需确认"
+                        value={autopilotPolicy.requireApprovalFor}
+                        options={autopilotApprovalActionOptions}
+                        onChange={(requireApprovalFor) => setAutopilotPolicy((current) => ({
+                          ...current,
+                          requireApprovalFor: requireApprovalFor.map(String),
+                        }))}
+                        style={{ minWidth: 190 }}
+                        placeholder="高风险仍需确认"
+                      />
+                    </Space>
+                  ) : null}
+                </div>
+              ) : null}
               {isSqlSyncMode(reviewSyncMode) ? (
                 <div className="agent-configuration-review-section">
                   <Typography.Text strong>只读 SQL</Typography.Text>
@@ -7474,6 +7667,46 @@ function UserAgentAssistant() {
           >
             拒绝本次方案
           </Button>
+        </Card>
+      ) : null}
+
+      {visibleAutopilotSnapshot ? (
+        <Card title="AUTOPILOT 状态" className="compact-card">
+          <Descriptions size="small" bordered column={{ xs: 1, sm: 2, xl: 3 }}>
+            <Descriptions.Item label="状态">
+              <Tag color={autopilotStateColor(visibleAutopilotSnapshot.state)}>
+                {visibleAutopilotSnapshot.state}
+              </Tag>
+            </Descriptions.Item>
+            <Descriptions.Item label="最大恢复轮次">
+              {visibleAutopilotSnapshot.maxRecoveryCycles}
+            </Descriptions.Item>
+            <Descriptions.Item label="自动风险上限">
+              {visibleAutopilotSnapshot.maxAutomaticRiskLevel}
+            </Descriptions.Item>
+            <Descriptions.Item label="总时限">
+              {visibleAutopilotSnapshot.maxTotalDurationMinutes} 分钟
+            </Descriptions.Item>
+            <Descriptions.Item label="签发时间">
+              {visibleAutopilotSnapshot.issuedAt
+                ? dayjs(visibleAutopilotSnapshot.issuedAt).format("YYYY-MM-DD HH:mm")
+                : "-"}
+            </Descriptions.Item>
+            <Descriptions.Item label="到期">
+              {visibleAutopilotSnapshot.expiresAt
+                ? dayjs(visibleAutopilotSnapshot.expiresAt).format("YYYY-MM-DD HH:mm")
+                : "-"}
+            </Descriptions.Item>
+            <Descriptions.Item label="策略编号">
+              {visibleAutopilotSnapshot.policyId || "-"}
+            </Descriptions.Item>
+            <Descriptions.Item label="允许自动恢复" span={3}>
+              {visibleAutopilotSnapshot.allowedRecoveryActions.join("、") || "-"}
+            </Descriptions.Item>
+            <Descriptions.Item label="仍需人工确认" span={3}>
+              {visibleAutopilotSnapshot.requireApprovalFor.join("、") || "-"}
+            </Descriptions.Item>
+          </Descriptions>
         </Card>
       ) : null}
 

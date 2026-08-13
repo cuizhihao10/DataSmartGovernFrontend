@@ -36,6 +36,12 @@ export const statusLabels: Record<string, string> = {
   PLANNING: "规划中",
   WAITING_HUMAN: "等待人工确认",
   WAITING_APPROVAL: "等待审批",
+  AUTOPILOT: "自动续跑",
+  ACTIVE: "自动续跑中",
+  RECOVERING: "自动恢复中",
+  ATTENTION_REQUIRED: "需要人工处理",
+  EXPIRED: "授权已到期",
+  COMPLETED: "自动处理完成",
 };
 
 export const syncTaskStateLabels: Record<string, string> = {
@@ -205,6 +211,7 @@ export const executionModeLabels: Record<string, string> = {
   DIRECT: "同步执行",
   ASYNC: "异步执行",
   ASYNC_COMMAND: "异步命令",
+  AUTOPILOT: "自动续跑",
   HUMAN_APPROVAL: "人工审批",
   APPROVAL_REQUIRED: "需要审批",
   DRAFT_ONLY: "仅生成草案",
