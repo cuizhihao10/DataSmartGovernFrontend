@@ -100,6 +100,11 @@ import { AgentConsole } from "@/pages/AgentConsole";
 import { useAuthStore } from "@/store/authStore";
 import { useUiStore } from "@/store/uiStore";
 import { DEFAULT_AUTOPILOT_POLICY } from "@/types/domain";
+import {
+  autopilotApprovalActionLabels,
+  autopilotRecoveryActionLabels,
+  labelOf,
+} from "@/utils/labels";
 import type {
   AutopilotPolicyDraft,
   AutopilotSnapshot,
@@ -724,7 +729,7 @@ function isUnexpectedHighRiskAudit(
     && (audit.riskLevel === "HIGH" || audit.riskLevel === "CRITICAL");
 }
 
-/** AUTOPILOT can only be attached to the original human confirmation boundary. */
+/** AUTOPILOT 只能附加在用户首次确认边界，后续恢复不能由浏览器再次扩权。 */
 function shouldSubmitAutopilotPolicy(
   enabled: boolean,
   alreadySubmitted: boolean,
@@ -3136,7 +3141,7 @@ function UserAgentAssistant() {
   const [historyPlaybackWarning, setHistoryPlaybackWarning] = useState<string>();
   /** 当前确认卡绑定的后续 Durable Run；只用于让新审批边界回到既有人工 UI。 */
   const pendingManualConfirmationRunIdRef = useRef<string>();
-  /** One AUTOPILOT grant belongs to the first human approval of one conversation only. */
+  /** 一份 AUTOPILOT 授权只属于一个会话的首次人工确认。 */
   const autopilotPolicySubmittedRef = useRef(false);
   const autoAdvanceTurnRef = useRef<string>();
   const mappingDefaultsPromptTurnRef = useRef<string>();
@@ -5636,9 +5641,9 @@ function UserAgentAssistant() {
   const isSyncTaskCreationReview = conversation?.structuredIntent.intentType === "CREATE_DATA_SYNC_TASK"
     || activeToolNames.includes("sync.task.draft.save");
   const autopilotActionOptions = DEFAULT_AUTOPILOT_POLICY.allowedRecoveryActions
-    .map((action) => ({ value: action, label: action }));
+    .map((action) => ({ value: action, label: labelOf(action, autopilotRecoveryActionLabels) }));
   const autopilotApprovalActionOptions = DEFAULT_AUTOPILOT_POLICY.requireApprovalFor
-    .map((action) => ({ value: action, label: action }));
+    .map((action) => ({ value: action, label: labelOf(action, autopilotApprovalActionLabels) }));
   const visibleAutopilotSnapshot = autopilotSnapshot
     ?? executionAnswer?.autopilotSnapshot
     ?? [...historicalRunProcesses]
@@ -7701,10 +7706,12 @@ function UserAgentAssistant() {
               {visibleAutopilotSnapshot.policyId || "-"}
             </Descriptions.Item>
             <Descriptions.Item label="允许自动恢复" span={3}>
-              {visibleAutopilotSnapshot.allowedRecoveryActions.join("、") || "-"}
+              {visibleAutopilotSnapshot.allowedRecoveryActions
+                .map((action) => labelOf(action, autopilotRecoveryActionLabels)).join("、") || "-"}
             </Descriptions.Item>
             <Descriptions.Item label="仍需人工确认" span={3}>
-              {visibleAutopilotSnapshot.requireApprovalFor.join("、") || "-"}
+              {visibleAutopilotSnapshot.requireApprovalFor
+                .map((action) => labelOf(action, autopilotApprovalActionLabels)).join("、") || "-"}
             </Descriptions.Item>
           </Descriptions>
         </Card>

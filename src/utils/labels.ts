@@ -92,6 +92,27 @@ export const riskLabels: Record<string, string> = {
   CRITICAL: "关键风险",
 };
 
+/** 首次授权盒内可由 Recovery Agent 提议、再由 Java/data-sync 双重校验的低风险动作。 */
+export const autopilotRecoveryActionLabels: Record<string, string> = {
+  RETRY_EXECUTION: "重试失败对象",
+  APPLY_QUARANTINE: "隔离确认的脏数据",
+  ROLLBACK_EXECUTION_POLICY: "回滚到上次成功运行策略",
+  TUNE_EXECUTION_POLICY: "有界调整运行参数",
+  REFRESH_METADATA: "刷新元数据并重新预检",
+  RESUME_FROM_CHECKPOINT: "从最新持久检查点恢复",
+  REPLAY_FAILED_SHARDS: "仅重放失败分片",
+  REPAIR_FIELD_MAPPING: "修复元数据可证明的字段映射",
+};
+
+/** 无人值守 Loop 必须退出并交给有权限用户处理的高风险动作。 */
+export const autopilotApprovalActionLabels: Record<string, string> = {
+  CHANGE_SCHEMA: "修改表结构或约束",
+  CHANGE_CREDENTIAL: "修改连接凭据",
+  DELETE_DATA: "删除数据",
+  OVERWRITE_TARGET: "覆盖目标数据",
+  EXPAND_DATA_SCOPE: "扩大同步范围",
+};
+
 export const priorityLabels: Record<string, string> = {
   LOW: "低",
   MEDIUM: "中",

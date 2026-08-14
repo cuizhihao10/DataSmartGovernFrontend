@@ -36,7 +36,7 @@ export interface AutopilotPolicyInput {
   expiresAt?: string;
 }
 
-/** Browser-only switch wrapped around the exact backend authorization payload. */
+/** 浏览器本地开关；提交时仍包装为后端定义的精确授权载荷。 */
 export interface AutopilotPolicyDraft extends AutopilotPolicyInput {
   enabled: boolean;
 }
@@ -59,14 +59,20 @@ export interface AutopilotSnapshot {
 }
 
 /**
- * Agent Runtime 当前已经实现真实自动执行器的恢复动作。
+ * Agent Runtime 当前已经实现真实自动执行器的低风险恢复动作。
  *
- * 这里不是产品路线图。只有同时具备后端执行器、双策略校验、幂等重放和回归测试的动作才能出现在默认授权中；
- * 尚未实现的动作即使 Recovery Agent 可以提出，也必须停在人工处理状态，不能由浏览器承诺自动执行。
+ * 这份目录只在用户首次确认时提交，页面允许用户进一步取消任意动作。只有同时具备后端执行器、
+ * 双策略校验、幂等重放和回归测试的动作才能进入目录；缺失动作列表时，后端仍按更保守的最小默认值处理。
  */
 export const DEFAULT_AUTOPILOT_RECOVERY_ACTIONS = [
   "RETRY_EXECUTION",
   "APPLY_QUARANTINE",
+  "ROLLBACK_EXECUTION_POLICY",
+  "TUNE_EXECUTION_POLICY",
+  "REFRESH_METADATA",
+  "RESUME_FROM_CHECKPOINT",
+  "REPLAY_FAILED_SHARDS",
+  "REPAIR_FIELD_MAPPING",
 ] as const;
 
 /** 无人值守恢复永远不能跳过的人工确认动作。 */

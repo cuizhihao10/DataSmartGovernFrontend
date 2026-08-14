@@ -125,16 +125,20 @@ const defaultAutopilotRecoveryActions = sourceBlock(
   "export const DEFAULT_AUTOPILOT_RECOVERY_ACTIONS",
   "export const DEFAULT_AUTOPILOT_APPROVAL_ACTIONS",
 );
-for (const governedExecutor of ["RETRY_EXECUTION", "APPLY_QUARANTINE"]) {
+for (const governedExecutor of [
+  "RETRY_EXECUTION",
+  "APPLY_QUARANTINE",
+  "ROLLBACK_EXECUTION_POLICY",
+  "TUNE_EXECUTION_POLICY",
+  "REFRESH_METADATA",
+  "RESUME_FROM_CHECKPOINT",
+  "REPLAY_FAILED_SHARDS",
+  "REPAIR_FIELD_MAPPING",
+]) {
   assert.match(defaultAutopilotRecoveryActions, new RegExp(`"${governedExecutor}"`),
     `${governedExecutor} must be enabled by the initial authorization default because the backend has a governed executor`);
 }
-for (const actionWithoutExecutor of [
-  "RECONNECT_DATASOURCE",
-  "RESUME_FROM_CHECKPOINT",
-  "REPLAY_FAILED_SHARDS",
-  "REFRESH_METADATA",
-]) {
+for (const actionWithoutExecutor of ["RECONNECT_DATASOURCE"]) {
   assert.doesNotMatch(defaultAutopilotRecoveryActions, new RegExp(`"${actionWithoutExecutor}"`),
     `${actionWithoutExecutor} must not be authorized before its governed executor exists`);
 }
