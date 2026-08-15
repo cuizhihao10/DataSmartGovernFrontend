@@ -727,6 +727,56 @@ export interface SyncAutopilotRecoveryStatus {
   quarantineUpdatedAt?: string;
 }
 
+/** 统一全链路图中的一个状态节点。 */
+export interface SyncExecutionLifecycleNode {
+  nodeId: string;
+  nodeType: "USER_GOAL" | "AGENT" | "COMMAND_DISPATCH" | "KAFKA_EVENT" | "JAVA_AUDIT" | "WORKER" | "RECOVERY" | "FINAL_VERIFICATION" | string;
+  role?: string;
+  state: string;
+  title: string;
+  source: string;
+  evidenceId?: string;
+  occurredAt?: string;
+  reasonCode?: string;
+}
+
+/** 统一全链路图中的有向关系；它只表达阅读顺序，不驱动后端状态。 */
+export interface SyncExecutionLifecycleEdge {
+  fromNodeId: string;
+  toNodeId: string;
+  relation: string;
+  state: string;
+  evidenceId?: string;
+}
+
+/** 生命周期证据索引，统一携带来源、时间和可信度等级。 */
+export interface SyncExecutionLifecycleEvidence {
+  evidenceId: string;
+  source: string;
+  kind: string;
+  state: string;
+  occurredAt?: string;
+  confidence: "AUTHORITATIVE" | "PARTIAL" | "UNAVAILABLE" | string;
+  reference: string;
+}
+
+/** 用户目标到最终验证的统一只读状态投影。 */
+export interface SyncExecutionLifecycleGraph {
+  schemaVersion: string;
+  graphType: string;
+  available: boolean;
+  syncTaskId: number;
+  rootExecutionId: number;
+  currentExecutionId: number;
+  overallState: string;
+  sourceStatus: "COMPLETE" | "PARTIAL" | "NOT_LINKED" | string;
+  missingReason?: string;
+  nodes: SyncExecutionLifecycleNode[];
+  edges: SyncExecutionLifecycleEdge[];
+  evidence: SyncExecutionLifecycleEvidence[];
+  generatedAt?: string;
+}
+
 export interface SyncExecutionLog {
   id: number;
   tenantId?: number;

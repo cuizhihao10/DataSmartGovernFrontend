@@ -73,6 +73,7 @@ import type {
   SyncExecutionPolicy,
   SyncExecutionPolicySnapshot,
   SyncAutopilotRecoveryStatus,
+  SyncExecutionLifecycleGraph,
   SyncIncident,
   SyncObjectExecution,
   SyncTaskBatchOperationResult,
@@ -1567,6 +1568,67 @@ function normalizeSyncAutopilotRecoveryStatus(value: unknown): SyncAutopilotReco
     quarantineOperationState: readOptionalString(record.quarantineOperationState ?? record.quarantine_operation_state)?.toUpperCase(),
     quarantineReceiptState: readOptionalString(record.quarantineReceiptState ?? record.quarantine_receipt_state)?.toUpperCase(),
     quarantineUpdatedAt: readOptionalString(record.quarantineUpdatedAt ?? record.quarantine_updated_at),
+  };
+}
+
+/**
+ * 归一化统一生命周期图，并只接收公开的低敏字段。
+ *
+ * 后端图是只读事实投影，前端不能根据缺失字段自行补出“成功”。因此这里对未知数组项做保守过滤，
+ * 状态缺失时使用 UNKNOWN，来源缺失时使用 unknown，而不是复用上一个节点的值。
+ */
+function normalizeSyncExecutionLifecycleGraph(value: unknown): SyncExecutionLifecycleGraph {
+  const record = readRecord(value);
+  const nodes = Array.isArray(record.nodes) ? record.nodes.map((item, index) => {
+    const node = readRecord(item);
+    return {
+      nodeId: readString(node.nodeId ?? node.node_id, `node-${index + 1}`),
+      nodeType: readString(node.nodeType ?? node.node_type, "UNKNOWN").toUpperCase(),
+      role: readOptionalString(node.role)?.toUpperCase(),
+      state: readString(node.state, "UNKNOWN").toUpperCase(),
+      title: readString(node.title, "未命名节点"),
+      source: readString(node.source, "unknown"),
+      evidenceId: readOptionalString(node.evidenceId ?? node.evidence_id),
+      occurredAt: readOptionalString(node.occurredAt ?? node.occurred_at),
+      reasonCode: readOptionalString(node.reasonCode ?? node.reason_code),
+    };
+  }) : [];
+  const edges = Array.isArray(record.edges) ? record.edges.map((item) => {
+    const edge = readRecord(item);
+    return {
+      fromNodeId: readString(edge.fromNodeId ?? edge.from_node_id),
+      toNodeId: readString(edge.toNodeId ?? edge.to_node_id),
+      relation: readString(edge.relation, "NEXT").toUpperCase(),
+      state: readString(edge.state, "UNKNOWN").toUpperCase(),
+      evidenceId: readOptionalString(edge.evidenceId ?? edge.evidence_id),
+    };
+  }) : [];
+  const evidence = Array.isArray(record.evidence) ? record.evidence.map((item, index) => {
+    const fact = readRecord(item);
+    return {
+      evidenceId: readString(fact.evidenceId ?? fact.evidence_id, `evidence-${index + 1}`),
+      source: readString(fact.source, "unknown"),
+      kind: readString(fact.kind, "UNKNOWN").toUpperCase(),
+      state: readString(fact.state, "UNKNOWN").toUpperCase(),
+      occurredAt: readOptionalString(fact.occurredAt ?? fact.occurred_at),
+      confidence: readString(fact.confidence, "UNAVAILABLE").toUpperCase(),
+      reference: readString(fact.reference),
+    };
+  }) : [];
+  return {
+    schemaVersion: readString(record.schemaVersion ?? record.schema_version, "1.0"),
+    graphType: readString(record.graphType ?? record.graph_type, "SYNC_EXECUTION_LIFECYCLE"),
+    available: readOptionalBoolean(record.available) ?? false,
+    syncTaskId: readNumber(record.syncTaskId ?? record.sync_task_id),
+    rootExecutionId: readNumber(record.rootExecutionId ?? record.root_execution_id),
+    currentExecutionId: readNumber(record.currentExecutionId ?? record.current_execution_id),
+    overallState: readString(record.overallState ?? record.overall_state, "UNKNOWN").toUpperCase(),
+    sourceStatus: readString(record.sourceStatus ?? record.source_status, "PARTIAL").toUpperCase(),
+    missingReason: readOptionalString(record.missingReason ?? record.missing_reason),
+    nodes,
+    edges,
+    evidence,
+    generatedAt: readOptionalString(record.generatedAt ?? record.generated_at),
   };
 }
 
@@ -3463,6 +3525,13 @@ export const api = {
       `/sync/sync-tasks/${taskId}/executions/${executionId}/autopilot-recovery`,
     );
     return { ...result, data: normalizeSyncAutopilotRecoveryStatus(result.data) };
+  },
+  /** 查询服务端聚合的统一全链路图；浏览器不在本地重算跨服务状态。 */
+  getSyncExecutionLifecycleGraph: async (taskId: number, executionId: number) => {
+    const result = await request<unknown>(
+      `/sync/sync-tasks/${taskId}/executions/${executionId}/lifecycle-graph`,
+    );
+    return { ...result, data: normalizeSyncExecutionLifecycleGraph(result.data) };
   },
   listSyncObjectExecutions: (taskId: number, executionId: number) =>
     pageEndpoint<SyncObjectExecution>(

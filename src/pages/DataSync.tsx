@@ -72,6 +72,7 @@ import { DataSourceIndicator } from "@/components/DataSourceIndicator";
 import { RealEmpty } from "@/components/RealEmpty";
 import { BooleanTag } from "@/components/StatusTag";
 import { PageHeader } from "@/components/PageHeader";
+import { SyncExecutionLifecycleGraph } from "@/components/agent/SyncExecutionLifecycleGraph";
 import {
   findMetadataTableByName,
   isMysqlLikeConnector,
@@ -1338,11 +1339,26 @@ export function DataSync() {
         : false;
     },
   });
+  const executionLifecycleGraphQuery = useQuery({
+    queryKey: ["sync-execution-lifecycle-graph", selectedTask?.id, selectedExecutionId],
+    queryFn: () => api.getSyncExecutionLifecycleGraph(selectedTask!.id, selectedExecutionId!),
+    enabled: Boolean(selectedTask?.id && selectedExecutionId && taskDrawerActiveTab === "logs"),
+    refetchInterval: (query) => {
+      const graph = query.state.data?.data;
+      if (selectedExecutionIsLive || graph?.overallState === "WAITING") return 3000;
+      /*
+       * worker 终态和观察来源完整度是两件事。Agent Runtime 短暂不可用时，后端可以返回 VERIFIED + PARTIAL；
+       * 此时以较慢频率继续补全证据，避免页面永远停留在假性缺失。NOT_LINKED 属于历史人工执行，不重复轮询。
+       */
+      return graph?.sourceStatus === "PARTIAL" ? 10000 : false;
+    },
+  });
   const objectExecutions = useMemo(() => sortByIdDesc(objectExecutionQuery.data?.data.records), [objectExecutionQuery.data?.data.records]);
   const executionLogs = useMemo(() => sortByIdDesc(executionLogQuery.data?.data.records), [executionLogQuery.data?.data.records]);
   const executionPolicies = useMemo(() => sortByIdDesc(executionPolicyQuery.data?.data.records), [executionPolicyQuery.data?.data.records]);
   const executionPolicySnapshot = executionPolicySnapshotQuery.data?.data;
   const autopilotRecoveryStatus = autopilotRecoveryQuery.data?.data;
+  const executionLifecycleGraph = executionLifecycleGraphQuery.data?.data;
   const errorSamples = useMemo(() => sortByIdDesc(errorSampleQuery.data?.data.records), [errorSampleQuery.data?.data.records]);
   const checkpoints = useMemo(() => sortByIdDesc(checkpointQuery.data?.data.records), [checkpointQuery.data?.data.records]);
   const auditRecords = useMemo(() => sortByIdDesc(auditQuery.data?.data.records), [auditQuery.data?.data.records]);
@@ -3099,6 +3115,9 @@ export function DataSync() {
         : Promise.resolve(),
       selectedTask && selectedExecutionId && taskDrawerActiveTab === "logs"
         ? autopilotRecoveryQuery.refetch()
+        : Promise.resolve(),
+      selectedTask && selectedExecutionId && taskDrawerActiveTab === "logs"
+        ? executionLifecycleGraphQuery.refetch()
         : Promise.resolve(),
       selectedTask ? errorSampleQuery.refetch() : Promise.resolve(),
       selectedTask ? checkpointQuery.refetch() : Promise.resolve(),
@@ -6190,6 +6209,28 @@ export function DataSync() {
                         }
                         description="运行日志记录任务入队、执行器认领、预检查/计划、通道创建、对象或分片同步、批次回执、断点与最终完成等关键阶段。日志只展示低敏进度事实，不展示 SQL、连接串、密码、where 原文或样本行。"
                       />
+                      {selectedExecutionId ? (
+                        <Card
+                          className="compact-card"
+                          title={`全链路状态图 · execution #${selectedExecutionId}`}
+                          loading={executionLifecycleGraphQuery.isLoading || executionLifecycleGraphQuery.isFetching}
+                        >
+                          {executionLifecycleGraphQuery.isError ? (
+                            <Alert
+                              showIcon
+                              type="warning"
+                              message="当前执行记录的全链路状态图暂不可读取"
+                              description={executionLifecycleGraphQuery.error instanceof Error
+                                ? executionLifecycleGraphQuery.error.message
+                                : "统一状态投影接口暂时不可用。"}
+                            />
+                          ) : executionLifecycleGraph ? (
+                            <SyncExecutionLifecycleGraph graph={executionLifecycleGraph} />
+                          ) : (
+                            <RealEmpty description="尚未加载全链路状态图" />
+                          )}
+                        </Card>
+                      ) : null}
                       {selectedExecutionId ? (
                         <Card
                           className="compact-card"

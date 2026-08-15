@@ -1,0 +1,30 @@
+.sync-lifecycle-graph {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.sync-lifecycle-summary {
+  min-height: 24px;
+}
+
+.sync-lifecycle-graph .ant-steps-item-description {
+  max-width: 100%;
+}
+
+.sync-lifecycle-node-description {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 4px 0 8px;
+}
+
+.sync-lifecycle-reference {
+  overflow-wrap: anywhere;
+}
+
+.sync-lifecycle-edge {
+  border-left: 2px solid #b7c0ca;
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}

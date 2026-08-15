@@ -30,6 +30,15 @@ const backendAutopilotSnapshot = fs.readFileSync(
   path.join(backendRoot, "agent-runtime", "src", "main", "java", "com", "czh", "datasmart", "govern", "agent", "service", "autopilot", "AgentAutopilotAuthorizationSnapshot.java"),
   "utf8",
 );
+const backendLifecycleGraph = fs.readFileSync(
+  path.join(backendRoot, "data-sync", "src", "main", "java", "com", "czh", "datasmart", "govern", "datasync", "service", "support", "SyncExecutionLifecycleGraphView.java"),
+  "utf8",
+);
+const dataSyncPage = fs.readFileSync(path.join(frontendRoot, "src", "pages", "DataSync.tsx"), "utf8");
+const lifecycleGraphComponent = fs.readFileSync(
+  path.join(frontendRoot, "src", "components", "agent", "SyncExecutionLifecycleGraph.tsx"),
+  "utf8",
+);
 
 function sourceBlock(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -229,6 +238,45 @@ const syncAutopilotRecoveryStatus = sourceBlock(
 );
 assert.match(syncAutopilotRecoveryStatus, /\bavailable\s*:\s*boolean;/,
   "Autopilot recovery availability must always be explicit");
+
+const lifecycleGraphContract = sourceBlock(
+  domain,
+  "export interface SyncExecutionLifecycleNode",
+  "export interface SyncExecutionLog",
+);
+for (const field of [
+  "sourceStatus",
+  "missingReason",
+  "nodes",
+  "edges",
+  "evidence",
+  "confidence",
+  "occurredAt",
+  "reference",
+]) {
+  assert.match(lifecycleGraphContract, new RegExp(`\\b${field}\\??\\s*:`),
+    `unified lifecycle graph must expose ${field}`);
+  assert.match(backendLifecycleGraph, new RegExp(`\\b${field}\\b`),
+    `backend unified lifecycle graph must expose ${field}`);
+}
+assert.match(endpoints, /function normalizeSyncExecutionLifecycleGraph/,
+  "frontend must normalize the server-owned lifecycle projection");
+assert.match(endpoints, /\/sync\/sync-tasks\/\$\{taskId\}\/executions\/\$\{executionId\}\/lifecycle-graph/,
+  "frontend must call the scoped lifecycle graph route");
+assert.match(dataSyncPage, /getSyncExecutionLifecycleGraph\(selectedTask!\.id, selectedExecutionId!\)/,
+  "execution detail must query the unified lifecycle graph");
+assert.match(dataSyncPage, /<SyncExecutionLifecycleGraph graph=\{executionLifecycleGraph\}/,
+  "execution detail must render the server-owned lifecycle graph");
+assert.match(dataSyncPage, /graph\?\.sourceStatus === "PARTIAL" \? 10000 : false/,
+  "unified graph must keep polling slowly while authoritative sources are temporarily partial");
+assert.match(lifecycleGraphComponent, /graph\.edges\.map/,
+  "unified graph must consume server-owned edges instead of rendering unrelated status rows");
+for (const field of ["source", "occurredAt", "confidence", "reference"]) {
+  assert.match(lifecycleGraphComponent, new RegExp(`\\b${field}\\b`),
+    `lifecycle graph evidence must render ${field}`);
+}
+assert.doesNotMatch(lifecycleGraphComponent, /prompt|password|credential|payloadJson|planArguments/,
+  "lifecycle graph must not render sensitive execution payloads");
 for (const field of [
   "syncTaskId",
   "rootExecutionId",
